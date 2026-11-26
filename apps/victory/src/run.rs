@@ -77,7 +77,10 @@ pub fn run(
     }
     // Rosetta cannot resume these when they fault partway (#14, #50).
     let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
-    println!("masked stores  {}", victory_loader::masked::summary(&masked));
+    println!(
+        "masked stores  {}",
+        victory_loader::masked::summary(&masked)
+    );
     // Under Rosetta, tracking is off unless asked for, and the stores it
     // cannot resume are patched when it is on (`victory_gpu::fault_tracking`).
     println!(
@@ -102,7 +105,8 @@ pub fn run(
         && requested.is_none()
         && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
     {
-        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
+        requested =
+            Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
     }
     let patching = victory_loader::masked::choice(requested, needs_patch);
     let original = patching.is_some().then_some(original);
@@ -214,6 +218,7 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
     let imported: Vec<&str> = image
         .info()
@@ -504,6 +509,11 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    victory_gpu::pipeline::note_title_dll(
+                        name,
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    );
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());
