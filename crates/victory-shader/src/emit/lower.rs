@@ -346,6 +346,10 @@ struct Lower<'a> {
     block_active: Vec<Option<V>>,
     /// Per-lane active predicate for each predicated CFG edge `(from, to)`.
     pred_edge_active: Map<(usize, usize), V>,
+    /// Outer active predicate saved before entering a lockstep loop header.
+    loop_outer_active: Map<usize, Option<V>>,
+    /// Lockstep loop active-lane phis `(phi, header, latch)` filled in `fill_phis`.
+    loop_act_phis: Vec<(V, usize, usize)>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: per IR block, whether every lane of the group runs it
@@ -759,7 +763,7 @@ impl<'a> Lower<'a> {
             let one_wave_lds = x.narrow_waves && one_wave && group > 32 && s.lds_dwords > 0;
             let step_plan = if x.native.wave64 && group > 32 && (x.host_wave32 || one_wave_lds) {
                 let base_step = in_step(p, x.st);
-                predicate::PredicatePlan::build(p, x.st, base_step, one_wave_lds)
+                predicate::PredicatePlan::build(p, x.st, base_step, one_wave_lds, x.host_wave32)
             } else {
                 predicate::PredicatePlan::empty(Vec::new())
             };
@@ -911,6 +915,8 @@ impl<'a> Lower<'a> {
             pred,
             block_active: vec![None; p.blocks.len()],
             pred_edge_active: Map::default(),
+            loop_outer_active: Map::default(),
+            loop_act_phis: Vec::new(),
             relabelled: None,
             half_words: None,
             level: 0,
@@ -2176,7 +2182,16 @@ impl<'a> Lower<'a> {
                 let single_half = self.halves && self.one_host_wave();
                 let across = self.halves && !single_half;
                 if across {
-                    at = self.across_at(def).ok_or(halves::MASK_ACROSS)?;
+                    match self.across_at(def) {
+                        Some(a) => at = a,
+                        None => {
+                            if let Ok(xy) = self.mask_number(lo) {
+                                self.ballots.insert(lo, xy);
+                                return Ok(if high { xy.1 } else { xy.0 });
+                            }
+                            return Err(halves::MASK_ACROSS);
+                        }
+                    }
                 }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -3019,7 +3034,7 @@ impl<'a> Lower<'a> {
                     .phi_at
                     .get(&id)
                     .ok_or("a lane-mask join without a phi")?;
-                if self.pred.linear_merges.contains(&b) {
+                if self.pred.linear_merges.contains(&b) || self.pred.skip_joins.contains_key(&b) {
                     return self.predicated_mask_phi(id, b, i, at);
                 }
                 let blk = self.block[b].ok_or("an unreachable join")?;
@@ -11789,6 +11804,9 @@ impl<'a> Lower<'a> {
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.pred.skipped_edges.contains(&(q, b)) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -11848,6 +11866,9 @@ impl<'a> Lower<'a> {
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.pred.skipped_edges.contains(&(q, b)) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -11868,6 +11889,7 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
+        self.fill_predicated_phis();
         Ok(())
     }
 }

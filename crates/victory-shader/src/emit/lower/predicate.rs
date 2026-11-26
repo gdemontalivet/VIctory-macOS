@@ -1,25 +1,33 @@
-//! Selective acyclic divergent-branch predication for wave64-on-32-lane
+//! Selective divergent-branch & lockstep-loop predication for wave64-on-32-lane
 //! (`halves`) compute shaders.
 //!
 //! Cross-half exchanges (`exchange_halves`) and split-wave LDS barriers
 //! (`split_wave_barriers`) emit group barriers (`dx.op.barrier`), which
 //! require every thread in the threadgroup to reach the block together
 //! (`in_step`). Standard compute patterns such as an early-out bounds check
-//! (`if (dtid >= limit) return;`) or an acyclic `if (cond) { ... } else { ... }`
-//! diamond put their body outside `in_step`.
+//! (`if (dtid >= limit) return;`), a one-sided guard (`if (cond) { ... }`,
+//! including bodies containing uniform loops), an acyclic `if/else` diamond,
+//! or a wave-scalarization / per-lane loop (`while (exec != 0)`) put their
+//! bodies outside `in_step`.
 //!
-//! When a wave64-on-32-lane compute shader has such an acyclic divergent
-//! branch whose body needs `in_step` (a cross-half wave op or split-wave LDS
-//! access), this pass linearizes that branch into predicated lockstep
-//! execution:
+//! When a wave64-on-32-lane compute shader has such a region needing `in_step`
+//! (cross-half wave ops, mask-as-data reads, `v_readfirstlane`/`v_readlane`,
+//! or split-wave LDS accesses), this pass rewrites its control flow into
+//! predicated lockstep execution:
 //! * **Early-out (`if (cond) return;`)**: replaces `CondBr(cond, end, cont)`
 //!   with `Br(cont)` and carries `active &= !cond` into every block dominated
-//!   by `cont` (including straight through subsequent uniform loops).
-//! * **Acyclic SESE diamond (`if (cond) { A } [else { B }] -> J`)**:
-//!   linearizes the strictly acyclic region `R` between `d` and its immediate
-//!   post-dominator `J` in reverse-postorder (`d -> r_0 -> ... -> r_k -> J`),
-//!   tracking per-edge active predicates and lowering phis at linearized
-//!   merges (`R ∪ {J}`) into `select` chains.
+//!   by `cont`.
+//! * **Skip-guard (`if (cond) { body } -> J`)**: replaces `CondBr(cond, body, J)`
+//!   with `Br(body)` without linearizing `body` (so uniform loops and branches
+//!   inside `body` keep their CFG), marks `(d, J)` skipped, and lowers `J`'s
+//!   phis via `select(act_body, v_body, v_d)`.
+//! * **Acyclic SESE diamond (`if (cond) { A } else { B } -> J`)**: linearizes
+//!   strictly acyclic two-sided regions (`<= 64` blocks) in topological RPO
+//!   order and lowers merge phis into `select` chains.
+//! * **Lockstep loop (`header .. latch -> (header, exit)`)**: turns a
+//!   single-latch, single-exit divergent loop (with no non-mask SGPRs live out)
+//!   into a group-uniform loop whose latch tests `group_any_true(next_active)`
+//!   and carries `loop_active` through an `i1` phi at `header`.
 //!
 //! Every side effect and potentially faulting load in a predicated block is
 //! guarded by the block's `active` predicate through `Lower::guard`, while
@@ -31,29 +39,58 @@ use super::*;
 /// Maximum number of blocks inside one linearized SESE diamond.
 const MAX_DIAMOND_BLOCKS: usize = 64;
 
+/// Maximum number of blocks inside one lockstep-predicated loop.
+const MAX_LOCKSTEP_LOOP_BLOCKS: usize = 32;
+
 /// How a predicated block's CFG exit is rewritten.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FlatExit {
     /// Early-out branch `d -> (end, cont)` rewritten to unconditional
     /// `Br(cont)`, with lanes staying active along `(d, cont)`.
     EarlyOut { cont: usize },
+    /// One-sided skip-guard `d -> (body, join)` rewritten to unconditional
+    /// `Br(body)`, bypassing `(d, join)` so `body` (including any uniform
+    /// loops inside it) runs in lockstep under `active &= body_cond`.
+    SkipGuard { body: usize },
     /// Block inside (or at the head of) a linearized SESE diamond jumping
     /// unconditionally to the next block in topological RPO order.
     Linear { next: usize },
+    /// Latch of a lockstep-predicated loop branching on
+    /// `group_any_true(next_active) && iter < LOOP_LIMIT`.
+    LockstepLatch {
+        header: usize,
+        exit: usize,
+        stay_when_true: bool,
+    },
 }
 
 /// Predication plan computed before `split_wave_barriers` and `Lower::run`.
 pub(super) struct PredicatePlan {
-    /// Rewritten exits for predicated branches and blocks inside linearized
-    /// diamonds.
+    /// Rewritten exits for predicated branches, linearized diamond blocks,
+    /// and lockstep loop latches.
     pub(super) exits: Map<usize, FlatExit>,
     /// Blocks inside linearized diamonds (strictly between `d` and `join`).
     pub(super) in_diamond: Set<usize>,
     /// Join blocks of linearized diamonds (`join -> head branch block d`).
     pub(super) diamond_joins: Map<usize, usize>,
+    /// Body entry blocks of `SkipGuard`s (`body -> head branch block d`).
+    pub(super) skip_bodies: Map<usize, usize>,
+    /// Join blocks of `SkipGuard`s (`join -> head branch block d`).
+    pub(super) skip_joins: Map<usize, usize>,
+    /// Bypassed CFG edges `(d, join)` dropped from DXIL phis in `fill_phis`.
+    pub(super) skipped_edges: Set<(usize, usize)>,
     /// Blocks whose DXIL predecessors were linearized (internal diamond merges
     /// and diamond joins), so their IR phis lower to `select` chains.
     pub(super) linear_merges: Set<usize>,
+    /// Lockstep-predicated loop headers (`header -> latch`).
+    pub(super) lockstep_headers: Map<usize, usize>,
+    /// Lockstep-predicated loop exits (`exit -> header`) so `block_active`
+    /// restores to the outer predicate at loop exit.
+    pub(super) lockstep_exits: Map<usize, usize>,
+    /// Blocks belonging to any lockstep-predicated loop.
+    pub(super) in_lockstep_loop: Set<usize>,
+    /// Latch blocks promoted to group-uniform branches for `in_step_with`.
+    pub(super) uniform_branches: Set<usize>,
     /// Blocks bypassed by `EarlyOut` that have no remaining live predecessors.
     pub(super) dead_blocks: Set<usize>,
     /// Immediate dominator per IR block (on the original CFG).
@@ -62,7 +99,7 @@ pub(super) struct PredicatePlan {
     pub(super) early_conts: Map<usize, usize>,
     /// Trivial `End` blocks bypassed by at least one `EarlyOut`.
     pub(super) skipped_ends: Set<usize>,
-    /// Updated `in_step` vector reflecting linearized control flow.
+    /// Updated `in_step` vector reflecting predicated control flow.
     pub(super) step: Vec<bool>,
 }
 
@@ -72,7 +109,14 @@ impl PredicatePlan {
             exits: Map::default(),
             in_diamond: Set::default(),
             diamond_joins: Map::default(),
+            skip_bodies: Map::default(),
+            skip_joins: Map::default(),
+            skipped_edges: Set::default(),
             linear_merges: Set::default(),
+            lockstep_headers: Map::default(),
+            lockstep_exits: Map::default(),
+            in_lockstep_loop: Set::default(),
+            uniform_branches: Set::default(),
             dead_blocks: Set::default(),
             idom: Vec::new(),
             early_conts: Map::default(),
@@ -93,6 +137,7 @@ impl PredicatePlan {
         st: &Structured,
         base_step: Vec<bool>,
         one_wave_lds: bool,
+        host_wave32: bool,
     ) -> Self {
         let n = p.blocks.len();
         if n <= 1 {
@@ -114,7 +159,14 @@ impl PredicatePlan {
             exits: Map::default(),
             in_diamond: Set::default(),
             diamond_joins: Map::default(),
+            skip_bodies: Map::default(),
+            skip_joins: Map::default(),
+            skipped_edges: Set::default(),
             linear_merges: Set::default(),
+            lockstep_headers: Map::default(),
+            lockstep_exits: Map::default(),
+            in_lockstep_loop: Set::default(),
+            uniform_branches: Set::default(),
             dead_blocks: Set::default(),
             idom,
             early_conts: Map::default(),
@@ -123,7 +175,7 @@ impl PredicatePlan {
         };
         let mut eff_exits = st.exits.clone();
 
-        // Iteratively flatten eligible acyclic divergent branches whose
+        // Iteratively predicate eligible divergent branches and loops whose
         // regions contain candidate blocks needing `in_step`.
         loop {
             let mut changed = false;
@@ -143,8 +195,6 @@ impl PredicatePlan {
                 if taken == not_taken || rpo[taken] <= rpo[d] || rpo[not_taken] <= rpo[d] {
                     continue;
                 }
-                // Already uniform if both targets stay in_step (or neither side
-                // has any candidate outside `step`).
                 if plan.step[taken] && plan.step[not_taken] {
                     continue;
                 }
@@ -156,19 +206,47 @@ impl PredicatePlan {
                     plan.exits.insert(d, FlatExit::EarlyOut { cont });
                     plan.early_conts.insert(cont, d);
                     plan.skipped_ends.insert(end_blk);
+                    plan.skipped_edges.insert((d, end_blk));
                     eff_exits[d] = LaneExit::Jump(cont);
                     if p.blocks[end_blk].preds.iter().all(|&q| {
                         plan.dead_blocks.contains(&q)
-                            || matches!(plan.exits.get(&q), Some(FlatExit::EarlyOut { .. }))
+                            || plan.skipped_edges.contains(&(q, end_blk))
                     }) {
                         plan.dead_blocks.insert(end_blk);
                     }
-                    plan.step = barriers::in_step_with(p, st, &eff_exits);
+                    plan.step =
+                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
                     changed = true;
                     break;
                 }
 
-                // Shape 2: acyclic single-entry single-exit diamond `d -> J`.
+                // Shape 2: one-sided skip-guard `if (cond) { body } -> J`
+                // (allows uniform loops and nested branches inside `body`).
+                if let Some(join) = ipdom[d]
+                    && let Some(body) = match_skip_guard(
+                        p,
+                        &eff_exits,
+                        d,
+                        taken,
+                        not_taken,
+                        join,
+                        &rpo,
+                        &needs,
+                        &plan,
+                    )
+                {
+                    plan.exits.insert(d, FlatExit::SkipGuard { body });
+                    plan.skip_bodies.insert(body, d);
+                    plan.skip_joins.insert(join, d);
+                    plan.skipped_edges.insert((d, join));
+                    eff_exits[d] = LaneExit::Jump(body);
+                    plan.step =
+                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    changed = true;
+                    break;
+                }
+
+                // Shape 3: acyclic two-sided SESE diamond `d -> J`.
                 if let Some(join) = ipdom[d]
                     && let Some(region) = match_sese_diamond(
                         p,
@@ -182,7 +260,6 @@ impl PredicatePlan {
                         &plan,
                     )
                 {
-                    // Linearize `d -> region[0] -> ... -> region[k-1] -> join`.
                     plan.exits.insert(d, FlatExit::Linear { next: region[0] });
                     eff_exits[d] = LaneExit::Jump(region[0]);
                     for (idx, &b) in region.iter().enumerate() {
@@ -196,18 +273,51 @@ impl PredicatePlan {
                     }
                     plan.diamond_joins.insert(join, d);
                     plan.linear_merges.insert(join);
-                    plan.step = barriers::in_step_with(p, st, &eff_exits);
+                    plan.step =
+                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
                     changed = true;
                     break;
                 }
             }
+
+            if !changed && host_wave32 {
+                // Shape 4: single-latch, single-exit divergent loop promoted
+                // to group-uniform lockstep execution (`group_any_true`).
+                for &h in &order {
+                    if plan.dead_blocks.contains(&h)
+                        || plan.lockstep_headers.contains_key(&h)
+                        || plan.in_diamond.contains(&h)
+                    {
+                        continue;
+                    }
+                    if let Some((latch, exit, stay_when_true, body)) =
+                        match_lockstep_loop(p, &eff_exits, h, &rpo, &needs, &plan)
+                    {
+                        plan.exits.insert(
+                            latch,
+                            FlatExit::LockstepLatch {
+                                header: h,
+                                exit,
+                                stay_when_true,
+                            },
+                        );
+                        plan.lockstep_headers.insert(h, latch);
+                        plan.lockstep_exits.insert(exit, h);
+                        plan.uniform_branches.insert(latch);
+                        plan.in_lockstep_loop.extend(body);
+                        plan.step =
+                            barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
             if !changed {
                 break;
             }
         }
 
-        // If any dead block is unreachable from entry in `eff_exits`, keep it
-        // out of `step`.
         for &b in &plan.dead_blocks {
             plan.step[b] = false;
         }
@@ -216,26 +326,27 @@ impl PredicatePlan {
 }
 
 /// Blocks that contain an operation needing `in_step` in `halves` mode
-/// (cross-half wave ops, mask-as-data reads, `v_readlane`/`v_readfirstlane`,
-/// or split-wave LDS accesses).
+/// (cross-half wave ops, mask-as-data reads and their transitive mask sources,
+/// `v_readlane`/`v_readfirstlane`, or split-wave LDS accesses).
 fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<bool> {
     let mut needs = vec![false; p.blocks.len()];
-    let mut mask_def: Map<Value, usize> = Map::default();
+    let mut mask_def: Map<Value, (usize, Option<usize>)> = Map::default();
     for (b, block) in p.blocks.iter().enumerate() {
         for phi in &block.phis {
             if st.masks.contains_key(&phi.value) || st.highs.contains_key(&phi.value) {
-                mask_def.insert(phi.value, b);
+                mask_def.insert(phi.value, (b, None));
             }
         }
-        for inst in &block.insts {
+        for (i, inst) in block.insts.iter().enumerate() {
             for &(_, w) in &inst.writes {
                 if st.masks.contains_key(&w) || st.highs.contains_key(&w) {
-                    mask_def.insert(w, b);
+                    mask_def.insert(w, (b, Some(i)));
                 }
             }
         }
     }
 
+    let mut mask_worklist: Vec<Value> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for inst in &block.insts {
             let name = inst.name();
@@ -244,6 +355,7 @@ fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<boo
                 "v_readfirstlane_b32"
                     | "v_readlane_b32"
                     | "s_or_saveexec_b64"
+                    | "s_nand_saveexec_b64"
                     | "v_mbcnt_lo_u32_b32"
                     | "v_mbcnt_hi_u32_b32"
                     | "s_bcnt1_i32_b64"
@@ -252,9 +364,6 @@ fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<boo
             ) {
                 needs[b] = true;
             }
-            // Any instruction reading a tracked lane mask as data (not a mask
-            // operation or branch): mark both this block and the mask's
-            // defining block.
             let is_mask_user = name.starts_with("s_cbranch")
                 || name.starts_with("v_cndmask")
                 || matches!(
@@ -282,9 +391,7 @@ fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<boo
                 for &(_, v) in &inst.reads {
                     if st.masks.contains_key(&v) || st.highs.contains_key(&v) {
                         needs[b] = true;
-                        if let Some(&def_b) = mask_def.get(&v) {
-                            needs[def_b] = true;
-                        }
+                        mask_worklist.push(v);
                     }
                 }
             }
@@ -297,16 +404,59 @@ fn candidate_blocks(p: &Program, st: &Structured, one_wave_lds: bool) -> Vec<boo
             }
         }
     }
+
+    // Walk backward through pure scalar mask ops (`s_not_b64`, `s_and_b64`,
+    // `s_mov_b64`, etc.) so source mask-defining blocks are marked as well.
+    let mut seen_masks: Set<Value> = Set::default();
+    while let Some(v) = mask_worklist.pop() {
+        let lo = st.highs.get(&v).copied().unwrap_or(v);
+        if !seen_masks.insert(lo) {
+            continue;
+        }
+        let Some(&(def_b, inst_idx)) = mask_def.get(&lo) else {
+            continue;
+        };
+        needs[def_b] = true;
+        if let Some(i) = inst_idx {
+            let inst = &p.blocks[def_b].insts[i];
+            if matches!(inst.fields, Fields::Sop { .. })
+                && inst.write(Reg::S(EXEC)).is_none()
+            {
+                for &(_, r) in &inst.reads {
+                    if st.masks.contains_key(&r) || st.highs.contains_key(&r) {
+                        mask_worklist.push(r);
+                    }
+                }
+            }
+        }
+    }
     needs
 }
 
-fn is_trivial_end(p: &Program, exits: &[LaneExit], b: usize) -> bool {
-    exits[b] == LaneExit::End
-        && p.blocks[b].phis.is_empty()
-        && p.blocks[b]
-            .insts
-            .iter()
-            .all(|i| matches!(i.name(), "s_endpgm" | "s_nop" | "s_waitcnt"))
+fn is_trivial_epilogue_inst(i: &Inst) -> bool {
+    match i.name() {
+        "s_endpgm" | "s_nop" | "s_waitcnt" | "s_waitcnt_depctr" | "s_branch" => true,
+        "s_mov_b64" | "s_or_b64" => {
+            i.writes.iter().all(|&(r, _)| matches!(r, Reg::S(EXEC) | Reg::S(127) | Reg::Scc))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `b` is a side-effect-free epilogue ending in `s_endpgm` (directly
+/// or through up to 4 trivial jump trampolines).
+fn is_trivial_end(p: &Program, exits: &[LaneExit], mut b: usize) -> bool {
+    for _ in 0..5 {
+        if !p.blocks[b].insts.iter().all(is_trivial_epilogue_inst) {
+            return false;
+        }
+        match exits[b] {
+            LaneExit::End => return true,
+            LaneExit::Jump(next) if next != b && p.blocks[b].phis.is_empty() => b = next,
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,8 +480,6 @@ fn match_early_out(
     if cont == end_blk || rpo[cont] <= rpo[d] || p.blocks[cont].preds != [d] {
         return None;
     }
-    // Only predicate if some block reachable from `cont` (without going
-    // through `end_blk`) needs `in_step` and is not currently `in_step`.
     let mut seen = vec![false; p.blocks.len()];
     let mut stack = vec![cont];
     let mut useful = false;
@@ -356,6 +504,138 @@ fn match_early_out(
     useful.then_some((cont, end_blk))
 }
 
+/// Live predecessors of `b` under `eff_exits` (excluding dead blocks).
+fn eff_preds(exits: &[LaneExit], dead: &Set<usize>, target: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (q, e) in exits.iter().enumerate() {
+        if dead.contains(&q) {
+            continue;
+        }
+        let hits = match *e {
+            LaneExit::Jump(t) => t == target,
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => taken == target || not_taken == target,
+            LaneExit::End | LaneExit::Indirect => false,
+        };
+        if hits {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// Matches a one-sided skip-guard `d -> (body, join)` where `join == ipdom[d]`.
+/// Unlike `match_sese_diamond`, `body` is NOT linearized, so uniform loops and
+/// nested branches inside `body` keep their native CFG structure.
+#[allow(clippy::too_many_arguments)]
+fn match_skip_guard(
+    p: &Program,
+    exits: &[LaneExit],
+    d: usize,
+    taken: usize,
+    not_taken: usize,
+    join: usize,
+    rpo: &[usize],
+    needs: &[bool],
+    plan: &PredicatePlan,
+) -> Option<usize> {
+    let body = if taken == join && not_taken != join {
+        not_taken
+    } else if not_taken == join && taken != join {
+        taken
+    } else {
+        return None;
+    };
+    if join == d
+        || rpo[join] <= rpo[d]
+        || rpo[body] <= rpo[d]
+        || plan.diamond_joins.contains_key(&join)
+        || plan.skip_joins.contains_key(&join)
+        || plan.skip_bodies.contains_key(&body)
+        || plan.in_diamond.contains(&body)
+        || plan.exits.contains_key(&body)
+    {
+        return None;
+    }
+    // `join` cannot be a loop header itself.
+    if eff_preds(exits, &plan.dead_blocks, join)
+        .iter()
+        .any(|&q| rpo[q] >= rpo[join])
+    {
+        return None;
+    }
+    // Collect all blocks reachable from `body` before `join`.
+    let mut region_set = Set::default();
+    let mut stack = vec![body];
+    while let Some(b) = stack.pop() {
+        if b == join || !region_set.insert(b) {
+            continue;
+        }
+        if plan.in_diamond.contains(&b) || plan.dead_blocks.contains(&b) {
+            return None;
+        }
+        match exits[b] {
+            LaneExit::Jump(t) => {
+                if t != join {
+                    stack.push(t);
+                }
+            }
+            LaneExit::Branch {
+                taken: t,
+                not_taken: f,
+                ..
+            } => {
+                for s in [t, f] {
+                    if s != join {
+                        stack.push(s);
+                    }
+                }
+            }
+            LaneExit::End | LaneExit::Indirect => return None,
+        }
+    }
+    if region_set.is_empty() {
+        return None;
+    }
+    // Single-entry: every live predecessor of `body` is `d` or inside `region_set`;
+    // every live predecessor of any other block in `region_set` is inside `region_set`.
+    for &b in &region_set {
+        for q in eff_preds(exits, &plan.dead_blocks, b) {
+            let ok = if b == body {
+                q == d || region_set.contains(&q)
+            } else {
+                region_set.contains(&q)
+            };
+            if !ok {
+                return None;
+            }
+        }
+    }
+    // Single-exit: every live predecessor of `join` is `d` or inside `region_set`.
+    let join_preds = eff_preds(exits, &plan.dead_blocks, join);
+    if !join_preds.iter().all(|&q| q == d || region_set.contains(&q)) {
+        return None;
+    }
+    if !join_preds.iter().any(|&q| q != d) {
+        return None;
+    }
+    // Every IR phi at `join` must come from original predecessors `d` or `region_set`.
+    if !p.blocks[join]
+        .preds
+        .iter()
+        .filter(|q| !plan.dead_blocks.contains(q) && !plan.skipped_edges.contains(&(**q, join)))
+        .all(|&q| q == d || region_set.contains(&q))
+    {
+        return None;
+    }
+    // Only predicate if at least one block in `region_set` needs `in_step`.
+    if !region_set.iter().any(|&b| needs[b] && !plan.step[b]) {
+        return None;
+    }
+    Some(body)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn match_sese_diamond(
     p: &Program,
@@ -371,8 +651,8 @@ fn match_sese_diamond(
     if join == d || rpo[join] <= rpo[d] {
         return None;
     }
-    // Do not linearize if `join` is already a diamond join or a loop header.
     if plan.diamond_joins.contains_key(&join)
+        || plan.skip_joins.contains_key(&join)
         || p.blocks[join].preds.iter().any(|&q| rpo[q] >= rpo[join])
     {
         return None;
@@ -398,7 +678,7 @@ fn match_sese_diamond(
         match exits[b] {
             LaneExit::Jump(t) => {
                 if rpo[t] <= rpo[b] {
-                    return None; // cycle inside region
+                    return None;
                 }
                 if t != join {
                     stack.push(t);
@@ -410,7 +690,7 @@ fn match_sese_diamond(
                 ..
             } => {
                 if rpo[t] <= rpo[b] || rpo[f] <= rpo[b] {
-                    return None; // cycle inside region
+                    return None;
                 }
                 for s in [t, f] {
                     if s != join {
@@ -424,34 +704,184 @@ fn match_sese_diamond(
     if region_set.is_empty() {
         return None;
     }
-    // Single-entry: every predecessor of every block in `region_set` must be
-    // `d` or inside `region_set`.
     for &b in &region_set {
         if !p.blocks[b]
             .preds
             .iter()
+            .filter(|q| !plan.dead_blocks.contains(q) && !plan.skipped_edges.contains(&(**q, b)))
             .all(|&q| q == d || region_set.contains(&q))
         {
             return None;
         }
     }
-    // Single-exit: every predecessor of `join` must be `d` or inside
-    // `region_set` (excluding dead blocks).
     if !p.blocks[join]
         .preds
         .iter()
-        .filter(|q| !plan.dead_blocks.contains(q))
+        .filter(|q| !plan.dead_blocks.contains(q) && !plan.skipped_edges.contains(&(**q, join)))
         .all(|&q| q == d || region_set.contains(&q))
     {
         return None;
     }
-    // Only predicate when at least one block in the diamond needs `in_step`.
     if !region_set.iter().any(|&b| needs[b] && !plan.step[b]) {
         return None;
     }
     let mut region: Vec<usize> = region_set.into_iter().collect();
     region.sort_unstable_by_key(|&b| rpo[b]);
     Some(region)
+}
+
+/// Matches a single-latch, single-exit natural loop `(header, latch, exit)`
+/// whose outside entry predecessors are all `in_step`, containing at least one
+/// candidate block not yet in `in_step`, and with no non-mask SGPR written
+/// inside the loop read outside the loop.
+fn match_lockstep_loop(
+    p: &Program,
+    exits: &[LaneExit],
+    h: usize,
+    rpo: &[usize],
+    needs: &[bool],
+    plan: &PredicatePlan,
+) -> Option<(usize, usize, bool, Set<usize>)> {
+    let preds = eff_preds(exits, &plan.dead_blocks, h);
+    let mut back_preds = Vec::new();
+    let mut out_preds = Vec::new();
+    for q in preds {
+        if rpo[q] >= rpo[h] {
+            back_preds.push(q);
+        } else {
+            out_preds.push(q);
+        }
+    }
+    if back_preds.len() != 1 || out_preds.is_empty() {
+        return None;
+    }
+    let latch = back_preds[0];
+    if plan.exits.contains_key(&latch)
+        || plan.in_diamond.contains(&latch)
+        || plan.in_lockstep_loop.contains(&h)
+        || plan.in_lockstep_loop.contains(&latch)
+    {
+        return None;
+    }
+    // Every outside predecessor entering the loop must already be `in_step`.
+    if !out_preds.iter().all(|&q| plan.step[q]) {
+        return None;
+    }
+    let LaneExit::Branch {
+        taken, not_taken, ..
+    } = exits[latch]
+    else {
+        return None;
+    };
+    let (exit, stay_when_true) = if taken == h && not_taken != h {
+        (not_taken, true)
+    } else if not_taken == h && taken != h {
+        (taken, false)
+    } else {
+        return None;
+    };
+    if rpo[exit] <= rpo[h]
+        || plan.lockstep_exits.contains_key(&exit)
+        || plan.diamond_joins.contains_key(&exit)
+    {
+        return None;
+    }
+
+    // Collect the natural loop body by reverse DFS from `latch` stopping at `h`.
+    let mut body = Set::default();
+    body.insert(h);
+    let mut stack = vec![latch];
+    while let Some(b) = stack.pop() {
+        if !body.insert(b) {
+            continue;
+        }
+        if body.len() > MAX_LOCKSTEP_LOOP_BLOCKS
+            || plan.in_diamond.contains(&b)
+            || plan.in_lockstep_loop.contains(&b)
+            || plan.dead_blocks.contains(&b)
+        {
+            return None;
+        }
+        for q in eff_preds(exits, &plan.dead_blocks, b) {
+            if !body.contains(&q) {
+                if rpo[q] < rpo[h] {
+                    return None; // side entry into loop body
+                }
+                stack.push(q);
+            }
+        }
+    }
+
+    // Single exit: every edge from `body` stays inside `body`, except `latch -> exit`,
+    // and no nested cycle exists inside `body`.
+    for &b in &body {
+        let succs: Vec<usize> = match exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                taken: t,
+                not_taken: f,
+                ..
+            } => vec![t, f],
+            LaneExit::End | LaneExit::Indirect => return None,
+        };
+        for t in succs {
+            if b == latch && t == exit {
+                continue;
+            }
+            if !body.contains(&t) {
+                return None; // second exit out of loop
+            }
+            if rpo[t] <= rpo[b] && !(b == latch && t == h) {
+                return None; // nested cycle inside loop
+            }
+        }
+    }
+    // `exit` must only be entered by `latch` under `eff_exits`.
+    if eff_preds(exits, &plan.dead_blocks, exit) != [latch] {
+        return None;
+    }
+    if !body.iter().any(|&b| needs[b] && !plan.step[b]) {
+        return None;
+    }
+
+    // Soundness check: no non-EXEC/VCC SGPR or SCC written inside `body` may
+    // be read outside `body` (inactive lanes spinning in lockstep overwrite
+    // scalar registers without per-lane guarding).
+    let is_mask_reg = |r: Reg| matches!(r, Reg::S(k) if [EXEC, EXEC + 1, VCC, VCC + 1].contains(&k));
+    let mut loop_scalars: Set<Value> = Set::default();
+    for &b in &body {
+        for phi in &p.blocks[b].phis {
+            if matches!(phi.reg, Reg::S(_) | Reg::Scc) && !is_mask_reg(phi.reg) {
+                loop_scalars.insert(phi.value);
+            }
+        }
+        for inst in &p.blocks[b].insts {
+            for &(r, v) in &inst.writes {
+                if matches!(r, Reg::S(_) | Reg::Scc) && !is_mask_reg(r) {
+                    loop_scalars.insert(v);
+                }
+            }
+        }
+    }
+    if !loop_scalars.is_empty() {
+        for (b, block) in p.blocks.iter().enumerate() {
+            if body.contains(&b) || plan.dead_blocks.contains(&b) {
+                continue;
+            }
+            for phi in &block.phis {
+                if phi.args.iter().any(|v| loop_scalars.contains(v)) {
+                    return None;
+                }
+            }
+            for inst in &block.insts {
+                if inst.reads.iter().any(|(_, v)| loop_scalars.contains(v)) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some((latch, exit, stay_when_true, body))
 }
 
 fn post_dominators(exits: &[LaneExit]) -> Vec<Vec<u64>> {
@@ -523,12 +953,11 @@ fn immediate_post_dominators(exits: &[LaneExit], pdom: &[Vec<u64>]) -> Vec<Optio
         .map(|b| {
             let mut best: Option<(u32, usize)> = None;
             for (cand, &sz) in sizes.iter().enumerate() {
-                if cand != b && contains(&pdom[b], cand) {
-                    // The immediate post-dominator is the strict post-dominator
-                    // with the largest pdom set (closest to `b`).
-                    if best.is_none_or(|(best_sz, _)| sz > best_sz) {
-                        best = Some((sz, cand));
-                    }
+                if cand != b
+                    && contains(&pdom[b], cand)
+                    && best.is_none_or(|(best_sz, _)| sz > best_sz)
+                {
+                    best = Some((sz, cand));
                 }
             }
             best.map(|(_, cand)| cand)
@@ -544,15 +973,27 @@ impl Lower<'_> {
     }
 
     /// Computes `self.block_active[b]` at the start of IR block `b` (when
-    /// `self.pred` is non-empty) and lowers linearized phis at `b` into
-    /// `select` chains instead of DXIL phis.
+    /// `self.pred` is non-empty) and lowers phis at linearized merges or
+    /// `SkipGuard` joins.
     pub(super) fn enter_predicated_block(&mut self, b: usize) -> Result<bool, Stop> {
         if self.pred.is_empty() {
             return Ok(false);
         }
         // 1. Compute `block_active[b]`.
-        let active = if let Some(&d) = self.pred.diamond_joins.get(&b) {
+        let active = if let Some(&latch) = self.pred.lockstep_headers.get(&b) {
+            let outer = self.pred_outer_active(b);
+            self.loop_outer_active.insert(b, outer);
+            let phi = self.s.m.phi(self.cur, self.s.t.i1);
+            self.loop_act_phis.push((phi, b, latch));
+            Some(phi)
+        } else if let Some(&d) = self.pred.skip_joins.get(&b) {
             self.pred_active(d)
+        } else if let Some(&d) = self.pred.diamond_joins.get(&b) {
+            self.pred_active(d)
+        } else if let Some(&h) = self.pred.lockstep_exits.get(&b) {
+            self.loop_outer_active.get(&h).copied().flatten()
+        } else if let Some(&d) = self.pred.skip_bodies.get(&b) {
+            self.pred_edge_active.get(&(d, b)).copied()
         } else if self.pred.in_diamond.contains(&b) {
             let mut acc: Option<V> = None;
             for &q in &self.x.p.blocks[b].preds {
@@ -569,24 +1010,23 @@ impl Lower<'_> {
         } else if self.pred.skipped_ends.contains(&b) {
             None
         } else {
-            let idom = self.pred.idom.get(b).copied().unwrap_or(b);
-            if idom != b && idom != usize::MAX {
-                self.pred_active(idom)
-            } else {
-                None
-            }
+            self.pred_outer_active(b)
         };
         self.block_active[b] = active;
+
+        if let Some(&d) = self.pred.skip_joins.get(&b) {
+            self.lower_skip_join_phis(b, d);
+            return Ok(true);
+        }
 
         if !self.pred.linear_merges.contains(&b) {
             return Ok(false);
         }
 
         // 2. Lower IR phis in linearized merge block `b` directly as `select`
-        // chains over `b`'s original IR predecessors (all already lowered in
-        // RPO order and strictly dominating `b`).
+        // chains over `b`'s original IR predecessors.
         let preds = &self.x.p.blocks[b].preds;
-        for (i, phi) in self.x.p.blocks[b].phis.iter().enumerate() {
+        for phi in &self.x.p.blocks[b].phis {
             if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
                 self.vals.insert(phi.value, Val::Missing("a lane mask"));
                 continue;
@@ -646,14 +1086,110 @@ impl Lower<'_> {
                     }
                 }
             };
-            let _ = i;
             self.vals.insert(phi.value, result);
         }
         Ok(true)
     }
 
-    /// Evaluates a mask phi (`Atom::Phi`) at a linearized merge block `b` as a
-    /// `select` chain over `b`'s original predecessors.
+    fn pred_outer_active(&self, b: usize) -> Option<V> {
+        let idom = self.pred.idom.get(b).copied().unwrap_or(b);
+        if idom != b && idom != usize::MAX {
+            self.pred_active(idom)
+        } else {
+            None
+        }
+    }
+
+    /// Lowers phis at a `SkipGuard` join block `b` (where edge `d -> b` was
+    /// bypassed through `body`): selects `act_body ? v_body : v_d`, creating a
+    /// DXIL phi over the live body predecessors when there are two or more.
+    fn lower_skip_join_phis(&mut self, b: usize, d: usize) {
+        let FlatExit::SkipGuard { body } = self.pred.exits[&d] else {
+            return;
+        };
+        let act_body = self.pred_edge_active[&(d, body)];
+        let preds = &self.x.p.blocks[b].preds;
+        let skip_idx = preds.iter().position(|&q| q == d);
+        let body_preds: Vec<(usize, usize)> = preds
+            .iter()
+            .enumerate()
+            .filter_map(|(n, &q)| {
+                (q != d
+                    && !self.pred.dead_blocks.contains(&q)
+                    && !self.pred.skipped_edges.contains(&(q, b))
+                    && self.tail[q].is_some())
+                .then_some((n, q))
+            })
+            .collect();
+
+        for (i, phi) in self.x.p.blocks[b].phis.iter().enumerate() {
+            if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                self.vals.insert(phi.value, Val::Missing("a lane mask"));
+                continue;
+            }
+            if let Some(&why) = self.bad.get(&phi.value) {
+                self.vals.insert(phi.value, Val::Missing(why));
+                continue;
+            }
+            let bit = phi.reg == Reg::Scc;
+            let zero = |l: &mut Self| {
+                if bit {
+                    l.s.m.bool(false)
+                } else {
+                    l.s.m.i32(0)
+                }
+            };
+            let v_d = match skip_idx {
+                Some(n_d) => {
+                    let arg = phi.args[n_d];
+                    match (self.vals.get(&arg).copied(), bit) {
+                        (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => Ok(x),
+                        _ if self.never_taken(d, b) || self.dead_on_edge(b, n_d, phi.reg) => {
+                            Ok(zero(self))
+                        }
+                        (Some(Val::Missing(why)), _) => Err(why),
+                        _ => Err("a join of mismatched values"),
+                    }
+                }
+                None => Ok(zero(self)),
+            };
+            let v_body = match body_preds.as_slice() {
+                [] => Ok(zero(self)),
+                &[(n_q, q)] => {
+                    let arg = phi.args[n_q];
+                    match (self.vals.get(&arg).copied(), bit) {
+                        (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => Ok(x),
+                        _ if self.never_taken(q, b) || self.dead_on_edge(b, n_q, phi.reg) => {
+                            Ok(zero(self))
+                        }
+                        (Some(Val::Missing(why)), _) => Err(why),
+                        _ => Err("a join of mismatched values"),
+                    }
+                }
+                _ => {
+                    let ty = if bit { self.s.t.i1 } else { self.s.t.i32 };
+                    let v = self.s.m.phi(self.cur, ty);
+                    self.data_phis.push((v, b, i));
+                    Ok(v)
+                }
+            };
+            let result = match (v_body, v_d) {
+                (Ok(vb), Ok(vd)) => {
+                    let sel = self.s.m.select(self.cur, act_body, vb, vd);
+                    if bit {
+                        Val::Bit(sel)
+                    } else {
+                        Val::I32(sel)
+                    }
+                }
+                (Err(why), _) | (_, Err(why)) => Val::Missing(why),
+            };
+            self.vals.insert(phi.value, result);
+        }
+    }
+
+    /// Evaluates a mask phi (`Atom::Phi`) at a linearized merge or `SkipGuard`
+    /// join block `b`.
     pub(super) fn predicated_mask_phi(
         &mut self,
         id: Value,
@@ -661,6 +1197,52 @@ impl Lower<'_> {
         i: usize,
         at: usize,
     ) -> Result<V, Why> {
+        if let Some(&d) = self.pred.skip_joins.get(&b) {
+            let FlatExit::SkipGuard { body } = self.pred.exits[&d] else {
+                return Err("a lane-mask join without a skip guard");
+            };
+            let act_body = self.pred_edge_active[&(d, body)];
+            let phi = &self.x.p.blocks[b].phis[i];
+            let preds = &self.x.p.blocks[b].preds;
+            let m_d = match preds.iter().position(|&q| q == d) {
+                Some(n_d) => match (self.x.st.masks.get(&phi.args[n_d]), self.tail[d]) {
+                    (Some(&m), Some(db)) => self.boolean(m, db)?,
+                    _ => self.s.m.bool(false),
+                },
+                None => self.s.m.bool(false),
+            };
+            let body_preds: Vec<(usize, usize)> = preds
+                .iter()
+                .enumerate()
+                .filter_map(|(n, &q)| {
+                    (q != d
+                        && !self.pred.dead_blocks.contains(&q)
+                        && !self.pred.skipped_edges.contains(&(q, b))
+                        && self.tail[q].is_some())
+                    .then_some((n, q))
+                })
+                .collect();
+            let m_body = match body_preds.as_slice() {
+                [] => self.s.m.bool(false),
+                &[(n_q, q)] => {
+                    let qb = self.tail[q].expect("tail");
+                    match self.x.st.masks.get(&phi.args[n_q]) {
+                        Some(&m) => self.boolean(m, qb)?,
+                        None => self.s.m.bool(false),
+                    }
+                }
+                _ => {
+                    let blk = self.block[b].ok_or("an unreachable join")?;
+                    let v = self.s.m.phi(blk, self.s.t.i1);
+                    self.pending_masks.push((v, b, i));
+                    v
+                }
+            };
+            let v = self.s.m.select(at, act_body, m_body, m_d);
+            self.mask_phis.insert(id, v);
+            return Ok(v);
+        }
+
         let phi = &self.x.p.blocks[b].phis[i];
         let preds = &self.x.p.blocks[b].preds;
         let mut acc: Option<V> = None;
@@ -687,9 +1269,37 @@ impl Lower<'_> {
         Ok(v)
     }
 
+    /// Populates `loop_act` phis at all lockstep-predicated loop headers after
+    /// all IR blocks and critical edges have been lowered.
+    pub(super) fn fill_predicated_phis(&mut self) {
+        let p = self.x.p;
+        for (phi, h, latch) in std::mem::take(&mut self.loop_act_phis) {
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[h].preds {
+                if self.pred.dead_blocks.contains(&q) || self.pred.skipped_edges.contains(&(q, h)) {
+                    continue;
+                }
+                let Some(qb) = self.tail[q] else { continue };
+                let from = if q == latch {
+                    qb
+                } else {
+                    self.edges.get(&(q, h)).copied().unwrap_or(qb)
+                };
+                let act = self
+                    .pred_edge_active
+                    .get(&(q, h))
+                    .copied()
+                    .or_else(|| self.pred_active(q))
+                    .unwrap_or_else(|| self.s.m.bool(true));
+                incoming.push((act, from));
+            }
+            self.s.m.set_phi(phi, incoming);
+        }
+    }
+
     /// Records per-edge active predicates at the end of IR block `b` and, if
-    /// `b` has a flattened exit in `self.pred`, returns its replacement
-    /// unconditional terminator `Some(Term::Br(next))`.
+    /// `b` has a flattened or lockstep exit in `self.pred`, returns its
+    /// replacement terminator.
     pub(super) fn exit_predicated_block(&mut self, b: usize) -> Result<Option<Term>, Stop> {
         let Some(&flat) = self.pred.exits.get(&b) else {
             return Ok(None);
@@ -700,6 +1310,73 @@ impl Lower<'_> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let cur = self.cur;
         let base_act = self.pred_active(b);
+        let and_base = |l: &mut Self, cond: V| match base_act {
+            Some(a) => l.s.m.bin(cur, Bin::And, a, cond),
+            None => cond,
+        };
+        match flat {
+            FlatExit::LockstepLatch {
+                header,
+                exit,
+                stay_when_true,
+            } => {
+                let LaneExit::Branch { when, .. } = self.x.st.exits[b] else {
+                    return Ok(None);
+                };
+                let cond = self
+                    .boolean(when, cur)
+                    .map_err(|w| unsupported(offset, w))?;
+                let stay = if stay_when_true {
+                    cond
+                } else {
+                    let t = self.s.m.bool(true);
+                    self.s.m.bin(cur, Bin::Xor, cond, t)
+                };
+                let next_act = and_base(self, stay);
+                self.pred_edge_active.insert((b, header), next_act);
+                let any = self
+                    .group_any_true(next_act, cur)
+                    .map_err(|w| unsupported(offset, w))?;
+                let ok = self.count_iteration(header, pred::IULT);
+                let go = self.s.m.bin(cur, Bin::And, any, ok);
+                let exit_blk = self.edge(b, exit);
+                let from = if Some(exit_blk) == self.block[exit] {
+                    cur
+                } else {
+                    exit_blk
+                };
+                self.enter_loop(b, exit, from);
+                Ok(Some(Term::CondBr(
+                    go,
+                    self.block[header].expect("reachable"),
+                    exit_blk,
+                )))
+            }
+            FlatExit::EarlyOut { cont } => {
+                self.record_branch_edge_actives(b, cur, offset, base_act)?;
+                self.enter_loop(b, cont, cur);
+                Ok(Some(Term::Br(self.block[cont].expect("reachable"))))
+            }
+            FlatExit::SkipGuard { body } => {
+                self.record_branch_edge_actives(b, cur, offset, base_act)?;
+                self.enter_loop(b, body, cur);
+                Ok(Some(Term::Br(self.block[body].expect("reachable"))))
+            }
+            FlatExit::Linear { next } => {
+                self.record_branch_edge_actives(b, cur, offset, base_act)?;
+                self.enter_loop(b, next, cur);
+                Ok(Some(Term::Br(self.block[next].expect("reachable"))))
+            }
+        }
+    }
+
+    fn record_branch_edge_actives(
+        &mut self,
+        b: usize,
+        cur: usize,
+        offset: usize,
+        base_act: Option<V>,
+    ) -> Result<(), Stop> {
         let and_base = |l: &mut Self, cond: V| match base_act {
             Some(a) => l.s.m.bin(cur, Bin::And, a, cond),
             None => cond,
@@ -726,11 +1403,6 @@ impl Lower<'_> {
             }
             LaneExit::End | LaneExit::Indirect => {}
         }
-        let target = match flat {
-            FlatExit::EarlyOut { cont } => cont,
-            FlatExit::Linear { next } => next,
-        };
-        self.enter_loop(b, target, cur);
-        Ok(Some(Term::Br(self.block[target].expect("reachable"))))
+        Ok(())
     }
 }

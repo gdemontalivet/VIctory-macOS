@@ -188,6 +188,64 @@ impl Lower<'_> {
         self.exchange_halves(own, zero, at)
     }
 
+    /// Group-wide logical OR of `bit` across every lane of every host wave in
+    /// the threadgroup, so every host wave exits a lockstep predicated loop on
+    /// the exact same iteration (never deadlocking at group barriers inside
+    /// `exchange_halves`). Reuses `self.half_words` (zero extra LDS bytes).
+    pub(super) fn group_any_true(&mut self, bit: V, at: usize) -> Result<V, Why> {
+        let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.s.m.extract(at, r, 0);
+        let zero = self.s.m.i32(0);
+        if group <= HALF {
+            return Ok(self.s.m.cmp(at, pred::NE, own, zero));
+        }
+        if group <= 2 * HALF {
+            let (lo, hi) = self.exchange_halves(own, zero, at)?;
+            let any = self.s.m.bin(at, Bin::Or, lo, hi);
+            return Ok(self.s.m.cmp(at, pred::NE, any, zero));
+        }
+        let dwords = group.div_ceil(2 * HALF) * 2;
+        if self.s.lds_dwords + dwords > GROUP_SHARED_DWORDS {
+            return Err("no group-shared memory left to pass values between 32-lane halves");
+        }
+        let f = self.relabelled_flat();
+        let words = match self.half_words {
+            Some(g) => g,
+            None => {
+                let arr = self.s.m.array(dwords, i32t);
+                let g = self.s.m.global("half_words", arr, 3);
+                self.half_words = Some(g);
+                g
+            }
+        };
+        let five = self.s.m.i32(5);
+        let slot = self.s.m.bin(at, Bin::LShr, f, five);
+        let sync = |l: &mut Self| {
+            let mode = l.s.m.i32(1 | 8);
+            let void = l.s.t.void;
+            l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        };
+        sync(self);
+        let mine = self.s.m.element(at, words, slot);
+        self.s.m.store(at, mine, own);
+        sync(self);
+        let host_waves = group.div_ceil(HALF);
+        let mut acc = zero;
+        for w in 0..host_waves {
+            let idx = self.s.m.i32(w);
+            let ptr = self.s.m.element(at, words, idx);
+            let val = self.s.m.load(at, ptr);
+            acc = self.s.m.bin(at, Bin::Or, acc, val);
+        }
+        Ok(self.s.m.cmp(at, pred::NE, acc, zero))
+    }
+
     /// What each half of this lane's console wave gave as `own` (a dword
     /// the same in every lane of a host wave): (lower half's, upper half's).
     /// Each host wave stores its own in a group-shared dword of its own, and
@@ -586,6 +644,20 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let regions = branch_regions(st);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
+    let mut tid_aliases: HashSet<Value> = wave_tid.into_iter().collect();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if inst.name() == "v_mov_b32"
+                && let Fields::Valu(v) = &inst.fields
+                && v.dpp.is_none()
+                && v.sdwa.is_none()
+                && let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                && inst.read(Reg::V(reg)).is_some_and(|x| tid_aliases.contains(&x))
+            {
+                tid_aliases.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
+            }
+        }
+    }
     let mut same: HashSet<Value> = entry_tids.iter().copied().collect();
     loop {
         let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
@@ -714,6 +786,40 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     continue;
                 }
+                // An image load / sample at wave-uniform coordinates and scalar
+                // descriptors reads one value in every lane.
+                if let Fields::Image {
+                    addr,
+                    rsrc,
+                    sampler,
+                    ..
+                } = &inst.fields
+                    && (name.starts_with("image_load")
+                        || name.starts_with("image_sample")
+                        || name.starts_with("image_gather"))
+                {
+                    let addr_ok = addr.iter().all(|op| match *op {
+                        Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                            inst.read(Reg::V(reg + k))
+                                .is_some_and(|v| known(&next, &v))
+                        }),
+                        _ => true,
+                    });
+                    let sc_ok = |op: &Operand| match *op {
+                        Operand::Scalar { code, dwords } if code != NULL => (0..dwords)
+                            .all(|k| inst.read(Reg::S(code + k)).is_none_or(|v| !per_lane(v))),
+                        _ => true,
+                    };
+                    if addr_ok && sc_ok(rsrc) && sampler.as_ref().is_none_or(sc_ok) {
+                        next.extend(
+                            inst.writes
+                                .iter()
+                                .filter(|w| matches!(w.0, Reg::V(_)))
+                                .map(|w| w.1),
+                        );
+                    }
+                    continue;
+                }
                 // An LDS read at an alike address reads one value in every lane.
                 if let Fields::Ds {
                     addr: Some(Operand::Vector { reg, .. }),
@@ -754,9 +860,9 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     Operand::Literal(l) => Some(l),
                     _ => None,
                 };
-                if let Some(tid) = wave_tid {
+                if !tid_aliases.is_empty() {
                     let is_tid = |op: &Operand| {
-                        matches!(*op, Operand::Vector { reg, .. } if inst.read(Reg::V(reg)) == Some(tid))
+                        matches!(*op, Operand::Vector { reg, .. } if inst.read(Reg::V(reg)).is_some_and(|x| tid_aliases.contains(&x)))
                     };
                     let wave_derived = match (name, ops.as_slice()) {
                         ("v_lshrrev_b32", [shift, src, ..])

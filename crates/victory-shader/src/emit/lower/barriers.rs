@@ -141,15 +141,21 @@ pub(crate) fn split_wave_barriers_with_step(
 /// itself), and the regions and the scalars are narrowed together to a
 /// fixed point. With an indirect branch, the blocks each lane runs once.
 pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
-    in_step_with(p, st, &st.exits)
+    in_step_with(p, st, &st.exits, &Set::default())
 }
 
 /// [`in_step`] evaluated over `exits` (either `st.exits` or exits after
-/// selective acyclic predication), tracking both group-uniform SGPRs and
-/// group-uniform VGPRs (so a uniform loop bound loaded via `buffer_load` /
-/// `global_load` / `ds_read` and moved through `v_readfirstlane_b32` stays
-/// group-uniform).
-pub(crate) fn in_step_with(p: &Program, st: &Structured, exits: &[LaneExit]) -> Vec<bool> {
+/// selective predication), with `uniform_branches` naming latch blocks whose
+/// branch condition has been promoted to a group-wide predicate, tracking both
+/// group-uniform SGPRs and group-uniform VGPRs (so a uniform loop bound loaded
+/// via `buffer_load` / `global_load` / `image_load` / `ds_read` and moved
+/// through `v_readfirstlane_b32` stays group-uniform).
+pub(crate) fn in_step_with(
+    p: &Program,
+    st: &Structured,
+    exits: &[LaneExit],
+    uniform_branches: &Set<usize>,
+) -> Vec<bool> {
     let Some(regions) = halves::branch_regions_with(exits) else {
         return once_per_lane(p);
     };
@@ -215,11 +221,12 @@ pub(crate) fn in_step_with(p: &Program, st: &Structured, exits: &[LaneExit]) -> 
             let LaneExit::Branch { when, .. } = exits[*d] else {
                 continue;
             };
-            let together = st
-                .bools
-                .support(when)
-                .iter()
-                .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)));
+            let together = uniform_branches.contains(d)
+                || st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)));
             if !together {
                 for (b, &r) in region.iter().enumerate() {
                     step[b] &= !r;
@@ -322,6 +329,36 @@ pub(crate) fn in_step_with(p: &Program, st: &Structured, exits: &[LaneExit]) -> 
                             _ => true,
                         };
                         if addr_ok && saddr_ok {
+                            next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
+                        }
+                    }
+                    Fields::Image {
+                        addr,
+                        rsrc,
+                        sampler,
+                        cache,
+                        ..
+                    } if (name.starts_with("image_load")
+                        || name.starts_with("image_sample")
+                        || name.starts_with("image_gather"))
+                        && !cache.glc =>
+                    {
+                        let addr_ok = addr.iter().all(|op| match *op {
+                            Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                                inst.read(Reg::V(reg + k))
+                                    .is_some_and(|v| alike_v.contains(&v))
+                            }),
+                            _ => true,
+                        });
+                        let sc_ok = |op: &Operand| match *op {
+                            Operand::Scalar { code, dwords } if code != NULL => (0..dwords)
+                                .all(|k| {
+                                    let r = Reg::S(code + k);
+                                    !mask(r) && inst.read(r).is_none_or(|v| alike.contains(&v))
+                                }),
+                            _ => true,
+                        };
+                        if addr_ok && sc_ok(rsrc) && sampler.as_ref().is_none_or(sc_ok) {
                             next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
                         }
                     }

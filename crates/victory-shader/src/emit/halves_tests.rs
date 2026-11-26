@@ -2013,3 +2013,287 @@ fn uniform_buffer_load_loop_across_halves_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// Skip-guard (`if (tid >= keep_from) { for (i = 0..3) { ... } }`) followed by
+/// a tail store: exercises `SkipGuard` predication around a uniform loop
+/// containing cross-half ballot, `v_readfirstlane_b32` (including upper-half
+/// only), and f32 wave reduction, plus `SkipGuard` join-phi preservation (`999`
+/// for inactive lanes).
+fn skip_guard_uniform_loop_program(keep_from: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E0C_02FF,
+        999, // v_mov_b32 v6, 999
+        0x7E0E_02FF,
+        999, // v_mov_b32 v7, 999
+        0x7E10_02FF,
+        999, // v_mov_b32 v8, 999
+        0x7D86_00FF,
+        keep_from,   // v_cmp_le_u32 vcc, lit(keep_from), v0 (v0 >= keep_from)
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    ]);
+    let skip_at = w.len();
+    w.push(0); // patched to `s_cbranch_execz join`
+
+    let mut body = vec![
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE94_0380, // s_mov_b32 s20, 0
+    ];
+    let mut loop_body = vec![
+        0x7D88_00FF,
+        50,          // v_cmp_gt_u32 vcc, 50, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x4A0C_0C0C, // v_add_nc_u32 v6, s12, v6
+        0x7E1A_0500, // v_readfirstlane_b32 s13, v0
+        0x7E0E_020D, // v_mov_b32 v7, s13
+        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
+    ];
+    emit_reduction_body(&mut loop_body, V_ADD_F32, 0x80);
+    loop_body.push(0x0610_100F); // v_add_f32 v8, s15, v8
+    let back = -(loop_body.len() as i32 + 3);
+    body.extend(loop_body);
+    body.extend([
+        0x8014_8114,                          // s_add_u32 s20, s20, 1
+        0xBF0A_8314,                          // s_cmp_lt_u32 s20, 3
+        0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1
+    ]);
+
+    w[skip_at] = 0xBF88_0000 | (body.len() as u32 & 0xFFFF); // s_cbranch_execz join
+    w.extend(body);
+    w.push(0xBEFE_040A); // s_mov_b64 exec, s[10:11]
+    w.extend(store(6, 0));
+    w.extend(store(7, 4));
+    w.extend(store(8, 8));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Wave64 scalarization loop (`while (exec != 0)`): partitions lanes by a key
+/// (`(v0 >> 3) & 3` plus `4` for `v0 >= 48`) so wave 0 runs 6 iterations
+/// (including cross-half keys, lower-half-only keys, and upper-half-only keys)
+/// while wave 1 runs 4 iterations, using `v_readfirstlane_b32`, `s_bcnt1`,
+/// `s_ff1`, and `v_mbcnt` across both halves inside a `LockstepLoop`.
+fn wave_scalarization_loop_program() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x2C0A_0083, // v_lshrrev_b32 v5, 3, v0
+        0x360A_0A83, // v_and_b32 v5, 3, v5
+        0x7D86_00FF,
+        48,          // v_cmp_le_u32 vcc, 48, v0 (v0 >= 48)
+        0x4A08_0A84, // v_add_nc_u32 v4, 4, v5
+        0xD501_0005,
+        0x01AA_0905, // v_cndmask_b32 v5, v5, v4, vcc
+        0x7E0C_0280, // v_mov_b32 v6, 0 (matched key)
+        0x7E0E_0280, // v_mov_b32 v7, 0 (matched count)
+        0x7E10_0280, // v_mov_b32 v8, 0 (matched first lane)
+        0x7E12_0280, // v_mov_b32 v9, 0 (matched mbcnt)
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    ]);
+    let loop_body: Vec<u32> = vec![
+        0x7E18_0505, // v_readfirstlane_b32 s12, v5
+        0x7D84_0A0C, // v_cmp_eq_u32 vcc, s12, v5
+        0xBE8D_106A, // s_bcnt1_i32_b64 s13, vcc
+        0xBE8E_146A, // s_ff1_i32_b64 s14, vcc
+        0xD765_000A,
+        0x0001_006A, // v_mbcnt_lo_u32_b32 v10, vcc_lo, 0
+        0xD766_000A,
+        0x0002_146B, // v_mbcnt_hi_u32_b32 v10, vcc_hi, v10
+        0xD501_0006,
+        0x01A8_1906, // v_cndmask_b32 v6, v6, s12, vcc
+        0xD501_0007,
+        0x01A8_1B07, // v_cndmask_b32 v7, v7, s13, vcc
+        0xD501_0008,
+        0x01A8_1D08, // v_cndmask_b32 v8, v8, s14, vcc
+        0xD501_0009,
+        0x01AA_1509, // v_cndmask_b32 v9, v9, v10, vcc
+        0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+    ];
+    let back = -(loop_body.len() as i32 + 1);
+    w.extend(loop_body);
+    w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz loop
+    w.push(0xBEFE_040A); // s_mov_b64 exec, s[10:11]
+    w.extend(store(6, 0));
+    w.extend(store(7, 4));
+    w.extend(store(8, 8));
+    w.extend(store(9, 12));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Early-out branching to a shared epilogue trampoline (`s_mov_b64 exec, -1;
+/// s_branch end`) followed by 64-bit lane-mask arithmetic (`s_and_b64`,
+/// `s_bcnt1_i32_b64`, `s_ff1_i32_b64`, and high-dword `s[15]` extraction).
+fn trampoline_early_out_mask_program() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7D88_00FF,
+        45,          // v_cmp_gt_u32 vcc, 45, v0 (v0 < 45)
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    ]);
+    let branch_at = w.len();
+    w.push(0); // patched to `s_cbranch_execz trampoline`
+
+    let mut body = vec![
+        0x7D86_00FF,
+        10,          // v_cmp_le_u32 vcc, 10, v0 (v0 >= 10)
+        0xBE8E_046A, // s_mov_b64 s[14:15], vcc
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0 (v0 < 40)
+        0x878E_6A0E, // s_and_b64 s[14:15], s[14:15], vcc (10 <= v0 < 40)
+        0xBE8C_100E, // s_bcnt1_i32_b64 s12, s[14:15]
+        0xBE8D_140E, // s_ff1_i32_b64 s13, s[14:15]
+        0x7E0C_020C, // v_mov_b32 v6, s12
+        0x7E0E_020D, // v_mov_b32 v7, s13
+        0x7E10_020F, // v_mov_b32 v8, s15 (high 32-bit mask word: lanes 32..39)
+    ];
+    body.extend(store(6, 0));
+    body.extend(store(7, 4));
+    body.extend(store(8, 8));
+    body.push(0xBF82_0002); // s_branch +2 (skip trampoline to S_ENDPGM)
+
+    w[branch_at] = 0xBF88_0000 | (body.len() as u32 & 0xFFFF); // s_cbranch_execz trampoline
+    w.extend(body);
+    // Epilogue trampoline: restores EXEC and branches to S_ENDPGM.
+    w.push(0xBEFE_04C1); // s_mov_b64 exec, -1
+    w.push(0xBF82_0000); // s_branch +0 (next word is S_ENDPGM)
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_extended_halves_programs_are_what_their_comments_say() {
+    let programs: Vec<(Vec<u32>, &[&str])> = vec![
+        (
+            skip_guard_uniform_loop_program(36),
+            &[
+                "v_cmp_le_u32 vcc, lit(0x00000024), v0",
+                "s_and_saveexec_b64 s[10:11], vcc",
+                "s_cbranch_execz",
+                "v_readfirstlane_b32 s13, v0",
+                "s_cmp_lt_u32 s20, 3",
+                "s_mov_b64 exec, s[10:11]",
+            ],
+        ),
+        (
+            wave_scalarization_loop_program(),
+            &[
+                "v_lshrrev_b32 v5, 3, v0",
+                "v_and_b32 v5, 3, v5",
+                "v_readfirstlane_b32 s12, v5",
+                "v_cmp_eq_u32 vcc, s12, v5",
+                "s_bcnt1_i32_b64 s13, vcc",
+                "s_ff1_i32_b64 s14, vcc",
+                "s_andn2_b64 exec, exec, vcc",
+                "s_cbranch_execnz",
+            ],
+        ),
+        (
+            trampoline_early_out_mask_program(),
+            &[
+                "v_cmp_gt_u32 vcc, lit(0x0000002d), v0",
+                "s_and_b64 s[14:15], s[14:15], vcc",
+                "s_bcnt1_i32_b64 s12, s[14:15]",
+                "s_ff1_i32_b64 s13, s[14:15]",
+                "v_mov_b32 v8, s15",
+            ],
+        ),
+    ];
+    for (words, wants) in programs {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in wants {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+#[test]
+fn skip_guard_with_uniform_loop_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for keep_from in [20u32, 36u32] {
+        let words = skip_guard_uniform_loop_program(keep_from);
+        let n = native(&words, true, 64, 0);
+        let lowered = lowered_with(&n, true, true).expect("skip-guard uniform loop lowers");
+        assert_eq!(lowered.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let bcnt = (keep_from..50).count() as u32;
+        let sum = (keep_from..64).sum::<u32>() as f32;
+        let want: Vec<u32> = (0..64)
+            .flat_map(|l| {
+                if l >= keep_from {
+                    [3 * bcnt, keep_from, (3.0 * sum).to_bits()]
+                } else {
+                    [999, 999, 999]
+                }
+            })
+            .collect();
+        failed.extend(differences_with(&words, 64, 3, &want, 0, true));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn wave_scalarization_lockstep_loop_matches_the_console_on_every_gpu() {
+    let words = wave_scalarization_loop_program();
+    let mut failed = Vec::new();
+    let key_of = |l: u32| ((l >> 3) & 3) + if l >= 48 { 4 } else { 0 };
+    for threads in [64, 96, 128] {
+        let n = native(&words, true, threads, 0);
+        let lowered = lowered_with(&n, true, true).expect("scalarization loop lowers");
+        assert_eq!(lowered.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| {
+                let wave = l & !63;
+                let end = (wave + 64).min(threads);
+                let k = key_of(l);
+                let peers: Vec<u32> = (wave..end).filter(|&t| key_of(t) == k).collect();
+                let count = peers.len() as u32;
+                let ff1 = peers[0] - wave;
+                let mbcnt = peers.iter().filter(|&&t| t < l).count() as u32;
+                [k, count, ff1, mbcnt]
+            })
+            .collect();
+        failed.extend(differences_with(&words, threads, 4, &want, 0, true));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn trampoline_early_out_and_mask_data_match_the_console_on_every_gpu() {
+    let words = trampoline_early_out_mask_program();
+    let n = native(&words, true, 64, 0);
+    let lowered = lowered_with(&n, true, true).expect("trampoline early-out lowers");
+    assert_eq!(lowered.wave_size, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut lowered.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    // Active lanes 0..45; intersection with 10 <= v0 < 40 is lanes 10..40 (30 lanes,
+    // first lane = 10, high dword = bits 0..7 = 0xFF). Inactive lanes 45..64 stay 0.
+    let want: Vec<u32> = (0..64)
+        .flat_map(|l| if l < 45 { [30, 10, 0xFF] } else { [0, 0, 0] })
+        .collect();
+    let failed = differences_with(&words, 64, 3, &want, 0, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
