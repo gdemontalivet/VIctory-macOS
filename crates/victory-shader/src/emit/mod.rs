@@ -249,6 +249,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;
+pub mod heap_sources;
+pub use heap_sources::{BufferBinding, HeapIndexSource, ScalarSource};
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -377,6 +379,10 @@ pub struct HostShader {
     /// Whether some of those are unordered access views: it may write
     /// through any of the heap's.
     pub heap_writes: bool,
+    /// Generic sources of `ResourceDescriptorHeap` texture indices extracted
+    /// from pixel-shader IR, for pre-uploading urgent bindless sources ahead
+    /// of one-time composite/bake draws.
+    pub heap_index_sources: Vec<HeapIndexSource>,
     /// Whether it marks the pages it writes through buffer views: the host
     /// binds the view-mark table `t`[`VIEW_MARKS`] and the bitmap
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
@@ -842,16 +848,30 @@ fn emit_pruned(
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
     };
-    let l = match lower::lower_pruned(&parts(st, res), keep) {
+    let (l, heap_index_sources) = match lower::lower_pruned(&parts(st, res), keep) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_pruned(&parts(&st, &res), keep)?
+            let l = lower::lower_pruned(&parts(&st, &res), keep)?;
+            let sources = if pixel && l.heap {
+                heap_sources::extract(native, p, &res)
+            } else {
+                Vec::new()
+            };
+            (l, sources)
         }
-        l => l?,
+        l => {
+            let l = l?;
+            let sources = if pixel && l.heap {
+                heap_sources::extract(native, p, res)
+            } else {
+                Vec::new()
+            };
+            (l, sources)
+        }
     };
     Ok(HostShader {
         stage: native.stage,
@@ -879,6 +899,7 @@ fn emit_pruned(
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources,
         view_marks: l.view_marks,
     })
 }
@@ -1530,6 +1551,7 @@ mod tests {
             view_addresses: false,
             heap: false,
             heap_writes: false,
+            heap_index_sources: Vec::new(),
             view_marks: false,
         };
         let file = |var: &str, stage| {
@@ -1548,6 +1570,7 @@ mod tests {
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
+                heap_index_sources: Vec::new(),
                 view_marks: false,
             })
         };

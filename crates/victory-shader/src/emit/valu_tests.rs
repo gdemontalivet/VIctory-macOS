@@ -174,6 +174,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
     };
 
@@ -1770,6 +1771,7 @@ fn lower_cs32_with(
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
     };
     if let (true, Ok(mut v)) = (

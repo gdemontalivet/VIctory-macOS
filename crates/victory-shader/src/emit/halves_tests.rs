@@ -178,6 +178,7 @@ fn shader(l: lower::Lowered) -> super::HostShader {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: l.view_marks,
     }
 }

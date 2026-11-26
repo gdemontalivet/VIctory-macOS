@@ -616,6 +616,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

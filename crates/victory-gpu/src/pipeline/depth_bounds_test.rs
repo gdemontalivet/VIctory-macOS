@@ -71,6 +71,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             view_addresses: false,
             heap: false,
             heap_writes: false,
+            heap_index_sources: Vec::new(),
             view_marks: false,
         },
         used: Vec::new(),
