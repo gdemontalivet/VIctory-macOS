@@ -40,6 +40,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod heap_worker;
 mod hold;
 #[cfg(windows)]
 mod host;

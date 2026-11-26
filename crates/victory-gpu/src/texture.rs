@@ -59,6 +59,9 @@ pub(crate) struct Staging {
     tracked: Option<crate::watch::Tracked>,
     /// True once real readable title memory has been uploaded at least once.
     uploaded_once: std::sync::atomic::AtomicBool,
+    /// Forces a refresh on the next pass even when a tracker reports clean
+    /// (e.g. a pre-staged worker upload was discarded before reaching the GPU).
+    force_refresh: std::sync::atomic::AtomicBool,
     /// Last `crate::queue::presented()` frame on which an untracked check ran.
     checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
@@ -603,11 +606,45 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
     out
 }
 
+/// Outcome of a background-worker texture refresh ([`Staging::refresh_for_worker`]).
+pub(crate) enum WorkerRefresh {
+    /// Title memory changed and was detiled into worker-owned staging space.
+    Uploaded(Upload),
+    /// Title memory is readable and unchanged since the last detile.
+    Unchanged,
+    /// Title memory is currently unmapped/unreadable or staging allocation failed.
+    Unreadable,
+}
+
 impl Staging {
+    /// Bytes required in a staging buffer for this texture.
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size
+    }
+
+    /// Marks that real readable title memory reached a submitted GPU upload.
+    pub(crate) fn mark_uploaded_once(&self) {
+        self.uploaded_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Marks staging state dirty again when a pre-staged worker upload was
+    /// discarded before reaching the GPU.
+    pub(crate) fn invalidate(&self) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.valid = false;
+        last.uploaded = false;
+        last.hashes.clear();
+        self.force_refresh
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        self.force_refresh
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -621,6 +658,134 @@ impl Staging {
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         buffer
+    }
+
+    /// Refreshes title memory on the background heap worker without touching
+    /// `CHUNKS`/`BUFFERS` (allocates exclusively through `alloc`) and without
+    /// entering `workers()` (no rayon work-stealing contention or deadlock).
+    pub(crate) fn refresh_for_worker(
+        &self,
+        alloc: &mut dyn FnMut(u64) -> Option<(ID3D12Resource, u64, *mut u8)>,
+    ) -> WorkerRefresh {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let forced = self
+            .force_refresh
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if let Some(t) = &self.tracked {
+            let last = &mut *guard;
+            let ranges = if forced || !last.uploaded {
+                let _ = t.take(start, start + size);
+                vec![(start, start + size)]
+            } else {
+                if t.clean() {
+                    return WorkerRefresh::Unchanged;
+                }
+                let ranges = t.take(start, start + size);
+                if ranges.is_empty() {
+                    return WorkerRefresh::Unchanged;
+                }
+                ranges
+            };
+            let n = self.footprints.len();
+            let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+            let touched: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                })
+                .collect();
+            let mut scratch = Scratch::take(size);
+            let read = &mut scratch.0[..size];
+            let mut done: Vec<(usize, usize)> = Vec::new();
+            for &i in &touched {
+                let (a, b) = span(i);
+                if !done.contains(&(a, b)) {
+                    // SAFETY: inside `scratch` of the texture's size.
+                    crate::host::copy_mapped(
+                        unsafe { read.as_mut_ptr().add(a) },
+                        self.memory.wrapping_add(a),
+                        b - a,
+                        false,
+                    );
+                    done.push((a, b));
+                }
+            }
+            let page = crate::watch::PAGE;
+            last.hashes.resize(n, None);
+            let fresh: Vec<u32> = touched
+                .into_iter()
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    let (a0, b0) = (start + a, start + b);
+                    if !forced
+                        && ranges.iter().any(|&(f, e)| {
+                            f.max(a0).next_multiple_of(page) + page <= e.min(b0)
+                        })
+                    {
+                        last.hashes[i] = None;
+                        return true;
+                    }
+                    let hash = blake3::hash(&read[a..b]);
+                    forced || last.hashes[i].replace(hash) != Some(hash)
+                })
+                .map(|i| i as u32)
+                .collect();
+            if fresh.is_empty() {
+                return WorkerRefresh::Unchanged;
+            }
+            let buffer = self.detile_into(read, &fresh, alloc);
+            let Some((b, at)) = buffer else {
+                for &i in &fresh {
+                    last.hashes[i as usize] = None;
+                }
+                self.force_refresh
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return WorkerRefresh::Unreadable;
+            };
+            last.uploaded = true;
+            return WorkerRefresh::Uploaded((b, at, fresh));
+        }
+        if guard.comparing {
+            return WorkerRefresh::Unchanged;
+        }
+        let memory = self.memory.expose_provenance();
+        let read = move |at: usize, to: &mut [u8]| {
+            crate::host::read_into(
+                std::ptr::with_exposed_provenance(memory.wrapping_add(at)),
+                to,
+            )
+        };
+        let runs = COMPARE_SCRATCH.with_borrow_mut(|scratch| {
+            scratch.resize(COMPARE_CHUNK, 0);
+            read_changed(&mut guard, size, scratch, read)
+        });
+        let last = &mut *guard;
+        let Some(runs) = runs else {
+            return WorkerRefresh::Unreadable;
+        };
+        if runs.is_empty() {
+            return WorkerRefresh::Unchanged;
+        }
+        let n = self.footprints.len();
+        let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+        let fresh: Vec<u32> = (0..n)
+            .filter(|&i| {
+                let (a, b) = span(i);
+                touches(&runs, a, b)
+            })
+            .map(|i| i as u32)
+            .collect();
+        if fresh.is_empty() {
+            return WorkerRefresh::Unchanged;
+        }
+        let Some((b, at)) = self.detile_into(&last.read, &fresh, alloc) else {
+            last.valid = false;
+            return WorkerRefresh::Unreadable;
+        };
+        last.uploaded = true;
+        WorkerRefresh::Uploaded((b, at, fresh))
     }
 
     /// Returns the bytes of title memory read, and the buffer it detiled
@@ -640,17 +805,26 @@ impl Staging {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let forced = self
+            .force_refresh
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         if let Some(t) = &self.tracked {
             let last = &mut *guard;
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() {
-                return (0, None);
-            }
-            let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
-                return (0, None);
-            }
+            let ranges = if forced {
+                let _ = t.take(start, start + size);
+                vec![(start, start + size)]
+            } else {
+                if t.clean() {
+                    return (0, None);
+                }
+                let ranges = t.take(start, start + size);
+                if ranges.is_empty() {
+                    return (0, None);
+                }
+                ranges
+            };
             // Only the subresources in the pages that changed (streamed
             // textures change page by page; a whole re-read and detile of
             // each cost up to 430 MB a frame, run integ2).
@@ -802,7 +976,18 @@ impl Staging {
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
     fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+        self.detile_into(tiled, subresources, &mut staging_space)
+    }
+
+    /// Detiles `subresources` of `tiled` into staging space returned by
+    /// `alloc`.
+    fn detile_into(
+        &self,
+        tiled: &[u8],
+        subresources: &[u32],
+        alloc: &mut dyn FnMut(u64) -> Option<(ID3D12Resource, u64, *mut u8)>,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let (buffer, at, data) = alloc(self.size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -1142,6 +1327,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         uploaded_once: std::sync::atomic::AtomicBool::new(false),
+        force_refresh: std::sync::atomic::AtomicBool::new(false),
         checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),
