@@ -1171,6 +1171,13 @@ mod tests {
             })
         };
         assert_ne!(umax(true), umax(false));
+        let widen = |on| {
+            translation_build(victory_shader::emit::Options {
+                widen_loads: on,
+                ..options
+            })
+        };
+        assert_ne!(widen(true), widen(false));
         assert_eq!(
             tag(b"library"),
             current(

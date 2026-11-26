@@ -172,6 +172,16 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_with(words, layout, used, threads, false)
+}
+
+fn build_with(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    widen_loads: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -204,6 +214,7 @@ fn build(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        widen_loads,
         view_marks: false,
     })
     .expect("lower");
@@ -749,5 +760,96 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         for (label, words) in run_tables(&shader, &views, vec![stride, 4]) {
             assert_eq!(words[0], want, "{label} {format:?}");
         }
+    }
+}
+
+/// A widened four-dword `s_buffer_load_dwordx4` at byte offset 8 of a 16-byte
+/// raw buffer view straddles the end of the view: the two in-bounds dwords
+/// read `[9, 10]` and the two out-of-bounds dwords read `[0, 0]`, matching
+/// console per-dword zeroing on D3DMetal and WARP.
+#[test]
+fn widened_four_dword_raw_load_past_view_end_zeroes_per_dword() {
+    // s0: table with raw SRV at dword 0; s1: table with raw UAV at dword 0.
+    // Loads 4 dwords at byte offset 8 of the 16-byte SRV and stores them to
+    // the UAV at offsets 0, 4, 8, 12.
+    const OOB_LOAD_X4_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBE8C_0301, // s_mov_b32 s12, s1
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xF408_0406,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF428_0504,
+        0xFA00_0008, // s_buffer_load_dwordx4 s[20:23], s[8:11], 8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0xE070_0000,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0 offset:0
+        0x7E02_0215, // v_mov_b32 v1, s21
+        0xE070_0004,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0 offset:4
+        0x7E02_0216, // v_mov_b32 v1, s22
+        0xE070_0008,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0 offset:8
+        0x7E02_0217, // v_mov_b32 v1, s23
+        0xE070_000C,
+        0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0 offset:12
+        0xBF81_0000, // s_endpgm
+    ];
+    let data = vec![7u32, 8, 9, 10];
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(4),
+    ];
+    for widen in [false, true] {
+        let shader = build_with(
+            OOB_LOAD_X4_WAVE32,
+            vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+            vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 1)],
+            1,
+            widen,
+        );
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = 32 * u32::from(u.slot);
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                words[0][..4],
+                [9, 10, 0, 0],
+                "{label} (widen_loads={widen}): expected per-dword zeroing past view end"
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
     }
 }

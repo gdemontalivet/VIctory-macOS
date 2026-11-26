@@ -635,6 +635,35 @@ impl Module {
         self.written_call_blocks(name).len()
     }
 
+    /// The arguments of every live call to `name` that [`Module::write`]
+    /// writes, folded to a 32-bit wrapping constant where an argument is a
+    /// constant or sum of constants.
+    #[cfg(test)]
+    pub fn written_call_args(&self, name: &str) -> Vec<Vec<Option<u32>>> {
+        fn value(m: &Module, v: V) -> Option<u32> {
+            match v {
+                V::Const(_) => m.int_value(v).map(|x| x as u32),
+                V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Bin(Bin::Add, a, b) => Some(value(m, a)?.wrapping_add(value(m, b)?)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .flat_map(|&b| &self.blocks[b].body)
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => {
+                    Some(args.iter().map(|&a| value(self, a)).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The blocks, instructions (phis included) and conditional branches
     /// [`Module::write`] writes.
     #[cfg(test)]

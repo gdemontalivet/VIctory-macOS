@@ -82,6 +82,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        widen_loads: false,
         view_marks: false,
     })
     .map(|_| ())
@@ -139,6 +140,7 @@ fn lower_wave(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        widen_loads: false,
         view_marks: false,
     })
 }
@@ -423,6 +425,7 @@ fn perm_features(selector: u32) -> u64 {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        widen_loads: false,
         view_marks: false,
     })
     .unwrap();
@@ -1391,6 +1394,7 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         bias_as_gradients: false,
         narrow_waves,
         host_wave32: false,
+        widen_loads: false,
         view_marks: false,
     })
     .expect("lower")
@@ -1632,6 +1636,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             bias_as_gradients: false,
             narrow_waves: false,
             host_wave32: false,
+            widen_loads: false,
             view_marks: false,
         })
         .unwrap();
@@ -1730,6 +1735,7 @@ fn lower_ps_for_early_z(
         bias_as_gradients: false,
         narrow_waves: false,
         host_wave32: false,
+        widen_loads: false,
         view_marks,
     })
     .expect("lower")

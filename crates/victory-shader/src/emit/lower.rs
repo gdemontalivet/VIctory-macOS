@@ -25,6 +25,7 @@ mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
+mod wide;
 use barriers::{in_step, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
@@ -120,6 +121,9 @@ pub(crate) struct Lowered {
     /// title-memory page table, one entry per load.
     #[cfg(test)]
     pub raw_loads: [Vec<usize>; 2],
+    /// `(offset, mask)` arguments of written `dx.op.rawBufferLoad.f32` calls.
+    #[cfg(test)]
+    pub raw_load_args: Vec<(Option<u32>, Option<u32>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -152,6 +156,8 @@ pub(crate) struct Parts<'a> {
     pub host_wave32: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
+    /// See [`Options::widen_loads`](super::Options).
+    pub widen_loads: bool,
 }
 
 enum Stop {
@@ -1055,6 +1061,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && self.x.widen_loads) {
+            for (k, x) in self.wide_raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -1700,6 +1712,14 @@ impl<'a> Lower<'a> {
             early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             #[cfg(test)]
             raw_loads,
+            #[cfg(test)]
+            raw_load_args: self
+                .s
+                .m
+                .written_call_args("dx.op.rawBufferLoad.f32")
+                .into_iter()
+                .map(|a| (a[2], a[4]))
+                .collect(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4581,6 +4601,12 @@ impl<'a> Lower<'a> {
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            if count > 1 && self.x.widen_loads {
+                for (k, x) in self.wide_raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);

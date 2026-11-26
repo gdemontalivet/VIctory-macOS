@@ -155,6 +155,46 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Opt-in: widen eligible multi-dword raw buffer/global loads up to 4 dwords
+/// per `rawBufferLoad` call (`VICTORY_WIDEN_LOADS=1`, or `VICTORY_SHADER_OPT`
+/// bit 64). Off by default.
+fn widen_loads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let widen = std::env::var("VICTORY_WIDEN_LOADS").ok();
+        let opt = std::env::var("VICTORY_SHADER_OPT").ok();
+        let on = widen_loads_on(widen.as_deref(), opt.as_deref());
+        if on {
+            tracing::info!("VICTORY_WIDEN_LOADS: multi-dword raw loads widened up to 4 dwords");
+        }
+        on
+    })
+}
+
+/// Pure parser for [`widen_loads`]: `VICTORY_WIDEN_LOADS` takes precedence
+/// when set; otherwise `VICTORY_SHADER_OPT` bit 64 (`0x40`) enables it.
+fn widen_loads_on(widen: Option<&str>, opt: Option<&str>) -> bool {
+    if let Some(v) = widen.map(str::trim).filter(|v| !v.is_empty()) {
+        if v.eq_ignore_ascii_case("1")
+            || v.eq_ignore_ascii_case("on")
+            || v.eq_ignore_ascii_case("true")
+        {
+            return true;
+        }
+        if v.eq_ignore_ascii_case("0")
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("false")
+        {
+            return false;
+        }
+    }
+    let bits = opt.map(str::trim).and_then(|v| match v.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    });
+    bits.is_some_and(|b| b & 64 != 0)
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -183,15 +223,17 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
-    if !locks && !bias && !narrow {
+    let widen = options.widen_loads;
+    if !locks && !bias && !narrow && !widen {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
-        | usize::from(umax) << 4;
+        | usize::from(umax) << 4
+        | usize::from(widen) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -209,6 +251,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if narrow {
             h.update(b"narrow waves");
+        }
+        if widen {
+            h.update(b"widen loads");
         }
         *h.finalize().as_bytes()
     })
@@ -228,6 +273,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        widen_loads: widen_loads(),
     }
 }
 
@@ -543,6 +589,24 @@ mod tests {
         assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
         assert!(!rounds_on(false, None), "no rounds without the locks");
         assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
+
+    #[test]
+    fn widen_loads_switch_defaults_off_and_invalidates_translation_build() {
+        assert!(!widen_loads_on(None, None), "off by default");
+        assert!(widen_loads_on(Some("1"), None));
+        assert!(widen_loads_on(Some("on"), None));
+        assert!(!widen_loads_on(Some("0"), Some("64")), "explicit 0 wins");
+        assert!(widen_loads_on(None, Some("64")));
+        assert!(widen_loads_on(None, Some("0x40")));
+        assert!(!widen_loads_on(None, Some("31")));
+
+        let base = victory_shader::emit::Options::default();
+        let widened = victory_shader::emit::Options {
+            widen_loads: true,
+            ..base
+        };
+        assert_ne!(translation_build(base), translation_build(widened));
     }
 
     fn shader() -> HostShader {

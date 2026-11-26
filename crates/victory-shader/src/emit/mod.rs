@@ -461,6 +461,11 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// Opt-in: read the dwords of a single multi-dword console raw buffer or
+    /// global load (`s_buffer_load_dwordx2..x16`, `global_load_dwordx2..x4`)
+    /// up to four per `rawBufferLoad` call when the group's start offset is a
+    /// compile-time constant that does not wrap past 2^32.
+    pub widen_loads: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -841,6 +846,7 @@ fn emit_pruned(
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
+        widen_loads: options.widen_loads,
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {
         // Discarded lanes kept on as helpers can read what no surviving

@@ -159,6 +159,7 @@ fn lowered_with(
         bias_as_gradients: false,
         narrow_waves,
         host_wave32,
+        widen_loads: false,
     })
 }
 
