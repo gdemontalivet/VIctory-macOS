@@ -306,12 +306,14 @@ impl<S> Held<S> {
 
         let flush = |piece: &mut Vec<(S, bool)>,
                      pending_signals: &mut Vec<(usize, u64)>,
+                     last_queue: &mut Option<usize>,
                      w: &mut World<S>,
                      done: &mut Pumped| {
             if !piece.is_empty() {
                 (w.run)(std::mem::take(piece));
                 done.pieces += 1;
             }
+            *last_queue = None;
             for (fence, value) in pending_signals.drain(..) {
                 (w.signal)(fence, value);
             }
@@ -320,6 +322,7 @@ impl<S> Held<S> {
         let mut done = Pumped::default();
         let mut piece: Vec<(S, bool)> = Vec::new();
         let mut pending_signals: Vec<(usize, u64)> = Vec::new();
+        let mut last_queue: Option<usize> = None;
         loop {
             let mut moved = false;
             for (queue, items) in &mut self.queues {
@@ -344,11 +347,19 @@ impl<S> Held<S> {
                                     None => unknown += 1,
                                 }
                             }
+                            // Only check `can_join` when crossing a join boundary (another queue,
+                            // a BoP-satisfied wait, or a deferred-signal fence wait). Consecutive
+                            // ready segments on the same queue already ran together in one host
+                            // submission in legacy mode and must never be shredded by `can_join`.
+                            let is_join_boundary = !piece.is_empty()
+                                && (last_queue != Some(*queue)
+                                    || via_bop > 0
+                                    || pending_fence_barrier);
                             if !ok {
                                 *fresh = false;
                                 done.unknown += unknown;
                                 Decision::Blocked
-                            } else if !piece.is_empty() && !(w.can_join)(&piece, seg) {
+                            } else if is_join_boundary && !(w.can_join)(&piece, seg) {
                                 Decision::FlushFirst
                             } else {
                                 if !*fresh {
@@ -379,7 +390,7 @@ impl<S> Held<S> {
                         Decision::Blocked => break,
                         Decision::FlushFirst => {
                             done.hazard_splits += 1;
-                            flush(&mut piece, &mut pending_signals, w, &mut done);
+                            flush(&mut piece, &mut pending_signals, &mut last_queue, w, &mut done);
                             pending_fence_barrier = false;
                             moved = true;
                             continue;
@@ -388,6 +399,7 @@ impl<S> Held<S> {
                             moved = true;
                             if let Some((Item::Segment(s, _), ..)) = items.pop_front() {
                                 piece.push((s, barrier_before));
+                                last_queue = Some(*queue);
                                 done.segments += 1;
                             }
                         }
@@ -415,7 +427,7 @@ impl<S> Held<S> {
                 if piece.is_empty() && pending_signals.is_empty() {
                     break;
                 }
-                flush(&mut piece, &mut pending_signals, w, &mut done);
+                flush(&mut piece, &mut pending_signals, &mut last_queue, w, &mut done);
             }
         }
         self.queues.retain(|(_, items)| !items.is_empty());
@@ -699,7 +711,8 @@ mod tests {
         assert_eq!(p2.hazard_splits, 1);
     }
 
-    /// Batch list cap (`max_lists`) splits oversized coalesced pieces cleanly.
+    /// Batch list cap (`max_lists`) splits oversized coalesced pieces across
+    /// queue boundaries without breaking a single queue's own submission.
     #[test]
     fn coalesced_max_lists_cap_splits_piece() {
         let fake = RefCell::new(Fake::default());
@@ -708,12 +721,52 @@ mod tests {
         held.push(1, Item::Segment("b", vec![]));
         held.push(2, Item::Segment("c", vec![]));
         held.push(2, Item::Segment("d", vec![]));
-        held.push(2, Item::Segment("e", vec![]));
+        held.push(3, Item::Segment("e", vec![]));
         let p = pump_with(&mut held, &fake, true, 2);
         assert_eq!(fake.borrow().log, ["run: a b", "run: c d", "run: e"]);
         assert_eq!(p.pieces, 3);
         assert_eq!(p.segments, 5);
         assert_eq!(p.hazard_splits, 2);
+    }
+
+    /// Consecutive ready segments on the same queue (e.g., one multi-list
+    /// submission containing mixed GPU writes, CPU copies/fills, and texture
+    /// uploads) are never split by `can_join`, while a cross-queue BoP-dependent
+    /// compute segment still coalesces onto that piece.
+    #[test]
+    fn coalesced_never_splits_same_queue_consecutive_segments() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.flags.insert("g0", BatchFlags { has_gpu_write: true, ..Default::default() });
+            f.flags.insert("g1", BatchFlags { has_title_copy: true, has_cpu_read: true, ..Default::default() });
+            f.flags.insert("g2", BatchFlags { has_textures: true, has_gpu_write: true, ..Default::default() });
+            f.writes.insert("g2", vec![(0x200, 1)]);
+            f.flags.insert("c0", BatchFlags { has_gpu_write: true, ..Default::default() });
+        }
+        let mut held = Held::default();
+        held.push(2, Item::Segment("c0", vec![ge(0x200, 1)]));
+        assert_eq!(pump_coalesced(&mut held, &fake).pieces, 0);
+        held.push(1, Item::Segment("g0", vec![]));
+        held.push(1, Item::Segment("g1", vec![]));
+        held.push(1, Item::Segment("g2", vec![]));
+        // Even with max_lists=2, same-queue g0..g2 are never shredded, and with max_lists=64 c0 joins too.
+        let p = pump_coalesced(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: g0 g1 g2 |c0"]);
+        assert_eq!(p.pieces, 1);
+        assert_eq!(p.segments, 4);
+        assert_eq!(p.coalesced_bop_waits, 1);
+        assert_eq!(p.hazard_splits, 0);
+
+        // Even when a single queue has more segments than `max_lists`, it stays one piece.
+        fake.borrow_mut().log.clear();
+        held.push(1, Item::Segment("g0", vec![]));
+        held.push(1, Item::Segment("g1", vec![]));
+        held.push(1, Item::Segment("g2", vec![]));
+        let p2 = pump_with(&mut held, &fake, true, 2);
+        assert_eq!(fake.borrow().log, ["run: g0 g1 g2"]);
+        assert_eq!(p2.pieces, 1);
+        assert_eq!(p2.hazard_splits, 0);
     }
 
     /// Deferred `Item::Signal` stays after its piece completes, while another
