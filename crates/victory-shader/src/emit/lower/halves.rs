@@ -262,16 +262,119 @@ impl Lower<'_> {
     }
 
     /// `v_readfirstlane_b32` of `x`, in halves ([`Lower::across_here`]): the
-    /// lower half's first lane. Every lane of the group runs the block, so
-    /// the console's first lane is in the lower half.
-    pub(super) fn first_lane_across(&mut self, x: V) -> Result<V, Why> {
+    /// first active lane across both 32-lane halves. When `active` is `None`,
+    /// every lane is active and the lower half's lane 0 wins; when `active` is
+    /// `Some(act)`, each half finds its own first active lane and exchanges
+    /// `(value, ballot != 0)` so the upper half's first active lane is chosen
+    /// whenever all 32 lanes of the lower half are inactive.
+    pub(super) fn first_lane_across(&mut self, x: V, active: Option<V>) -> Result<V, Why> {
         let c = self.cur;
         let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
         self.s.flags |= flags::WAVE_OPS;
-        let own = self
+        let Some(act) = active else {
+            let own = self
+                .s
+                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+            return Ok(self.exchange_halves(own, zero, c)?.0);
+        };
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let b = self
             .s
-            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
-        Ok(self.exchange_halves(own, zero, c)?.0)
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+        let ballot = self.s.m.extract(c, b, 0);
+        // DXIL opcode 32: FirstbitLo (returns 0..31 for non-zero ballot).
+        let bit = self.unary_bits(c, 32, ballot);
+        let mask31 = self.s.m.i32(31);
+        let lane = self.s.m.bin(c, Bin::And, bit, mask31);
+        let own = self.read_lane(x, lane);
+        let (lo_val, hi_val) = self.exchange_halves(own, zero, c)?;
+        let (lo_ballot, _) = self.exchange_halves(ballot, zero, c)?;
+        let lo_any = self.s.m.cmp(c, pred::NE, lo_ballot, zero);
+        Ok(self.s.m.select(c, lo_any, lo_val, hi_val))
+    }
+
+    /// `Shape::Half(Op::AddH)` 16-bit float wave reduction (low 16 bits = sum
+    /// of active lanes' low halves, high 16 bits = lane `hi`'s high half when
+    /// active else `ident`'s high half), supporting both wave64 and 32-lane
+    /// `halves` mode.
+    pub(super) fn reduce_half(
+        &mut self,
+        src: Value,
+        mask: Value,
+        ident: u32,
+        hi: u32,
+    ) -> Result<V, Why> {
+        const ACROSS: Why = "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+        if self.mask_data != MaskData::Console {
+            return Err("a 16-bit wave reduction outside compute");
+        }
+        let across = self.halves && !self.one_host_wave();
+        if across && !self.across_here() {
+            return Err(ACROSS);
+        }
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let mut on = self.boolean(m, c)?;
+        if let Some(active) = self.pred_active(self.cur_ir) {
+            on = self.s.m.bin(c, Bin::And, on, active);
+        }
+        let x = self.i32_of(src)?;
+        let id = self.s.m.i32(ident);
+        let x = self.s.m.select(c, on, x, id);
+        self.s.flags |= flags::WAVE_OPS;
+        let low = self.s.m.i32(0xFFFF);
+        let h = self.s.m.bin(c, Bin::And, x, low);
+        let f = self.f16_to_f32(c, h);
+        let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+        let mut r = self.s.op(
+            c,
+            "waveActiveOp.f32",
+            Attr::NoUnwind,
+            self.s.t.f32,
+            119,
+            &[f, sum, signed],
+        );
+        if across {
+            r = self.reduce_across(super::super::wave::Op::AddF, r, r, false, 0)?;
+        }
+        let r = self.f32_to_f16(c, r);
+        let r = self.s.m.bin(c, Bin::And, r, low);
+        let (there, at) = if across {
+            let (blo, bhi) = self.ballot_across_halves(on, c)?;
+            let word = if hi < 32 { blo } else { bhi };
+            let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+            let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let there = self.s.m.cmp(c, pred::NE, bit, z);
+            let lane = self.s.m.i32(hi);
+            let at = self.read_lane_across(x, lane)?;
+            (there, at)
+        } else if self.halves && hi >= 32 {
+            (self.s.m.bool(false), id)
+        } else {
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let b = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let word = self.s.m.extract(c, b, hi / 32);
+            let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+            let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let there = self.s.m.cmp(c, pred::NE, bit, z);
+            let lane = self.s.m.i32(hi);
+            let at = self.read_lane(x, lane);
+            (there, at)
+        };
+        let top = self.s.m.select(c, there, at, id);
+        let high = self.s.m.i32(0xFFFF_0000);
+        let top = self.s.m.bin(c, Bin::And, top, high);
+        Ok(self.s.m.bin(c, Bin::Or, top, r))
     }
 
     /// A whole-wave reduction or prefix of `op`, in halves
@@ -345,9 +448,14 @@ pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may diff
 /// run (the branch's own block among them where a cycle leads back to it).
 /// None with an indirect exit.
 pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
+    branch_regions_with(&st.exits)
+}
+
+/// [`branch_regions`] over an explicit `exits` slice (used by `in_step_with`).
+pub(super) fn branch_regions_with(exits: &[LaneExit]) -> Option<Vec<(usize, Vec<bool>)>> {
+    let n = exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
+    for (b, e) in exits.iter().enumerate() {
         match *e {
             LaneExit::Jump(t) => succ[b].push(t),
             LaneExit::Branch {
@@ -395,7 +503,7 @@ pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>>
         }
     }
     let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
+    for (d, e) in exits.iter().enumerate() {
         if !matches!(e, LaneExit::Branch { .. }) {
             continue;
         }
@@ -449,13 +557,36 @@ fn wave_tid(x: &Parts) -> Option<Value> {
 /// them (a branch on alike values does not). The analysis runs to a fixed
 /// point from nothing, so a loop-carried value that needs itself to be
 /// alike never is.
+/// Entry thread-id VGPRs (`v1`/`v2`) that are wave-uniform in a wave64 compute
+/// group: `v1` (`tid.y`) when `ty == 1` or `tx` is a multiple of 64, and `v2`
+/// (`tid.z`) when `tz == 1` or `tx * ty` is a multiple of 64.
+fn uniform_entry_tids(x: &Parts) -> Vec<Value> {
+    let StageIo::Cs(cs) = &x.native.io else {
+        return Vec::new();
+    };
+    if !x.native.wave64 {
+        return Vec::new();
+    }
+    let [tx, ty, tz] = cs.threads;
+    let mut out = Vec::new();
+    let v1_uniform = ty <= 1 || tx.is_multiple_of(64);
+    let v2_uniform = tz <= 1 || (tx * ty).is_multiple_of(64);
+    for &(reg, v) in &x.p.inputs {
+        if (reg == Reg::V(1) && v1_uniform) || (reg == Reg::V(2) && v2_uniform) {
+            out.push(v);
+        }
+    }
+    out
+}
+
 pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
+    let entry_tids = uniform_entry_tids(x);
     let regions = branch_regions(st);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
-    let mut same: HashSet<Value> = HashSet::new();
+    let mut same: HashSet<Value> = entry_tids.iter().copied().collect();
     loop {
         let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
             Atom::Uniform(_) => true,
@@ -486,7 +617,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
             }
             None => vec![false; st.exits.len()],
         };
-        let mut next: HashSet<Value> = HashSet::new();
+        let mut next: HashSet<Value> = entry_tids.iter().copied().collect();
         for b in crate::ir::reverse_postorder(&p.blocks) {
             let block = &p.blocks[b];
             let whole = block
@@ -556,6 +687,33 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     continue;
                 }
+                // A global load at an alike address reads one value in every lane.
+                if let Fields::Flat {
+                    addr: Some(Operand::Vector { reg, dwords }),
+                    saddr,
+                    ..
+                } = &inst.fields
+                    && name.starts_with("global_load")
+                {
+                    let addr_ok = (0..*dwords).all(|k| {
+                        inst.read(Reg::V(reg + k))
+                            .is_some_and(|v| known(&next, &v))
+                    });
+                    let saddr_ok = match saddr {
+                        Some(Operand::Scalar { code, dwords }) if *code != NULL => (0..*dwords)
+                            .all(|k| inst.read(Reg::S(code + k)).is_none_or(|v| !per_lane(v))),
+                        _ => true,
+                    };
+                    if addr_ok && saddr_ok {
+                        next.extend(
+                            inst.writes
+                                .iter()
+                                .filter(|w| matches!(w.0, Reg::V(_)))
+                                .map(|w| w.1),
+                        );
+                    }
+                    continue;
+                }
                 // An LDS read at an alike address reads one value in every lane.
                 if let Fields::Ds {
                     addr: Some(Operand::Vector { reg, .. }),
@@ -588,22 +746,41 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     _ => continue,
                 };
-                // The thread id's x shifted past the console wave: one value
-                // per console wave (the b32 shift uses five bits of its count).
-                if let (
-                    Some(tid),
-                    "v_lshrrev_b32",
-                    [
-                        Operand::Const(k @ 128..=192),
-                        Operand::Vector { reg, .. },
-                        ..,
-                    ],
-                ) = (wave_tid, name, ops.as_slice())
-                    && ((k - 128) & 31) >= 6
-                    && inst.read(Reg::V(*reg)) == Some(tid)
-                {
-                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
-                    continue;
+                // The thread id's x shifted/masked past the console wave: one
+                // value per console wave.
+                let inline_u32 = |op: &Operand| match *op {
+                    Operand::Const(k @ 128..=192) => Some(u32::from(k - 128)),
+                    Operand::Const(k @ 193..=208) => Some((192i32 - i32::from(k)) as u32),
+                    Operand::Literal(l) => Some(l),
+                    _ => None,
+                };
+                if let Some(tid) = wave_tid {
+                    let is_tid = |op: &Operand| {
+                        matches!(*op, Operand::Vector { reg, .. } if inst.read(Reg::V(reg)) == Some(tid))
+                    };
+                    let wave_derived = match (name, ops.as_slice()) {
+                        ("v_lshrrev_b32", [shift, src, ..])
+                            if is_tid(src) && inline_u32(shift).is_some_and(|s| (s & 31) >= 6) =>
+                        {
+                            true
+                        }
+                        ("v_and_b32", [a, b, ..])
+                            if (is_tid(a) && inline_u32(b).is_some_and(|m| m & 63 == 0))
+                                || (is_tid(b) && inline_u32(a).is_some_and(|m| m & 63 == 0)) =>
+                        {
+                            true
+                        }
+                        ("v_bfe_u32", [src, start, ..])
+                            if is_tid(src) && inline_u32(start).is_some_and(|s| (s & 31) >= 6) =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if wave_derived {
+                        next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                        continue;
+                    }
                 }
                 let alike = ops.iter().all(|op| match *op {
                     Operand::Vector { reg, .. } => {

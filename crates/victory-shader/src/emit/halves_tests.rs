@@ -972,6 +972,31 @@ fn differences_in(
     lds_bytes: u32,
     narrow_waves: bool,
 ) -> Vec<String> {
+    differences_with_buffer(
+        wave64,
+        words,
+        threads,
+        per_lane,
+        want,
+        lds_bytes,
+        narrow_waves,
+        &[0; 4],
+    )
+}
+
+/// [`differences_in`] with custom contents for the structured SRV buffer at
+/// table dword 8.
+#[allow(clippy::too_many_arguments)]
+fn differences_with_buffer(
+    wave64: bool,
+    words: &[u32],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+    lds_bytes: u32,
+    narrow_waves: bool,
+    buf_data: &[u32],
+) -> Vec<String> {
     let n = native(words, wave64, threads, lds_bytes);
     let forms = if wave64 {
         vec![
@@ -993,7 +1018,7 @@ fn differences_in(
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
-            data: &[0; 4],
+            data: buf_data,
             stride: Stride::Structured(16),
         },
         View::RawUav(threads * 8),
@@ -1502,4 +1527,489 @@ fn the_permlanex16_model_follows_the_instruction() {
     assert_eq!(permlanex16_console(16)[0], 15);
     assert_eq!(permlanex16_console(32)[0], 63);
     assert_eq!(permlanex16_console(48)[0], 47);
+}
+
+/// VOP2 opcode for `v_add_f16`.
+const V_ADD_F16: u32 = 0x32;
+
+/// Appends the console compiler's whole-wave reduction of `v3` by VOP2 `op`
+/// (identity inline constant `ident`), leaving the wave result in `s15`.
+fn emit_reduction_body(w: &mut Vec<u32>, op: u32, ident: u32) {
+    let vop2 = |word: u32| word & !(0x3F << 25) | op << 25;
+    w.extend([
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_0600 | ident, // v_cndmask_b32 v1, ident, v3, s[12:13]
+    ]);
+    for control in [0x161, 0x162, 0x164, 0x168] {
+        w.extend([
+            vop2(0x0602_02FA),
+            0xFF00_0001 | control << 8, // op v1, v1, v1 row_xmask
+        ]);
+    }
+    w.extend([
+        0xD778_0002,
+        0x0201_0101,       // v_permlanex16_b32 v2, v1, 0, 0
+        vop2(0x0602_0302), // op v1, v2, v1
+        0xD760_000E,
+        0x0001_4101,       // v_readlane_b32 s14, v1, 32
+        vop2(0x0602_020E), // op v1, s14, v1
+        0xD760_000F,
+        0x0001_0101, // v_readlane_b32 s15, v1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+}
+
+/// Test 1: early-out bounds check (`keep_below`: `if (tid >= limit) return;`;
+/// `!keep_below`: `if (tid < limit) return;`) followed by cross-half
+/// sum/min/max reductions, ballot/`s_bcnt1`/`v_mbcnt`, `v_readfirstlane_b32`,
+/// `v_readlane_b32`, and split-wave LDS write-then-read.
+fn early_out_program(keep_below: bool, limit: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    // Initialize output offset and zero-initialize LDS[v0 * 4].
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xD834_0000,
+        0x0000_0802, // ds_write_b32 v2, v8
+        S_WAITCNT_LGKM,
+        // `keep_below`: v_cmp_gt_u32 vcc, limit, v0 (v0 < limit)
+        // `!keep_below`: v_cmp_le_u32 vcc, limit, v0 (v0 >= limit)
+        if keep_below { 0x7D88_00FF } else { 0x7D86_00FF },
+        limit,
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    ]);
+    let branch_at = w.len();
+    w.push(0); // patched to `s_cbranch_execz end`
+
+    let mut body = Vec::new();
+    // Slot 0: f32 sum reduction of (float)v0 across active lanes.
+    body.push(0x7E06_0D00); // v_cvt_f32_u32 v3, v0
+    emit_reduction_body(&mut body, V_ADD_F32, 0x80);
+    body.push(0x7E0E_020F); // v_mov_b32 v7, s15
+
+    // Slot 1: u32 min reduction of v0 across active lanes.
+    body.push(V_MOV_V3_V0);
+    emit_reduction_body(&mut body, V_MIN_U32, 0xC1);
+    body.push(0x7E10_020F); // v_mov_b32 v8, s15
+
+    // Slot 2: u32 max reduction of v0 across active lanes.
+    body.push(V_MOV_V3_V0);
+    emit_reduction_body(&mut body, V_MAX_U32, 0x80);
+    body.push(0x7E12_020F); // v_mov_b32 v9, s15
+
+    // Slots 3 & 4: cross-half ballot (`v0 < 50`) count & `v_mbcnt` prefix.
+    body.extend([
+        0x7D88_00FF,
+        50,          // v_cmp_gt_u32 vcc, 50, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E14_020C, // v_mov_b32 v10, s12
+        0xD765_000B,
+        0x0001_006A, // v_mbcnt_lo_u32_b32 v11, vcc_lo, 0
+        0xD766_000B,
+        0x0002_166B, // v_mbcnt_hi_u32_b32 v11, vcc_hi, v11
+    ]);
+
+    // Slot 5: `v_readfirstlane_b32` of v0 (upper half when lower half inactive).
+    body.extend([
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0x7E18_020C, // v_mov_b32 v12, s12
+    ]);
+
+    // Slot 6: `v_readlane_b32` of v0 at lane 38.
+    body.extend([
+        0xD760_000C,
+        0x0001_0100 | (128 + 38) << 9, // v_readlane_b32 s12, v0, 38
+        0x7E1A_020C,                   // v_mov_b32 v13, s12
+    ]);
+
+    // Slot 7: split-wave LDS write (`v0 + 100` at `v0 * 4`) then read at `(v0 ^ 32) * 4`.
+    body.extend([
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A1C_00FF,
+        100, // v_add_nc_u32 v14, 100, v0
+        0xD834_0000,
+        0x0000_0E02, // ds_write_b32 v2, v14
+        S_WAITCNT_LGKM,
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0F00_0004, // ds_read_b32 v15, v4
+        S_WAITCNT_LGKM,
+    ]);
+
+    for (vdata, slot) in [
+        (7, 0),
+        (8, 1),
+        (9, 2),
+        (10, 3),
+        (11, 4),
+        (12, 5),
+        (13, 6),
+        (15, 7),
+    ] {
+        body.extend(store(vdata, 4 * slot));
+    }
+
+    w[branch_at] = 0xBF88_0000 | (body.len() as u32 & 0xFFFF); // s_cbranch_execz end
+    w.extend(body);
+    w.push(S_ENDPGM);
+    w
+}
+
+fn console_early_out(keep_below: bool, limit: u32, l: u32) -> [u32; 8] {
+    let active = |t: u32| if keep_below { t < limit } else { t >= limit };
+    if !active(l) {
+        return [0; 8];
+    }
+    let active_lanes: Vec<u32> = (0..64).filter(|&t| active(t)).collect();
+    let sum = active_lanes.iter().sum::<u32>() as f32;
+    let min = *active_lanes.iter().min().unwrap();
+    let max = *active_lanes.iter().max().unwrap();
+    let below50: Vec<u32> = active_lanes.iter().copied().filter(|&t| t < 50).collect();
+    let bcnt = below50.len() as u32;
+    let mbcnt = below50.iter().filter(|&&t| t < l).count() as u32;
+    let first = active_lanes[0];
+    let peer = l ^ 32;
+    let lds = if active(peer) { peer + 100 } else { 0 };
+    [sum.to_bits(), min, max, bcnt, mbcnt, first, 38, lds]
+}
+
+/// Test 2: acyclic `if (tid < 36) { ... } else { ... }` diamond containing
+/// cross-half ballot + f32 reduction + LDS exchange in the `then` branch and
+/// cross-half ballot + f32 reduction + `v_readfirstlane_b32` (upper half only)
+/// in the `else` branch, merging `v8..v10` at the join.
+fn diamond_program() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0x7E14_0280, // v_mov_b32 v10, 0
+        0xD834_0000,
+        0x0000_0802, // ds_write_b32 v2, v8
+        S_WAITCNT_LGKM,
+        0x7D88_00FF,
+        36,          // v_cmp_gt_u32 vcc, 36, v0 (v0 < 36)
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    ]);
+    let then_branch = w.len();
+    w.push(0); // patched to `s_cbranch_execz else_check`
+
+    let mut then_body = Vec::new();
+    then_body.extend([
+        0x7D88_00FF,
+        64,          // v_cmp_gt_u32 vcc, 64, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E10_020C, // v_mov_b32 v8, s12
+        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
+    ]);
+    emit_reduction_body(&mut then_body, V_ADD_F32, 0x80);
+    then_body.extend([
+        0x7E12_020F, // v_mov_b32 v9, s15
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x4A16_008A, // v_add_nc_u32 v11, 10, v0
+        0xD834_0000,
+        0x0000_0B02, // ds_write_b32 v2, v11
+        S_WAITCNT_LGKM,
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0A00_0004, // ds_read_b32 v10, v4
+        S_WAITCNT_LGKM,
+    ]);
+    w[then_branch] = 0xBF88_0000 | (then_body.len() as u32 & 0xFFFF);
+    w.extend(then_body);
+
+    // Else check: flip EXEC to `saved & !exec` (v0 >= 36).
+    w.push(0x8AFE_7E0A); // s_andn2_b64 exec, s[10:11], exec
+    let else_branch = w.len();
+    w.push(0); // patched to `s_cbranch_execz join`
+
+    let mut else_body = Vec::new();
+    else_body.extend([
+        0x7D88_00FF,
+        64,          // v_cmp_gt_u32 vcc, 64, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E10_020C, // v_mov_b32 v8, s12
+        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
+    ]);
+    emit_reduction_body(&mut else_body, V_ADD_F32, 0x80);
+    else_body.extend([
+        0x7E12_020F, // v_mov_b32 v9, s15
+        0x7E1A_0500, // v_readfirstlane_b32 s13, v0
+        0x7E14_020D, // v_mov_b32 v10, s13
+    ]);
+    w[else_branch] = 0xBF88_0000 | (else_body.len() as u32 & 0xFFFF);
+    w.extend(else_body);
+
+    // Join: restore EXEC and store merged v8..v10.
+    w.push(0xBEFE_040A); // s_mov_b64 exec, s[10:11]
+    w.extend(store(8, 0));
+    w.extend(store(9, 4));
+    w.extend(store(10, 8));
+    w.push(S_ENDPGM);
+    w
+}
+
+fn console_diamond(l: u32) -> [u32; 3] {
+    if l < 36 {
+        let sum: u32 = (0..36).sum();
+        let peer = l ^ 32;
+        let lds = if peer < 36 { peer + 10 } else { 0 };
+        [36, (sum as f32).to_bits(), lds]
+    } else {
+        let sum: u32 = (36..64).sum();
+        [28, (sum as f32).to_bits(), 36]
+    }
+}
+
+/// Test 3: `Shape::Half(Op::AddH)` 16-bit float wave64 reduction across both
+/// 32-lane halves. Low 16 bits of `v3` hold `(f16)v0`, high 16 bits hold
+/// `v0 + 7`; the reduction sums the low f16 across the wave and keeps lane 0's
+/// high 16 bits (`(l & !63) + 7`).
+fn half_add_reduction() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E0A_0D00, // v_cvt_f32_u32 v5, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E06_1505, // v_cvt_f16_f32 v3, v5
+        0x4A08_0087, // v_add_nc_u32 v4, 7, v0
+        0x3408_0890, // v_lshlrev_b32 v4, 16, v4
+        0x3806_0903, // v_or_b32 v3, v3, v4
+    ]);
+    emit_reduction_body(&mut w, V_ADD_F16, 0x80);
+    w.push(0x7E02_020F); // v_mov_b32 v1, s15
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Exact IEEE-754 f16 encoding of an exact non-negative integer `n` in `0..=65504`.
+fn u32_to_f16_bits(n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let msb = 31 - n.leading_zeros();
+    let exp = msb + 15;
+    let frac = if msb >= 10 {
+        (n >> (msb - 10)) & 0x3FF
+    } else {
+        (n << (10 - msb)) & 0x3FF
+    };
+    (exp << 10) | frac
+}
+
+/// Test 4: uniform loop whose trip count comes from a group-uniform
+/// `buffer_load_dword` -> `v_readfirstlane_b32`, containing a cross-half
+/// ballot (`v0 < 40`) and cross-half `v_add_f32` reduction accumulated across
+/// every iteration.
+fn buffer_load_uniform_loop() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE030_1000,
+        0x800B_0403, // buffer_load_dword v4, v3, s[44:47], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2A_0504, // v_readfirstlane_b32 s21, v4
+        0x7E0C_0280, // v_mov_b32 v6, 0 (ballot accumulator)
+        0x7E0E_0280, // v_mov_b32 v7, 0 (f32 reduction accumulator)
+        0xBE94_0380, // s_mov_b32 s20, 0
+    ]);
+    let mut body = Vec::new();
+    body.extend([
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x4A0C_0C0C, // v_add_nc_u32 v6, s12, v6
+        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
+    ]);
+    emit_reduction_body(&mut body, V_ADD_F32, 0x80);
+    body.push(0x060E_0E0F); // v_add_f32 v7, s15, v7
+    let back = -(body.len() as i32 + 3);
+    w.extend(body);
+    w.extend([
+        0x8014_8114,                          // s_add_u32 s20, s20, 1
+        0xBF0A_1514,                          // s_cmp_lt_u32 s20, s21
+        0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1
+    ]);
+    w.extend(store(6, 0));
+    w.extend(store(7, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_predication_test_programs_are_what_their_comments_say() {
+    let programs: Vec<(Vec<u32>, &[&str])> = vec![
+        (
+            early_out_program(true, 40),
+            &[
+                "v_cmp_gt_u32 vcc, lit(0x00000028), v0",
+                "s_and_saveexec_b64 s[10:11], vcc",
+                "s_cbranch_execz",
+                "v_readfirstlane_b32 s12, v0",
+                "v_readlane_b32 s12, v0, 38",
+                "ds_write_b32 v2, v14",
+                "ds_read_b32 v15, v4",
+            ],
+        ),
+        (
+            early_out_program(false, 35),
+            &[
+                "v_cmp_le_u32 vcc, lit(0x00000023), v0",
+                "s_and_saveexec_b64 s[10:11], vcc",
+                "s_cbranch_execz",
+            ],
+        ),
+        (
+            diamond_program(),
+            &[
+                "v_cmp_gt_u32 vcc, lit(0x00000024), v0",
+                "s_and_saveexec_b64 s[10:11], vcc",
+                "s_andn2_b64 exec, s[10:11], exec",
+                "v_readfirstlane_b32 s13, v0",
+                "s_mov_b64 exec, s[10:11]",
+            ],
+        ),
+        (
+            half_add_reduction(),
+            &[
+                "v_cvt_f16_f32 v3, v5",
+                "v_add_nc_u32 v4, 7, v0",
+                "v_lshlrev_b32 v4, 16, v4",
+                "v_or_b32 v3, v3, v4",
+                "v_add_f16 v1, v2, v1",
+                "v_add_f16 v1, s14, v1",
+            ],
+        ),
+        (
+            buffer_load_uniform_loop(),
+            &[
+                "buffer_load_dword v4, v3, s[44:47], 0 offen",
+                "v_readfirstlane_b32 s21, v4",
+                "v_add_nc_u32 v6, s12, v6",
+                "v_add_f32 v7, s15, v7",
+                "s_cmp_lt_u32 s20, s21",
+            ],
+        ),
+    ];
+    for (words, wants) in programs {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in wants {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+#[test]
+fn predicated_early_out_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for (keep_below, limit) in [(true, 40), (false, 35)] {
+        let words = early_out_program(keep_below, limit);
+        let n = native(&words, true, 64, 256);
+        let lowered = lowered_with(&n, true, true).expect("predicated early-out lowers");
+        assert_eq!(lowered.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let want: Vec<u32> = (0..64)
+            .flat_map(|l| console_early_out(keep_below, limit, l))
+            .collect();
+        failed.extend(differences_with(&words, 64, 8, &want, 256, true));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn predicated_diamond_matches_the_console_on_every_gpu() {
+    let words = diamond_program();
+    let n = native(&words, true, 64, 256);
+    let lowered = lowered_with(&n, true, true).expect("predicated diamond lowers");
+    assert_eq!(lowered.wave_size, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut lowered.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let want: Vec<u32> = (0..64).flat_map(console_diamond).collect();
+    let failed = differences_with(&words, 64, 3, &want, 256, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn half_add_reduction_across_halves_matches_the_console_on_every_gpu() {
+    let words = half_add_reduction();
+    let mut failed = Vec::new();
+    for threads in [32, 64, 96, 128] {
+        let n = native(&words, true, threads, 0);
+        let lowered = lowered_with(&n, true, true).expect("half add reduction lowers");
+        assert_eq!(lowered.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let want: Vec<u32> = (0..threads)
+            .map(|l| {
+                let wave = l & !63;
+                let sum = console_reduction(threads, l, |a, b| a + b, |t| t);
+                let hi = (wave + 7) << 16;
+                hi | u32_to_f16_bits(sum)
+            })
+            .collect();
+        failed.extend(differences_with(&words, threads, 1, &want, 0, true));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn uniform_buffer_load_loop_across_halves_matches_the_console_on_every_gpu() {
+    let words = buffer_load_uniform_loop();
+    let mut failed = Vec::new();
+    let trips = 3u32;
+    for threads in [64, 96, 128] {
+        let n = native(&words, true, threads, 0);
+        let lowered = lowered_with(&n, true, true).expect("buffer-load loop lowers");
+        assert_eq!(lowered.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| {
+                let bcnt = console_lanes_below(40, threads, l)[0];
+                let sum = console_reduction(threads, l, |a, b| a + b, |t| t) as f32;
+                [trips * bcnt, ((trips as f32) * sum).to_bits()]
+            })
+            .collect();
+        failed.extend(differences_with_buffer(
+            true,
+            &words,
+            threads,
+            2,
+            &want,
+            0,
+            true,
+            &[trips, 0, 0, 0],
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
