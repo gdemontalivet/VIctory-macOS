@@ -443,13 +443,28 @@ impl HostPipeline {
         }
         // Mesh shaders whose standalone output footprint exceeds Metal's 32 KiB
         // limit are re-translated together with their paired pixel shader,
-        // pruning outputs the pixel shader never reads.
-        let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
-            let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
-            if bytes <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES {
-                return None;
+        // pruning outputs the pixel shader never reads. When the paired pixel
+        // shader reads non-provoking vertex values (`VICTORY_P10`/`VICTORY_P20`),
+        // mesh pipelines have no geometry stage, so lower those reads to
+        // hardware center interpolation (`VICTORY_MESH_PER_VERTEX_CENTER`).
+        let ps_deltas = mesh.is_some()
+            && super::mesh_per_vertex_center()
+            && find("pixel")
+                .and_then(|ps| ps.translated())
+                .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
+        let linked = mesh.and_then(|ms| {
+            let over_limit = super::link_mesh_outputs()
+                && victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)
+                    .is_some_and(|o| o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES);
+            if over_limit {
+                super::translate_linked(ms, find("pixel").map(Arc::as_ref), ps_deltas)
+            } else if ps_deltas {
+                let ps = find("pixel")?;
+                let ps_center = super::translate_pixel_center(ps)?;
+                Some((ms.clone(), Some(ps_center)))
+            } else {
+                None
             }
-            super::translate_linked(ms, find("pixel").map(Arc::as_ref))
         });
         let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
             Some((ms, ps)) => {
