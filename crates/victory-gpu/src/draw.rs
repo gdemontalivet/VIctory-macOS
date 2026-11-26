@@ -4732,6 +4732,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     fn run_shadow_preserve_gpu_write_repro(p: usize, len: usize) {
+        let _keep = crate::shadow::KeepGuard::enable();
         let Some(host) = crate::host::host() else {
             return;
         };

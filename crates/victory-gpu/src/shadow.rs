@@ -34,10 +34,38 @@ const KEEP_PIECE: usize = 256;
 const KEEP_CHUNK_PIECES: usize = PAGE / KEEP_PIECE;
 
 fn shadow_keep_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("0"))
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEEP_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scoped test guard to enable `VICTORY_SHADOW_KEEP` on the current thread
+/// without mutating process-wide environment state or racing parallel tests.
+#[cfg(test)]
+pub(crate) struct KeepGuard(Option<bool>);
+
+#[cfg(test)]
+impl KeepGuard {
+    pub(crate) fn enable() -> Self {
+        Self(KEEP_OVERRIDE.with(|c| c.replace(Some(true))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeepGuard {
+    fn drop(&mut self) {
+        KEEP_OVERRIDE.with(|c| c.set(self.0));
+    }
 }
 
 pub(crate) fn shadow_keep_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = KEEP_OVERRIDE.with(std::cell::Cell::get) {
+        return v;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         shadow_keep_enabled_value(std::env::var_os("VICTORY_SHADOW_KEEP").as_deref())
@@ -1154,7 +1182,7 @@ impl Shadow {
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    /// When `VICTORY_SHADOW_KEEP` is enabled (default), compares 256-byte
+    /// When `VICTORY_SHADOW_KEEP=1` is enabled (opt-in), compares 256-byte
     /// pieces against the last title-memory baseline so unchanged pieces keep
     /// any GPU shader writes already in the host copy.
     fn copy(&self, from: usize, to: usize) -> usize {
@@ -2433,7 +2461,7 @@ impl Arena {
 /// unconditionally there (used on remap, explicit title copies, and
 /// withheld-write retakes).
 pub(crate) fn forget_range(at: usize, len: usize) {
-    if len == 0 {
+    if len == 0 || !shadow_keep_enabled() {
         return;
     }
     let from = at as u64;
@@ -3714,12 +3742,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shadow_keep_switch_defaults_on_and_disables_with_zero() {
+    fn shadow_keep_switch_defaults_off_and_enables_with_one() {
         use std::ffi::OsStr;
-        assert!(shadow_keep_enabled_value(None));
-        assert!(shadow_keep_enabled_value(Some(OsStr::new("1"))));
-        assert!(shadow_keep_enabled_value(Some(OsStr::new(""))));
+        assert!(!shadow_keep_enabled_value(None));
         assert!(!shadow_keep_enabled_value(Some(OsStr::new("0"))));
+        assert!(!shadow_keep_enabled_value(Some(OsStr::new(""))));
+        assert!(shadow_keep_enabled_value(Some(OsStr::new("1"))));
     }
 
     #[test]
@@ -3746,6 +3774,7 @@ pub(crate) mod tests {
     /// as matching the stale pre-GPU baseline).
     #[test]
     fn shadow_keep_resets_after_copy_back_allow_cpu_to_restore_old_value() {
+        let _keep = KeepGuard::enable();
         let p = crate::watch::tests::pool(1);
         let len = PAGE;
         // SAFETY: committed pool page.
@@ -3775,6 +3804,7 @@ pub(crate) mod tests {
     /// not leave the second shadow stale when the title restores `1`.
     #[test]
     fn shadow_keep_overlapping_shadows_do_not_go_stale_on_refill() {
+        let _keep = KeepGuard::enable();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         // SAFETY: committed pool pages.
