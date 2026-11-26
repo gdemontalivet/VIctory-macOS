@@ -4730,4 +4730,117 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(state.host_targets.is_none());
         list.close();
     }
+
+    fn run_shadow_preserve_gpu_write_repro(p: usize, len: usize) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // SAFETY: committed buffer of `len` bytes.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 0x200) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let buf = buffer_at_address(p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).expect("shadow copy");
+        assert!(!copy.is_aliased(), "test requires a non-aliased shadow buffer");
+        let (out_buf, out_data) = host.shared_buffer(256).expect("output buffer");
+        // SAFETY: live output buffer.
+        let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+        // SAFETY: inside mapped output buffer.
+        unsafe { std::ptr::write_bytes(out_data, 0, 256) };
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store(0, 0xDEADBEEFu); }
+"#,
+            &[Param::Uav { register: 0 }],
+        );
+        let reader = compile_cs(
+            r#"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, src.Load(0));
+    dst.Store(4, src.Load(0x200));
+}
+"#,
+            &[
+                Param::Srv {
+                    register: 0,
+                    space: 0,
+                },
+                Param::Uav { register: 0 },
+            ],
+        );
+
+        // Submission 1: initial refresh uploads CPU values, then GPU writes
+        // 0xDEADBEEF to word 0 (kept in shadow, not copied back to CPU).
+        let list1 = host.new_list().unwrap();
+        copy.refresh(&list1, p as u64, len as u64);
+        // SAFETY: open command list and live root/PSO/buffers.
+        unsafe {
+            list1.list.SetComputeRootSignature(&writer.0);
+            list1.list.SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+            list1.list.SetPipelineState(&writer.1);
+            list1.list.Dispatch(1, 1, 1);
+        }
+        list1.close();
+        host.execute(&[&list1]);
+        assert_eq!(copy.read_host(p as u64, 1), [0xDEAD_BEEF]);
+        // SAFETY: committed title memory.
+        assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0x1111_1111);
+
+        // Between submissions: sibling CPU write in a different 256-byte piece
+        // on the same 64 KiB page marks the page dirty while word 0 stays unchanged.
+        // SAFETY: committed title memory.
+        unsafe { ((p + 0x200) as *mut u32).write_volatile(0x3333_3333) };
+
+        // Submission 2: refresh runs, then GPU reads both words into `out_buf`.
+        let list2 = host.new_list().unwrap();
+        copy.refresh(&list2, p as u64, len as u64);
+        // SAFETY: open command list and live root/PSO/buffers.
+        unsafe {
+            list2.list.SetComputeRootSignature(&reader.0);
+            list2.list.SetComputeRootShaderResourceView(0, copy.gpu(p as u64));
+            list2.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+            list2.list.SetPipelineState(&reader.1);
+            list2.list.Dispatch(1, 1, 1);
+        }
+        list2.close();
+        host.execute(&[&list2]);
+
+        // SAFETY: inside mapped output buffer after GPU completion.
+        let got = unsafe { std::slice::from_raw_parts(out_data.cast::<u32>(), 2).to_vec() };
+        crate::shadow::unregister(buf as usize, p as u64);
+        assert_eq!(
+            got,
+            [0xDEAD_BEEF, 0x3333_3333],
+            "GPU write at word 0 must survive refresh when sibling CPU write dirties the same 64 KiB page"
+        );
+    }
+
+    #[test]
+    fn shadow_refresh_preserves_gpu_writes_on_same_tracked_page() {
+        let len = crate::watch::PAGE;
+        let p = crate::watch::tests::pool(1);
+        run_shadow_preserve_gpu_write_repro(p, len);
+    }
+
+    #[test]
+    fn shadow_refresh_preserves_gpu_writes_on_untracked_buffer() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let len = crate::watch::PAGE;
+        // SAFETY: fresh plain committed page (untracked by fault tracking).
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        run_shadow_preserve_gpu_write_repro(p, len);
+        crate::watch::tests::free(p);
+    }
 }
