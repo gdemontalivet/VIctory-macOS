@@ -1266,44 +1266,73 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    /// In every build, so that unattended runs can get past the title's
-    /// prompts; unset, it holds nothing.
+    struct KeyHold {
+        window: std::ops::Range<Duration>,
+        vk: u8,
+    }
+
+    fn key_hold(entry: &str) -> Option<KeyHold> {
+        let mut fields = entry.split(':').map(str::trim);
+        let seconds = |s: &str| Duration::try_from_secs_f64(s.parse().ok()?).ok();
+        let at = seconds(fields.next()?)?;
+        let vk = match fields.next()? {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        };
+        let hold = match fields.next() {
+            Some(value) => seconds(value)?,
+            None => Duration::from_millis(200),
+        };
+        if hold.is_zero() || fields.next().is_some() {
+            return None;
+        }
+        Some(KeyHold {
+            window: at..at.checked_add(hold)?,
+            vk,
+        })
+    }
+
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold_seconds>],...` holds
+    /// each key (for 0.2 s by default) that long after input starts, with or
+    /// without focus. A key is a letter, a digit, or `Enter`, `Esc`, `Tab`,
+    /// `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps
+    /// them to buttons). In every build, so that unattended runs can get past
+    /// the title's prompts; unset, it holds nothing.
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<KeyHold>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
+            let keys = list.split(',').filter_map(key_hold);
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|key| key.window.contains(&now))
+            .map(|key| key.vk)
             .collect()
+    }
+
+    #[test]
+    fn input_script_supports_taps_and_holds() {
+        let tap = key_hold(" 3 : Enter ").unwrap();
+        assert_eq!(tap.vk, 0x0D);
+        assert_eq!(tap.window, Duration::from_secs(3)..Duration::from_millis(3200));
+        let hold = key_hold("6:Enter:2.5").unwrap();
+        assert!(hold.window.contains(&Duration::from_secs(8)));
+        assert!(!hold.window.contains(&Duration::from_millis(8500)));
+        for invalid in ["3:Enter:0", "3:Enter:-1", "3:Enter:NaN", "3:X:2:4"] {
+            assert!(key_hold(invalid).is_none());
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
