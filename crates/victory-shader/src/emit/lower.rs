@@ -2543,6 +2543,21 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
+    /// with the legacy rule that a zero factor makes the product a +0 rather
+    /// than turning an infinite or NaN factor into a NaN.
+    fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let fused = self.fmad(a, b, c);
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
+        let z = self.s.m.bin(cur, Bin::Or, az, bz);
+        // +0 + c, so the sign of a zero addend follows the addition.
+        let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+        self.s.m.select(cur, z, addend, fused)
+    }
+
     /// `f` as an f16 in the low bits, rounded as the program's MODE says at
     /// this point: toward zero where it set that for 16-bit results (the
     /// title does around its 16-bit interpolation), else to nearest even;
@@ -6898,21 +6913,26 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
+                    // On RDNA 2 the legacy encoding decodes as fused
+                    // (`v_fma_legacy_f32`) and flushes its sources; the
+                    // zero-factor rule of the legacy multiply comes with it.
                     _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
+                        self.legacy_fmad(a, bb, acc)
                     }
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
+                float(self, r)
+            }
+            "v_mad_legacy_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                let r = self.legacy_fmad(a, bb, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
@@ -7539,33 +7559,42 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), bit 15
+        // copied upward (sext: dst_unused 1 with WORD_0), or zero (pad; a sign
+        // extension above the high word or a whole dword adds nothing). The
+        // reserved dst_unused 3 is refused.
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
         } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                Some(Ok(o)) if keep => o,
+                _ => self.s.m.i32(0),
+            };
+            let x = self.s.m.bin(c, Bin::And, x, low);
+            if high {
+                let o = self.s.m.bin(c, Bin::And, old, low);
+                let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                self.s.m.bin(c, Bin::Or, o, x)
+            } else {
+                let keep = self.s.m.i32(0xFFFF_0000);
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, o, x)
+            }
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
