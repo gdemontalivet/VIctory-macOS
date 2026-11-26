@@ -273,7 +273,7 @@ fn a_wave64_program_reading_lanes_declares_32_lane_waves_in_halves() {
 }
 
 #[test]
-fn a_lane_mask_fits_in_a_single_host_wave() {
+fn a_lane_mask_runs_per_half_in_halves() {
     let first_active_lane = [
         PROLOGUE.as_slice(),
         &[
@@ -286,15 +286,13 @@ fn a_lane_mask_fits_in_a_single_host_wave() {
     ]
     .concat();
     assert_eq!(refusal(&first_active_lane, 32, 0), "translated");
-    let why = refusal(&first_active_lane, 64, 0);
-    assert!(
-        why.contains("a lane mask read as data (wave64 on a 32-lane host)"),
-        "{why}"
-    );
+    assert_eq!(refusal(&first_active_lane, 64, 0), "translated");
+    let failed = differences(&first_active_lane, 64, 1, &[0; 64]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 #[test]
-fn an_active_reduction_fits_in_a_single_host_wave() {
+fn an_active_reduction_runs_per_half_in_halves() {
     let mut sum = PROLOGUE.to_vec();
     sum.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -324,104 +322,131 @@ fn an_active_reduction_fits_in_a_single_host_wave() {
     sum.extend(store(1, 0));
     sum.push(S_ENDPGM);
 
-    let why = refusal(&sum, 64, 0);
-    assert!(
-        why.contains("a wave reduction over both 32-lane halves"),
-        "{why}"
-    );
+    assert_eq!(refusal(&sum, 64, 0), "translated");
     let failed = differences(&sum, 32, 1, &[496.0_f32.to_bits(); 32]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+
+    let want_halves: Vec<u32> = (0..64)
+        .map(|l| if l < 32 { 496.0_f32 } else { 1520.0_f32 }.to_bits())
+        .collect();
+    let failed = halves_only(&sum, 64, 1, &want_halves);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// Reads across the halves are refused where they are made, with a reason
-/// naming the host's waves; the same programs translate for 64-lane hosts.
+/// Cross-half operations lower to each 32-lane half (`host_lane` and
+/// `waveReadLaneFirst`), while intra-block scalar spills (`restored_lanes`)
+/// keep the exact scalar across both halves even on a mixed VGPR.
 #[test]
-fn reads_across_32_lane_halves_are_refused_with_their_reason() {
+fn cross_half_reads_run_per_half_and_intra_block_spills_stay_exact() {
     let readlane = [
         PROLOGUE.as_slice(),
         &[
             0x3420_0085, // v_lshlrev_b32 v16, 5, v0
             0xD760_000C,
-            0x0001_5100, // v_readlane_b32 s12, v0, 40
+            0x0001_5100, // v_readlane_b32 s12, v0, 40 -> host lane 8 (8 in low, 40 in high)
             0x7E02_020C, // v_mov_b32 v1, s12
         ],
         &store(1, 0),
         &[S_ENDPGM],
     ]
     .concat();
-    assert!(
-        refusal(&readlane, 64, 0).contains("a lane read that may cross 32-lane halves"),
-        "{}",
-        refusal(&readlane, 64, 0)
-    );
-    assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
+    assert_eq!(refusal(&readlane, 64, 0), "translated");
+    let want_readlane: Vec<u32> = (0..64).map(|l| if l < 32 { 8 } else { 40 }).collect();
+    let mut failed = halves_only(&readlane, 64, 1, &want_readlane);
 
-    let first = [
-        PROLOGUE.as_slice(),
-        &[
-            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-            0x7E18_0500, // v_readfirstlane_b32 s12, v0
-            0x7E02_020C, // v_mov_b32 v1, s12
-        ],
-        &store(1, 0),
-        &[S_ENDPGM],
-    ]
-    .concat();
-    // A first-lane read alone needs no console lanes: the host wave's
-    // first lane, in halves or not.
-    assert_eq!(refusal(&first, 64, 0), "translated");
+    assert_eq!(refusal(&first_lane_of_the_thread_id(), 64, 0), "translated");
+    let want_first: Vec<u32> = (0..64).map(|l| if l < 32 { 0 } else { 32 }).collect();
+    failed.extend(halves_only(
+        &first_lane_of_the_thread_id(),
+        64,
+        1,
+        &want_first,
+    ));
 
-    // With console lanes the program runs in halves, where lane 32 is the
-    // upper host wave's first lane: a value that differs between the halves
-    // (the thread id) would read 32 there, the console 0. In a group of 32
-    // there is no upper half.
-    let why = refusal(&first_lane_of_the_thread_id(), 64, 0);
-    assert!(
-        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
-        "{why}"
-    );
-    assert_eq!(refusal(&first_lane_of_the_thread_id(), 32, 0), "translated");
-    // A first-lane read nothing uses costs nothing.
-    let unused_first = [
-        PROLOGUE.as_slice(),
-        &[
-            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-            0xD765_0001,
-            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
-            0x7E18_0500, // v_readfirstlane_b32 s12, v0
-        ],
-        &store(1, 0),
-        &[S_ENDPGM],
-    ]
-    .concat();
-    assert_eq!(refusal(&unused_first, 64, 0), "translated");
-    // A buffer dword loaded at an offset the same in every lane, through a
-    // scalar descriptor, is one value: its first lane is the console's.
     assert_eq!(
         refusal(&first_lane_of_a_buffer_load(3), 64, 0),
         "translated"
     );
-    let why = refusal(&first_lane_of_a_buffer_load(0), 64, 0);
-    assert!(
-        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
-        "{why}"
+    assert_eq!(
+        refusal(&first_lane_of_a_buffer_load(0), 64, 0),
+        "translated"
     );
 
-    // A value read across halves that nothing uses costs nothing.
-    let unused = [
+    // Intra-block scalar spill into lane 40 of a VGPR that also holds `v0`:
+    // `restored_lanes` recovers `0x777` in every lane of both halves, while
+    // `v5` itself keeps `0x777` only in console lane 40 and `v0` elsewhere.
+    let mixed_spill = [
         PROLOGUE.as_slice(),
         &[
             0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0x7E0A_0300, // v_mov_b32 v5, v0
+            0xBE88_03FF,
+            0x0000_0777, // s_mov_b32 s8, 0x777
+            0xD761_0005,
+            0x0001_5008, // v_writelane_b32 v5, s8, 40
             0xD760_000C,
-            0x0001_5100, // v_readlane_b32 s12, v0, 40
-            0xD765_0001,
-            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_5105, // v_readlane_b32 s12, v5, 40
+            0x7E02_020C, // v_mov_b32 v1, s12
         ],
         &store(1, 0),
+        &store(5, 4),
         &[S_ENDPGM],
     ]
     .concat();
-    assert_eq!(refusal(&unused, 64, 0), "translated");
+    let want_spill: Vec<u32> = (0..64)
+        .flat_map(|l| [0x777, if l == 40 { 0x777 } else { l }])
+        .collect();
+    failed.extend(differences(&mixed_spill, 64, 2, &want_spill));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Runs `words` in `halves` (`host_wave32: true`) on every hardware adapter
+/// and compares each lane's output against `want`.
+fn halves_only(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Vec<String> {
+    let n = native(words, true, threads, 0);
+    let s = shader(lowered(&n, true).expect("halves"));
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(threads * 8),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut failed = Vec::new();
+    for (adapter, host) in Host::each_hardware() {
+        let label = format!("{adapter} (halves)");
+        let (root, pso) = host
+            .compute_pipeline(&s)
+            .unwrap_or_else(|e| panic!("{label}: no pipeline: {e}"));
+        let ud = vec![0u32; s.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        failed.extend(
+            out[0]
+                .chunks(8)
+                .zip(want.chunks(per_lane))
+                .enumerate()
+                .filter(|(_, (got, want))| got[..per_lane] != **want)
+                .map(|(l, (got, want))| {
+                    format!("{label}: lane {l}: {:?}, want {want:?}", &got[..per_lane])
+                }),
+        );
+    }
+    failed
 }
 
 /// Phased LDS shared by a group that is one console wave64 meets at group

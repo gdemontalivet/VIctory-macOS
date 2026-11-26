@@ -312,9 +312,6 @@ struct Lower<'a> {
     halves: bool,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
-    /// In halves: VGPR values the same in every lane of the console wave
-    /// ([`halves::lane_uniform`]), whose first lane either half reads.
-    alike: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -683,30 +680,31 @@ impl<'a> Lower<'a> {
                     )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
+            }) || (!x.native.wave64 && reads_exec_scc(p))
+                || {
+                    // Masks held as numbers or constant lane sets: the lane
+                    // tests its own bit by its console lane.
+                    let whens = x.st.exits.iter().filter_map(|e| match *e {
+                        LaneExit::Branch { when, .. } => Some(when),
+                        _ => None,
+                    });
+                    let mut all: Vec<Bool> =
+                        x.st.guards
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .copied()
+                            .chain(whens)
+                            .collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    all.into_iter().any(|g| {
+                        x.st.bools
+                            .support(g)
+                            .iter()
+                            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                    })
+                };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -840,11 +838,6 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             relabelled: None,
-            alike: if halves {
-                halves::lane_uniform(x)
-            } else {
-                HashSet::new()
-            },
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1280,7 +1273,6 @@ impl<'a> Lower<'a> {
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
         use super::wave::{Op, Shape};
-        const ACROSS: Why = "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -1301,7 +1293,6 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -1336,14 +1327,17 @@ impl<'a> Lower<'a> {
                 let r = self.f32_to_f16(c, r);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
-                // elsewhere on the host; there it holds the identity.
+                // elsewhere on the host; there it holds the identity. In
+                // halves the scan stays within the 32-lane half: the ballot is
+                // asked about the lane `read_lane` reads.
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let (word, shift) = halves::ballot_bit(hi, self.host_wave());
+                let word = self.s.m.extract(c, b, word);
+                let (sh, one, z) = (self.s.m.i32(shift), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
@@ -1366,12 +1360,6 @@ impl<'a> Lower<'a> {
                 ))
         {
             return Err("a wave reduction in a mesh shader");
-        }
-        // An active reduction substitutes its identity for inactive lanes.
-        // If the group fits one host wave, the absent upper half contributes
-        // only identities and the host wave contains all participating lanes.
-        if prefix.is_some() || !self.one_host_wave() {
-            self.same_half(ACROSS)?;
         }
         let c = self.cur;
         let &m = self
@@ -1913,6 +1901,21 @@ impl<'a> Lower<'a> {
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
         }
+        // SAVEEXEC and WREXEC set SCC when the resulting EXEC mask has any
+        // lane. A later scalar select reads that one value for the whole wave.
+        // Our packed low dword represents every lane on a required 32-lane wave.
+        if matches!(found, Some(Val::Missing(LANE_MASK)))
+            && self.s.wave_size == Some(32)
+            && !self.x.native.wave64
+            && let Some(inst) = self.def_inst(v)
+            && inst.write(Reg::Scc) == Some(v)
+            && writes_exec_scc(inst)
+            && let Some(exec) = inst.write(Reg::S(EXEC))
+        {
+            let bits = self.mask_dword(exec)?;
+            let zero = self.s.m.i32(0);
+            return Ok(Val::Bit(self.s.m.cmp(self.cur, pred::NE, bits, zero)));
+        }
         if let Some(Val::Missing(w)) = found {
             return Err(w);
         }
@@ -2108,18 +2111,14 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                // If the whole group fits, there are no dispatched lanes in
-                // the upper half and the host ballot covers every active lane.
-                let single_half = self.halves && self.one_host_wave();
-                if !single_half {
-                    self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
-                }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                // In halves, the host wave holds one 32-lane half: its low
+                // dword is the half's own ballot and its high dword is 0.
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2127,7 +2126,7 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let low_word = self.s.m.extract(at, r, 0);
-                let high_word = if single_half {
+                let high_word = if self.halves {
                     self.s.m.i32(0)
                 } else {
                     self.s.m.extract(at, r, 1)
@@ -3384,6 +3383,7 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = self.host_lane(lane);
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -3457,7 +3457,7 @@ impl<'a> Lower<'a> {
             let q = self.s.m.bin(c, Bin::And, src, three);
             self.s.m.bin(c, Bin::Or, base, q)
         } else {
-            src
+            self.host_lane(src)
         };
         Some(self.lane_bit_of(c, ballot_lane, lo, hi))
     }
@@ -6432,6 +6432,15 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(&source) = self.x.res.restored_lanes.get(&(b, i)) {
+            // This lane was overwritten by a uniform scalar in the same block;
+            // other lanes of the VGPR may hold arbitrary vector data.
+            let word = match source {
+                crate::resource::Moved::Value(v) => self.i32_of(v)?,
+                crate::resource::Moved::Const(k) => self.s.m.i32(k),
+            };
+            return self.write_i(inst, word, None);
+        }
         if self.waterfall_compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
@@ -7300,9 +7309,6 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
-                    self.same_half(
-                        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
-                    )?;
                 }
                 let r = self.read_lane(a, lane);
                 int(self, r)
@@ -7371,21 +7377,10 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readfirstlane_b32" => {
-                // In halves the host wave's first lane is the console's only
-                // for a value the same in both halves, or where the group is
-                // one host wave.
-                if self.halves
-                    && !self.one_host_wave()
-                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
-                {
-                    return Err(halves::FIRST_ACROSS);
-                }
                 let a = s(self, 0)?;
-                // shortcut: without console lanes, the first lane of the host
-                // wave (whose waves are the driver's choice): the console's
-                // where the value is the same in every lane, what the compiler
-                // reads first lanes for.
+                // shortcut: without console lanes (or in halves), the first
+                // active lane of the host wave: exact where the value is the
+                // same in every lane, and the half's own first lane otherwise.
                 self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,
@@ -11762,6 +11757,21 @@ impl<'a> Lower<'a> {
 /// at its end syncs there when a successor is not one, so divergent code
 /// after it reads clean LDS. `None`: a read in divergent code may see a
 /// write made in divergent code since the last such block.
+/// An EXEC update whose scalar condition code says whether the resulting
+/// 32-bit mask is nonzero.
+fn writes_exec_scc(inst: &Inst) -> bool {
+    inst.name().ends_with("_wrexec_b32") || inst.name().ends_with("_saveexec_b32")
+}
+
+fn reads_exec_scc(p: &Program) -> bool {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let flags: Set<_> = insts()
+        .filter(|i| writes_exec_scc(i))
+        .filter_map(|i| i.write(Reg::Scc))
+        .collect();
+    !flags.is_empty() && insts().any(|i| i.read(Reg::Scc).is_some_and(|v| flags.contains(&v)))
+}
+
 pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
