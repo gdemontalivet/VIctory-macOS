@@ -96,6 +96,12 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Pending RTVs drawn while `VICTORY_HDR_PROBE` is active, flushed on
+    /// target switch or list close: `(resources, last_pipeline_name)`.
+    hdr_rtvs: Option<(Vec<usize>, String)>,
+    /// Last `(pipeline_ptr, uav_resource)` probed by a compute dispatch on
+    /// this list, collapsing consecutive tile/mip dispatches of the same pass.
+    hdr_last_compute: (usize, usize),
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -449,6 +455,13 @@ impl State {
             crate::capture::note_target(list, record.resource);
             rtv_keys.push((texture.as_raw() as usize, record.key()));
             rtv_views.push((texture, record.desc()));
+        }
+        if self
+            .hdr_rtvs
+            .as_ref()
+            .is_some_and(|(prev, _)| prev != &self.targets)
+        {
+            self.flush_hdr_probe(list);
         }
         self.depth = 0;
         let mut dsv_view = None;
@@ -1194,9 +1207,71 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.probe_hdr_compute(list);
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes any pending RTV probes recorded during `VICTORY_HDR_PROBE`.
+    pub(crate) fn flush_hdr_probe(&mut self, list: &HostList) {
+        let Some((targets, shaders)) = self.hdr_rtvs.take() else {
+            return;
+        };
+        if !crate::hdr_probe::active() {
+            return;
+        }
+        const RENDER_TARGET: u32 = 0x4;
+        for resource in targets {
+            crate::hdr_probe::probe_texture(list, resource as This, RENDER_TARGET, "rtv", &shaders);
+        }
+    }
+
+    /// Marks the currently bound RTVs dirty for `VICTORY_HDR_PROBE`; zero cost
+    /// outside the single targeted world frame.
+    fn note_hdr_draw(&mut self) {
+        if !crate::hdr_probe::active() || self.targets.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        self.hdr_rtvs = Some((self.targets.clone(), p.name.clone()));
+    }
+
+    /// Probes HDR/color UAV textures written by the just-recorded compute
+    /// dispatch when `VICTORY_HDR_PROBE` is active.
+    fn probe_hdr_compute(&mut self, list: &HostList) {
+        if !crate::hdr_probe::active() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        const UNORDERED: u32 = 0x8;
+        for stage in &p.stages {
+            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Uav) {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.compute.get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let Some(view) =
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
+                    continue;
+                };
+                let View::Unordered(r, ..) = &*view else {
+                    continue;
+                };
+                let key = (self.pipeline, *r);
+                if self.hdr_last_compute == key {
+                    continue;
+                }
+                self.hdr_last_compute = key;
+                crate::hdr_probe::probe_texture(list, *r as This, UNORDERED, "uav", &p.name);
+            }
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1276,6 +1351,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1655,6 +1731,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1749,6 +1826,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1905,8 +1983,10 @@ impl State {
         }
         crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
+            self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true

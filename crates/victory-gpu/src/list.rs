@@ -207,10 +207,14 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
         if !current.is_empty() {
             let Some(next) = next_segment(this) else { return };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            current.close();
             // SAFETY: the title passes one of our lists.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            {
+                let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.flush_hdr_probe(current);
+                current.close();
+                state.cut(next);
+            }
             next.defer_wait(wait);
             return;
         }
@@ -450,6 +454,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        with_state(this, |list, state| state.flush_hdr_probe(list));
         host.close();
     }
     S_OK

@@ -658,6 +658,8 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    crate::hdr_probe::on_present(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
