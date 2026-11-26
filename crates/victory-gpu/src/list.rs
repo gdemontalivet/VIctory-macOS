@@ -272,16 +272,49 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
 #[cfg(windows)]
 static SPARE: std::sync::Mutex<Vec<crate::host::HostList>> = std::sync::Mutex::new(Vec::new());
 
+/// Host lists waiting out [`crate::host::bury_lag`] submissions before their
+/// command allocators and kept resources are reset.
+#[cfg(windows)]
+static AGING: std::sync::Mutex<std::collections::VecDeque<(u64, crate::host::HostList)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
 /// A host list a queue has run: one no title list holds any more is reset
-/// and kept for [`restart`].
+/// and kept for [`restart`] (after [`crate::host::bury_lag`] submissions).
 #[cfg(windows)]
 pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
-    if let Ok(list) = std::sync::Arc::try_unwrap(list) {
+    let Ok(list) = std::sync::Arc::try_unwrap(list) else {
+        return;
+    };
+    let lag = crate::host::bury_lag();
+    let done = crate::host::submissions_done();
+    if lag == 0 {
         list.reset();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
             spare.push(list);
+        }
+        return;
+    }
+    let ready: Vec<crate::host::HostList> = {
+        let mut aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+        aging.push_back((done, list));
+        let n = aging
+            .iter()
+            .take_while(|(at, _)| at.saturating_add(lag) <= done)
+            .count();
+        aging.drain(..n).map(|(_, l)| l).collect()
+    };
+    if ready.is_empty() {
+        return;
+    }
+    for l in &ready {
+        l.reset();
+    }
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    for l in ready {
+        if spare.len() < KEPT {
+            spare.push(l);
         }
     }
 }
