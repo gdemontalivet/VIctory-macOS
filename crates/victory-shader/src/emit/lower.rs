@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod lds;
 mod mesh;
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
@@ -137,6 +138,7 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[allow(dead_code)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_pruned(parts, None)
 }
@@ -312,8 +314,6 @@ struct Lower<'a> {
     console_lanes: bool,
     /// A console wave64 program in host waves of 32 lanes (`halves`).
     halves: bool,
-    /// Why such a program cannot run in halves.
-    halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: per IR block, whether each lane runs it once
@@ -372,6 +372,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loop latches' barriers still ahead (`lds::Plan::drains`).
+    drains: HashMap<usize, usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -675,7 +677,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
-        let (mut halves, mut halves_refused) = (false, None);
+        let mut halves = false;
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -724,7 +726,7 @@ impl<'a> Lower<'a> {
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
-            if x.narrow_waves && one_wave && group > 32 && s.lds_dwords > 0 {
+            if x.narrow_waves && !x.host_wave32 && one_wave && group > 32 && s.lds_dwords > 0 {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
@@ -736,14 +738,11 @@ impl<'a> Lower<'a> {
             // A host whose waves are narrower than WaveSize(64) does not run
             // the dispatch (D3DMetal: nothing written): ask for the console's
             // width only where wave operations need it, or LDS is not synced.
-            // On a host of 32-lane waves that width is two halves, which
-            // refuse LDS only where no barriers sync it.
-            let fits = x.narrow_waves && (synced || group <= 32);
+            // On a host of 32-lane waves that width is two halves, whose LDS
+            // phases meet at group barriers (`lds::barriers`).
+            let fits = x.narrow_waves && !x.host_wave32 && (synced || group <= 32);
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
-            if halves && !synced {
-                halves_refused = Self::halves_lds(group, s.lds_dwords);
-            }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });
             }
@@ -853,7 +852,6 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             halves,
-            halves_refused,
             relabelled: None,
             once: if halves { once_per_lane(p) } else { Vec::new() },
             half_words: None,
@@ -896,6 +894,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            drains: HashMap::new(),
             round16: round16(p),
             mode16: Some(0),
         }
@@ -1506,10 +1505,28 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.level = self.s.entry;
-        if let Some(why) = self.halves_refused {
-            return Err(unsupported(0, why));
-        }
         self.find_sections();
+        // One console wave run as two host waves: its halves meet at a
+        // barrier between LDS phases (`lds::barriers`).
+        let mut meet = Set::default();
+        if self.halves
+            && !self.one_host_wave()
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() <= 64)
+            && self.s.lds_dwords > 0
+        {
+            let sections = &self.sections;
+            let inside = |b: usize, i: usize| {
+                sections
+                    .get(&b)
+                    .is_some_and(|s| s.iter().any(|(&start, sec)| start < i && i < sec.end))
+            };
+            let plan = lds::barriers(p, &self.x.st.exits, inside).map_err(|w| unsupported(0, w))?;
+            meet.extend(plan.at);
+            self.drains = plan.drains;
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -1545,6 +1562,9 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
+                if meet.contains(&(b, i)) {
+                    self.lds_barrier();
+                }
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
@@ -1571,6 +1591,9 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if meet.contains(&(b, p.blocks[b].insts.len())) {
+                self.lds_barrier();
             }
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
                 self.group_barrier();
@@ -1643,7 +1666,7 @@ impl<'a> Lower<'a> {
                 ],
             },
             #[cfg(test)]
-            split_barriers: self.split_barriers.len(),
+            split_barriers: self.split_barriers.len() + meet.len(),
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -11252,7 +11275,7 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let abort = self.lds_abort(b);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -12015,91 +12038,7 @@ impl<'a> Lower<'a> {
     }
 }
 
-/// Where a compute group that is one console wave needs group barriers
-/// when the host splits it into narrower waves: (block, instruction) to
-/// sync before, instruction index = the block's length for its end.
-///
-/// The console runs such a group in lockstep, so its compiler leaves out
-/// the barrier between one lane's LDS write and another's read. Here a
-/// read (or atomic) of LDS that a write may have changed since the last
-/// barrier gets one before it. Barriers need every lane of the group, so
-/// they go only in blocks each lane runs exactly once (no cycle through
-/// them, on every path from the entry to an end); such a block still dirty
-/// at its end syncs there when a successor is not one, so divergent code
-/// after it reads clean LDS. `None`: a read in divergent code may see a
-/// write made in divergent code since the last such block.
-pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
-    let n = p.blocks.len();
-    let succ = |b: usize| p.blocks[b].exit.successors();
-    let uniform = once_per_lane(p);
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    let mut dirty_out = vec![false; n];
-    loop {
-        let mut at = Set::default();
-        let mut changed = false;
-        for &b in &order {
-            let mut dirty = p.blocks[b].preds.iter().any(|&q| dirty_out[q]);
-            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                let name = inst.name();
-                if name == "s_barrier" {
-                    dirty = false;
-                }
-                if !matches!(inst.fields, Fields::Ds { .. })
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute")
-                {
-                    continue;
-                }
-                if dirty && !name.starts_with("ds_write") {
-                    if !uniform[b] {
-                        return None;
-                    }
-                    at.insert((b, i));
-                }
-                dirty = !name.starts_with("ds_read");
-            }
-            if dirty && uniform[b] && succ(b).iter().any(|&s| !uniform[s]) {
-                at.insert((b, p.blocks[b].insts.len()));
-                dirty = false;
-            }
-            changed |= std::mem::replace(&mut dirty_out[b], dirty) != dirty;
-        }
-        if !changed {
-            return Some(at);
-        }
-    }
-}
-
-/// Per block, whether each lane of the group runs it exactly once: no cycle
-/// passes through it, and every path from the entry to an end does. A group
-/// barrier needs every lane of the group, so it can go only in these.
-pub(crate) fn once_per_lane(p: &Program) -> Vec<bool> {
-    let n = p.blocks.len();
-    let succ = |b: usize| p.blocks[b].exit.successors();
-    // Blocks reachable from `from`'s successors (or from `from` itself when
-    // `start`), never entering `avoid`.
-    let reach = |from: usize, start: bool, avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut stack = if start { vec![from] } else { succ(from) };
-        while let Some(b) = stack.pop() {
-            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            stack.extend(succ(b));
-        }
-        seen
-    };
-    (0..n)
-        .map(|b| {
-            let ends_around = b != 0
-                && reach(0, true, Some(b))
-                    .iter()
-                    .enumerate()
-                    .any(|(q, &r)| r && succ(q).is_empty());
-            !reach(b, false, None)[b] && !ends_around
-        })
-        .collect()
-}
+pub(crate) use halves::{once_per_lane, split_wave_barriers};
 
 #[cfg(test)]
 mod tests;

@@ -826,12 +826,13 @@ fn lane_reads_across_halves_match_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// LDS shared by a group that is one console wave64 (no barriers between
-/// its lanes) cannot be split into two host waves; one of 32 threads or
-/// fewer is one host wave, and a group of several console waves keeps the
-/// console's barriers.
+/// Phased LDS shared by a group that is one console wave64 meets at group
+/// barriers between its phases (`lds::barriers`); unphased LDS written and
+/// read in one loop has no point every thread reaches once and is refused in
+/// halves (while a group of 32 threads is one host wave, and 128 is several
+/// console waves).
 #[test]
-fn lds_of_a_one_wave64_group_is_refused_in_halves() {
+fn lds_of_a_one_wave64_group_phases_or_refuses_in_halves() {
     let lds = [
         PROLOGUE.as_slice(),
         &[
@@ -850,13 +851,39 @@ fn lds_of_a_one_wave64_group_is_refused_in_halves() {
         &[S_ENDPGM],
     ]
     .concat();
-    let why = refusal(&lds, 64, 256);
-    assert!(
-        why.contains("LDS one console wave64 shares without barriers"),
-        "{why}"
-    );
+    assert_eq!(refusal(&lds, 64, 256), "translated");
     assert_eq!(refusal(&lds, 32, 256), "translated");
     assert_eq!(refusal(&lds, 128, 512), "translated");
+
+    let unphased = [
+        PROLOGUE.as_slice(),
+        &[
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0xBE86_0384, // s_mov_b32 s6, 4
+            0xD834_0000,
+            0x0000_0102, // loop: ds_write_b32 v2, v1
+            S_WAITCNT_LGKM,
+            0xD8D8_0000,
+            0x0300_0002, // ds_read_b32 v3, v2
+            S_WAITCNT_LGKM,
+            0x8186_8106, // s_sub_u32 s6, s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_FFF7, // s_cbranch_scc1 -9 -> loop
+        ],
+        &store(3, 0),
+        &[S_ENDPGM],
+    ]
+    .concat();
+    let why = refusal(&unphased, 64, 256);
+    assert!(
+        why.contains("one-wave LDS on a 32-lane host: no point all threads reach"),
+        "{why}"
+    );
+    assert_eq!(refusal(&unphased, 32, 256), "translated");
+    assert_eq!(refusal(&unphased, 128, 512), "translated");
 }
 
 /// Runs `words`, one group of `threads` of a wave64 program whose lanes store
@@ -1037,9 +1064,9 @@ fn first_lane_of_a_buffer_load(offset: u32) -> Vec<u32> {
         0x7E06_0284, // v_mov_b32 v3, 4
         0xE030_1000,
         0x800B_0400 | offset, // buffer_load_dword v4, v<offset>, s[44:47], 0 offen
-        0xBF8C_3F70,         // s_waitcnt vmcnt(0)
-        0x7E18_0504,         // v_readfirstlane_b32 s12, v4
-        0x7E0A_020C,         // v_mov_b32 v5, s12
+        0xBF8C_3F70,          // s_waitcnt vmcnt(0)
+        0x7E18_0504,          // v_readfirstlane_b32 s12, v4
+        0x7E0A_020C,          // v_mov_b32 v5, s12
     ]);
     w.extend(store(5, 0));
     w.push(S_ENDPGM);
@@ -1142,23 +1169,16 @@ fn the_lds_program_is_what_its_comments_say() {
     }
 }
 
-/// With narrow host waves (#148, D3DMetal), a one-wave group whose LDS gets
-/// its barrier runs in halves instead of being refused; without them it is
-/// refused, as before.
+/// On a 32-lane host, a one-wave64 group whose LDS accesses come in phases
+/// gets its barrier and runs in halves whether `narrow_waves` is set or not.
 #[test]
 fn lds_of_a_one_wave64_group_synced_by_barriers_runs_in_halves() {
     let n = native(&lds_across_halves(), true, 64, 256);
-    let synced = lowered_with(&n, true, true).expect("synced, in halves");
-    assert_eq!(synced.wave_size, Some(32));
-    assert_eq!(synced.split_barriers, 1);
-    let why = lowered_with(&n, true, false)
-        .err()
-        .expect("refused")
-        .to_string();
-    assert!(
-        why.contains("LDS one console wave64 shares without barriers"),
-        "{why}"
-    );
+    for narrow in [false, true] {
+        let synced = lowered_with(&n, true, narrow).expect("synced, in halves");
+        assert_eq!(synced.wave_size, Some(32));
+        assert_eq!(synced.split_barriers, 1);
+    }
 }
 
 /// The synced program on every hardware adapter, in halves: each lane reads
@@ -1167,7 +1187,47 @@ fn lds_of_a_one_wave64_group_synced_by_barriers_runs_in_halves() {
 #[test]
 fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..64u32).map(|l| (l ^ 32).min(32)).collect();
-    let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, true);
+    let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, false);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// An unconditional back-edge loop followed by a divergent lane-0 LDS write
+/// and a group-wide read across halves (`lds_abort` drain + join barrier).
+#[test]
+fn divergent_lds_and_loop_drain_in_halves_match_the_console_on_every_gpu() {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE86_0382, // s_mov_b32 s6, 2
+        0x8186_8106, // loop: s_sub_u32 s6, s6, 1
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF84_0001, // s_cbranch_scc0 +1 -> out
+        0xBF82_FFFC, // s_branch -4 -> loop
+        0x7E04_0280, // out: v_mov_b32 v2, 0
+        0x7E02_02AA, // v_mov_b32 v1, 42
+        0xBE88_047E, // s_mov_b64 s[8:9], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xBF88_0002, // s_cbranch_execz +2 -> join
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        0xBEFE_0408, // join: s_mov_b64 exec, s[8:9]
+        S_WAITCNT_LGKM,
+        0xD8D8_0000,
+        0x0300_0002, // ds_read_b32 v3, v2
+        S_WAITCNT_LGKM,
+    ]);
+    w.extend(store(3, 0));
+    w.push(S_ENDPGM);
+
+    let n = native(&w, true, 64, 256);
+    let l = lowered(&n, true).expect("halves with loop drain");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.split_barriers, 1);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut l.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let failed = differences_with(&w, 64, 1, &[42; 64], 256, false);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
