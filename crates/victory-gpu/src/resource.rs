@@ -2002,6 +2002,25 @@ fn hand_out_resource(
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A live reference to a title resource, taken under the lookup table's lock
+/// so the title cannot free it while the caller uses it.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_ref(self.0);
+    }
+}
+
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
 /// memory, in the same layout and with the same bytes per row and rows
@@ -2011,7 +2030,7 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<Held> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     // A shader view of no resource (a null view) has no memory.
     if placed.is_null() {
@@ -2035,11 +2054,17 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .peekable();
     written.peek()?;
     let want = bytes(&b.desc)?;
-    written.find(|&r| {
-        let a = resource(r);
-        bytes(&a.desc) == Some(want)
-            && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
-    })
+    // Take a reference under `TEXTURES_AT`'s lock: `Resource::drop` removes
+    // itself under the same lock before freeing the `Resource`, so `try_add_ref`
+    // succeeds only while live and keeps it alive until `Held` drops.
+    written
+        .find(|&r| {
+            let a = resource(r);
+            bytes(&a.desc) == Some(want)
+                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+                && crate::object::try_add_ref(r)
+        })
+        .map(Held)
 }
 
 #[cfg(windows)]
@@ -2522,7 +2547,57 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_null_view_has_no_alias_source() {
-        assert_eq!(alias_source(std::ptr::null()), None);
+        assert!(alias_source(std::ptr::null()).is_none());
+    }
+
+    /// An alias source returned by [`alias_source`] holds a reference so the
+    /// title releasing its texture cannot free it before the caller copies
+    /// from it, and dropping the handle releases it cleanly.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        // Uncompressed 16x16 R32G32B32A32_UINT UAV (format 3, 16 bytes/texel)
+        // and block-compressed 64x64 BC7_UNORM SRV (format 98, 16 bytes/4x4
+        // block) at the same address share row_bytes/rows/swizzle but have
+        // distinct host textures, so `view` resolves `source` as its alias.
+        let source = place(&ResourceDesc { flags: UNORDERED, ..texture(16, 16, 3, 1) });
+        let view = place(&texture(64, 64, 98, 1));
+        let source_host = host_copy(source).expect("source host texture");
+        let view_host = host_copy(view).expect("view host texture");
+        assert!(!std::sync::Arc::ptr_eq(&source_host, &view_host), "distinct host copies");
+        drop((source_host, view_host));
+
+        let held = alias_source(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+
+        // The title releases its reference: `held` still keeps `source` alive.
+        assert_eq!(slot::<Release>(source, 0x10)(source), 1);
+        assert!(host_resource(held.get()).is_some(), "source still live while held");
+        let at = resource(source).data() as u64;
+        assert!(
+            TEXTURES_AT.lock().unwrap().get(&at).is_some_and(|list| list.contains(&(source as usize))),
+            "source still registered while held"
+        );
+
+        // Dropping `held` releases the final reference and unregisters `source`.
+        drop(held);
+        assert!(
+            !TEXTURES_AT.lock().unwrap().get(&at).is_some_and(|list| list.contains(&(source as usize))),
+            "source unregistered after handle drops"
+        );
+
+        assert_eq!(slot::<Release>(view, 0x10)(view), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
     #[test]
