@@ -210,11 +210,37 @@ fn mirror(handle: u64) {
 /// world 1,300-14,400 slots a frame, against a few hundred views made by
 /// calls). Called before each submission: shaders take descriptors from the
 /// heap at indices in their data, where a slot never mirrored reads nothing.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub(crate) fn sync_heaps() {
+    sync_heaps_filtered(None);
+}
+
+/// Syncs only the shader-visible heaps bound by a submission's command lists
+/// (`bound_heaps` by title `Heap` pointer, `bound_viewed` by `HostHeap::viewed`
+/// pointer). Unbound heaps keep their dirty ranges in `written` until a
+/// submission actually binds them, and copy/upload-only submissions skip
+/// `SHADER_HEAPS` entirely.
+#[cfg(windows)]
+pub(crate) fn sync_heaps_for(
+    bound_heaps: &std::collections::HashSet<usize>,
+    bound_viewed: &std::collections::HashSet<usize>,
+) {
+    if bound_heaps.is_empty() && bound_viewed.is_empty() {
+        return;
+    }
+    sync_heaps_filtered(Some((bound_heaps, bound_viewed)));
+}
+
+#[cfg(windows)]
+fn sync_heaps_filtered(
+    only: Option<(
+        &std::collections::HashSet<usize>,
+        &std::collections::HashSet<usize>,
+    )>,
+) {
     /// A heap's start, its address, and the ranges written since the last sync.
     type Written = (u64, usize, Vec<(usize, usize)>);
-    // The written ranges of every heap, taken in one short hold of the lock.
+    // The written ranges of every matching heap, taken in one short hold of the lock.
     let work: Vec<Written> = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
@@ -224,12 +250,19 @@ pub(crate) fn sync_heaps() {
                 let heap = unsafe { &*(at as *const Heap) };
                 // As before: ranges are taken only once the heap has its
                 // host heap, so writes before that are not lost.
-                let (Some(Some(_)), Some(written), Some(_)) =
+                let (Some(Some(host)), Some(written), Some(_)) =
                     (heap.host.get(), &heap.written, increment(heap.desc.kind))
                 else {
                     return None;
                 };
-                Some((start, at, written.take(start as usize, usize::MAX)))
+                if let Some((bound_heaps, bound_viewed)) = only
+                    && !bound_heaps.contains(&at)
+                    && !bound_viewed.contains(&(std::sync::Arc::as_ptr(&host.viewed) as usize))
+                {
+                    return None;
+                }
+                let ranges = written.take(start as usize, usize::MAX);
+                (!ranges.is_empty()).then_some((start, at, ranges))
             })
             .collect()
     };

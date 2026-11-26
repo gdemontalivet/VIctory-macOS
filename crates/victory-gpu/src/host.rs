@@ -1384,6 +1384,8 @@ struct Deferred {
     slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title shader-visible descriptor heaps bound on this list since reset.
+    bound_heaps: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1728,42 +1730,41 @@ impl Host {
         if crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
         }
-        // Descriptors the title copied into its heaps itself, before the
-        // heaps' views are brought up to date below.
+        // Descriptors the title copied into the submission's bound heaps as
+        // bytes, synced before their views are brought up to date below
+        // (unbound heaps keep their dirty ranges until bound).
+        let mut bound_heaps = std::collections::HashSet::new();
+        let mut bound_viewed = std::collections::HashSet::new();
+        let mut seen_heaps = std::collections::HashSet::new();
+        let mut heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = Vec::new();
+        let mut textures: Vec<_> = Vec::new();
+        for l in runs {
+            let deferred = l.deferred();
+            bound_heaps.extend(deferred.bound_heaps.iter().copied());
+            for s in &deferred.copies {
+                match s {
+                    Step::Heap(v) => {
+                        let ptr = std::sync::Arc::as_ptr(v) as usize;
+                        bound_viewed.insert(ptr);
+                        if seen_heaps.insert(ptr) {
+                            heaps.push(v.clone());
+                        }
+                    }
+                    Step::Slot(v, _) => {
+                        bound_viewed.insert(std::sync::Arc::as_ptr(v) as usize);
+                    }
+                    Step::Texture(staging, copy) => {
+                        textures.push((staging.clone(), copy.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
-        crate::descriptor::sync_heaps();
+        crate::descriptor::sync_heaps_for(&bound_heaps, &bound_viewed);
         #[cfg(feature = "diagnostics")]
         drop(syncing);
-        // Textures heap-indexing shaders may read, uploaded first by a list
-        // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // And textures read through tables, uploaded by the same list.
-        let textures: Vec<_> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
@@ -3279,6 +3280,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Records a title shader-visible descriptor heap bound on this list so
+    /// submission-time `sync_heaps_for` only sweeps bound heaps.
+    pub(crate) fn note_bound_heap(&self, heap: usize) {
+        self.deferred().bound_heaps.insert(heap);
+    }
+
     /// Brings a texture's staging buffer and host texture `copy` up to date
     /// when the list is submitted (`crate::bindless::uploads`), keeping
     /// both alive until the list is reset.
@@ -3369,7 +3376,12 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    if batch
+                        .swept_heaps
+                        .insert(std::sync::Arc::as_ptr(viewed) as usize)
+                    {
+                        crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 &Step::Memory(heap) => {
@@ -3417,6 +3429,8 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
+    /// `Viewed` heaps already swept into `batch` since the last title write.
+    swept_heaps: std::collections::HashSet<usize>,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -3456,6 +3470,7 @@ impl Batch {
         self.flush();
         self.current.clear();
         self.extents.clear();
+        self.swept_heaps.clear();
     }
 
     /// As [`Batch::title_written`], before a copy into the title memory
@@ -3472,6 +3487,7 @@ impl Batch {
             return self.title_written();
         }
         self.flush();
+        self.swept_heaps.clear();
         let (from, to) = touched(at, at.saturating_add(len));
         // Only the copies whose memory the bytes can be in: the rest
         // hold nothing of the window, and what a no-op remove would

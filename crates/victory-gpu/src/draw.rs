@@ -897,16 +897,17 @@ impl State {
                 }
             }
             if let Some(param) = stage.view_addresses {
-                let gpu = (self.heaps[0] != 0)
+                let addresses = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
-                    .and_then(|h| h.view_addresses());
-                let Some(gpu) = gpu else {
+                    .and_then(|h| h.view_addresses_resource());
+                let Some((buffer, gpu)) = addresses else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                // SAFETY: an open list; the heap's buffer lives with the heap.
+                list.keep(buffer);
+                // SAFETY: an open list; `list.keep(buffer)` retains the buffer until reset.
                 unsafe {
                     if compute {
                         l.SetComputeRootShaderResourceView(param, gpu);
@@ -1070,6 +1071,11 @@ impl State {
     /// Gives the host list the title's heaps if it has others.
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
         let want = Self::wanted(self.heaps, memory_heap);
+        for &h in &self.heaps {
+            if h != 0 && h != SAMPLERS_OURS {
+                list.note_bound_heap(h);
+            }
+        }
         if self.host_heaps != want {
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps

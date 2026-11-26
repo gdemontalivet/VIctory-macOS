@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -17,6 +17,14 @@ use super::{VIEW_TAG, View, ViewPin, view_at, views_current_into, views_forgot};
 use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
+
+/// Power-of-two stripes for slow-path descriptor slot locks and `kept` storage.
+const SLOT_LOCK_STRIPES: usize = 256;
+const SLOT_LOCK_SHIFT: usize = 8;
+const _: () = assert!(SLOT_LOCK_STRIPES == 1 << SLOT_LOCK_SHIFT);
+
+#[repr(align(64))]
+struct StripeLock<T>(Mutex<T>);
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -28,27 +36,30 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// The record (view index and generation) each title slot was last made from.
+    made: Box<[AtomicU64]>,
+    /// Cache-aligned striped locks guarding slow-path descriptor updates for title slots.
+    slot_locks: Box<[StripeLock<()>]>,
     /// One bit per slot: whether `made[index] != 0`, so empty slots skip
-    /// `made` and `VIEWS` locks during `sync_slots`.
+    /// `VIEWS` locks during `sync_slots`.
     made_nonzero: Box<[AtomicU64]>,
     /// Per `SYNC_BLOCK_SLOTS` block, the `views_forgot()` epoch last verified.
     block_forgot: Box<[AtomicU64]>,
     /// Per title slot, its record once the slot is made from it and holds
     /// what a draw reads (a texture's view not left null), else 0: what
-    /// [`HostHeap::mirror`] finds without the `made` lock, which every
-    /// title thread binding or writing views would otherwise wait on. Set
-    /// last, under that lock, once the slot is made; cleared first.
+    /// [`HostHeap::mirror`] finds without any lock. Set last with `Release`
+    /// once the slot is made and kept; cleared first.
     ready: Box<[AtomicU64]>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    /// With it the view's own copy of title memory, if it has one. Paged:
-    /// the title views through a fraction of the slots, and a dense table
-    /// of them all was 37.7 MB, written when the heap was made.
-    kept: Mutex<Paged<Held>>,
+    /// Striped across [`SLOT_LOCK_STRIPES`] sparse [`Paged`] tables.
+    kept: Box<[StripeLock<Paged<Held>>]>,
+    /// Raw `ID3D12Resource` pointer (`0` if none) held by each title slot,
+    /// allowing [`HostHeap::needs_remake`] and [`HostHeap::unmade_placed`]
+    /// to run completely lock-free on the `mirror` fast path.
+    kept_raw: Box<[AtomicUsize]>,
     /// Unordered views of textures left null by [`HostHeap::evict`]
     /// (`VICTORY_EVICT_HEAP_UAV`), made again by
     /// [`HostHeap::remake_unordered`] once shaders write through heaps.
@@ -225,6 +236,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let kept_total = (count + extra) as usize;
         let mut h = HostHeap {
             heap,
             cpu,
@@ -232,7 +244,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            slot_locks: (0..SLOT_LOCK_STRIPES)
+                .map(|_| StripeLock(Mutex::new(())))
+                .collect(),
             made_nonzero: (0..(count as usize).div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -240,7 +255,15 @@ impl HostHeap {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
-            kept: Mutex::new(Paged::new((count + extra) as usize)),
+            kept: (0..SLOT_LOCK_STRIPES)
+                .map(|stripe| {
+                    let len = kept_total
+                        .saturating_sub(stripe)
+                        .div_ceil(SLOT_LOCK_STRIPES);
+                    StripeLock(Mutex::new(Paged::new(len)))
+                })
+                .collect(),
+            kept_raw: (0..count).map(|_| AtomicUsize::new(0)).collect(),
             nulled_unordered: Mutex::new(Vec::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -543,18 +566,25 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        if let Some(old) = self.make_null_keeping(index) {
+            crate::host::retire(old);
+        }
+    }
+
+    fn make_null_keeping(&self, index: u32) -> Option<ID3D12Resource> {
         if self.sampler {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, None);
+        let old = self.replace_kept(index, None);
         self.set_stride(index, None);
         self.set_mark(index, None);
         self.note_address(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
+        old
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
@@ -602,11 +632,47 @@ impl HostHeap {
         self.marks.as_ref().map(|(buffer, _)| buffer)
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Kept) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        // A slot that held nothing and gets nothing is left alone (no page).
-        if let Some(slot) = kept.slot(index as usize, resource.is_some()) {
+    fn stripe(index: u32) -> usize {
+        (index as usize) & (SLOT_LOCK_STRIPES - 1)
+    }
+
+    fn slot_lock(&self, index: u32) -> std::sync::MutexGuard<'_, ()> {
+        self.slot_locks[Self::stripe(index)]
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn kept_slot(&self, index: u32) -> Option<(usize, usize)> {
+        let total = self.count.checked_add(self.dynamic)?;
+        if index >= total {
+            return None;
+        }
+        Some((Self::stripe(index), (index as usize) >> SLOT_LOCK_SHIFT))
+    }
+
+    fn retire_all(resources: Vec<ID3D12Resource>) {
+        for old in resources {
+            crate::host::retire(old);
+        }
+    }
+
+    /// Replaces slot `index`'s held resource under its stripe lock, returning
+    /// any displaced resource so callers can retire it outside heap locks.
+    fn replace_kept(&self, index: u32, resource: Kept) -> Option<ID3D12Resource> {
+        let raw_ptr = resource
+            .as_ref()
+            .map_or(0, |(res, _)| windows::core::Interface::as_raw(res) as usize);
+        if let Some(atom) = self.kept_raw.get(index as usize) {
+            atom.store(raw_ptr, Ordering::Release);
+        }
+        let (stripe, local) = self.kept_slot(index)?;
+        let (old, old_widened, new_widened) = {
+            let mut kept = self.kept[stripe]
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let slot = kept.slot(local, resource.is_some())?;
             let old_widened = slot.as_ref().and_then(|(_, source)| match source {
                 Some(HeldSource::Widened(view, _)) => Some(view.clone()),
                 _ => None,
@@ -616,26 +682,34 @@ impl HostHeap {
                 _ => None,
             });
             let old = std::mem::replace(slot, resource);
-            self.note_widened(old_widened.as_ref(), false);
-            self.note_widened(new_widened.as_ref(), true);
             #[cfg(feature = "diagnostics")]
-            if let Some((old, _)) = &old
+            if let Some((old_res, _)) = &old
                 && !self.sampler
-                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
+                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0))
+                    != Some(windows::core::Interface::as_raw(old_res))
                 // SAFETY: a live resource.
-                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                && unsafe { old_res.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
             {
                 use windows::core::Interface;
-                let left = crate::resource::life::holders(old);
-                crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+                let left = crate::resource::life::holders(old_res);
+                crate::resource::life::note(
+                    old_res.as_raw() as usize,
+                    crate::resource::life::SLOT,
+                    u64::from(index),
+                    left,
+                );
             }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
-            }
+            (old, old_widened, new_widened)
+        };
+        self.note_widened(old_widened.as_ref(), false);
+        self.note_widened(new_widened.as_ref(), true);
+        old.map(|(res, _)| res)
+    }
+
+    /// Slot `index` now views `resource` (or nothing of the host's).
+    fn keep(&self, index: u32, resource: Kept) {
+        if let Some(old) = self.replace_kept(index, resource) {
+            crate::host::retire(old);
         }
     }
 
@@ -664,25 +738,23 @@ impl HostHeap {
             .collect()
     }
 
-    /// The host address of the slots' view addresses (see the field), made
-    /// on first use from the slots made so far.
-    pub(crate) fn view_addresses(&self) -> Option<u64> {
+    /// The buffer and host GPU address of the slots' view addresses, made on
+    /// first use under ascending stripe locks.
+    pub(crate) fn view_addresses_resource(&self) -> Option<(&ID3D12Resource, u64)> {
         let made = self.addresses.get_or_init(|| {
-            // The view is a root view, which has no bounds: an entry for
-            // every slot a table can lie in, the dynamic ones too (a table
-            // made afresh on a host whose heap is smaller than the title's
-            // read past the title slots' entries: whatever followed the
-            // buffer, or a GPU fault).
             let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
+            let _stripes: Vec<_> = self
+                .slot_locks
+                .iter()
+                .map(|l| l.0.lock().unwrap_or_else(|e| e.into_inner()))
+                .collect();
+            for (i, slot) in self.made.iter().enumerate() {
+                let key = slot.load(Ordering::Acquire);
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_deref());
             }
-            // Dynamic slots are entered as they are made ([`Self::make_at`],
-            // [`Self::make_null`], raw views).
             for i in self.count..self.address_slots() {
                 write_address(data, i as usize, None);
             }
@@ -690,7 +762,13 @@ impl HostHeap {
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, data, gpu))
         });
-        made.as_ref().map(|m| m.2)
+        made.as_ref().map(|(b, _, gpu)| (b, *gpu))
+    }
+
+    /// The host address of the slots' view addresses (see the field), made
+    /// on first use from the slots made so far.
+    pub(crate) fn view_addresses(&self) -> Option<u64> {
+        self.view_addresses_resource().map(|(_, gpu)| gpu)
     }
 
     /// The slots the view addresses have an entry for: the title's and the
@@ -867,11 +945,12 @@ impl HostHeap {
             let records: Vec<[u32; 3]> = candidates.iter().map(|&(_, r)| r).collect();
             let mut current = Vec::with_capacity(records.len());
             views_current_into(&records, &mut current);
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (&(i, [_, view, generation]), is_current) in candidates.iter().zip(current) {
-                let changed = match made.get(i as usize) {
-                    Some(&m) if is_current => m != (u64::from(generation) << 32 | u64::from(view)),
-                    Some(&m) => m != 0,
+                let changed = match self.made.get(i as usize) {
+                    Some(m) if is_current => {
+                        m.load(Ordering::Acquire) != (u64::from(generation) << 32 | u64::from(view))
+                    }
+                    Some(m) => m.load(Ordering::Acquire) != 0,
                     None => true,
                 };
                 if changed {
@@ -893,24 +972,19 @@ impl HostHeap {
         }
     }
 
-    /// Whether the view made in slot `index` must be made again for a draw
-    /// that reads it: a placed texture's view left null is made when a draw
-    /// reads the slot through a table (heap syncs revisit it at every
-    /// submission), a texture's unordered view left null when the texture was
-    /// given up (`VICTORY_EVICT_HEAP_UAV`) is made again like a shader view (a
-    /// table copying the null slot loses writes), and a later unordered or
-    /// renderable view that upgraded the memory's `HostTexture` leaves the
-    /// made view on the old one.
+    /// Lock-free check whether the view made in slot `index` must be made
+    /// again for a draw that reads it (placed texture left null, evicted UAV,
+    /// or upgraded `HostTexture`).
     fn needs_remake(&self, index: u32, view: &View, for_draw: bool) -> bool {
         if !for_draw || !(is_texture(view) || is_unordered_texture(view)) {
             return false;
         }
         let held = self
-            .kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .kept_raw
             .get(index as usize)
-            .map(|(res, _)| windows::core::Interface::as_raw(res));
+            .map(|a| a.load(Ordering::Acquire))
+            .filter(|&p| p != 0)
+            .map(|p| p as *mut std::ffi::c_void);
         let Some(held) = held else {
             return true;
         };
@@ -932,13 +1006,11 @@ impl HostHeap {
 
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there, pinned for
-    /// as long as the caller uses it. Buffer views are made only for draws
-    /// (`for_draw`), which also copy their data: a host copy of a buffer is
-    /// made on first use.
+    /// as long as the caller uses it. Cache hits take zero locks; slow-path
+    /// updates lock only `index`'s stripe in [`SLOT_LOCK_STRIPES`] and retire
+    /// displaced resources outside all heap locks.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<ViewPin> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
@@ -952,79 +1024,64 @@ impl HostHeap {
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        // Made from this record already and readable as it is (what the
-        // checks below find under the lock): nothing to make.
+        // Lock-free cache-hit fast path: `ready[index]` is stored with `Release`
+        // only after `make_marked`, `replace_kept`, and `made[index]` complete.
         if tag == VIEW_TAG
+            && key != 0
             && self.ready[index as usize].load(Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
             && !self.needs_remake(index, &view, for_draw)
         {
             return Some(view);
         }
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        // A second recorder may have replaced the slot while this thread waited.
+
+        let mut guard = self.slot_lock(index);
+        // Re-read the title slot under `slot_lock(index)`.
         // SAFETY: the caller holds the heap alive until the update completes.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
-            if made[index as usize] != 0 {
-                self.ready[index as usize].store(0, Ordering::Relaxed);
-                made[index as usize] = 0;
+            if self.made[index as usize].load(Ordering::Acquire) != 0 {
+                self.ready[index as usize].store(0, Ordering::Release);
+                self.made[index as usize].store(0, Ordering::Release);
                 self.set_made_nonzero(index, false);
-                self.make_null(index);
-                self.note_address(index, None);
+                let displaced = self.make_null_keeping(index);
+                drop(guard);
+                if let Some(old) = displaced {
+                    crate::host::retire(old);
+                }
             }
             return None;
         };
-        // A placed texture's view left null below is made when a draw reads
-        // the slot through a table; until then the slot is not made again
-        // (heap syncs revisit it at every submission). Also re-mirror if a
-        // later unordered or renderable view upgraded the memory's HostTexture.
         let needs_remake = || self.needs_remake(index, &view, for_draw);
-        if made[index as usize] == key && !needs_remake() {
+        if self.made[index as usize].load(Ordering::Acquire) == key && !needs_remake() {
             return Some(view);
         }
-        // Shaders index the heap itself (`crate::bindless`): buffer views
-        // are made when written.
-        // shortcut: views of textures the title placed itself are made
-        // when a draw reads them through a table: a host texture (and a
-        // staging copy) for each of the ~20,000 the title has views of
-        // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
         if !later {
-            // What the view needs (the texture it views, the copy of the
-            // memory) is made without the slot lock, which title threads
-            // binding and writing views wait on (run evict5).
-            drop(made);
+            // Prepare backing texture / shadow buffer outside the stripe lock.
+            drop(guard);
             prepare(&view);
-            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            // The title may have written another record there meanwhile (and
-            // another thread made it): that one is the slot's.
+            guard = self.slot_lock(index);
             // SAFETY: as above.
             if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
-                drop(made);
+                drop(guard);
                 drop(view);
                 return self.mirror(index, handle, for_draw);
             }
-            if made[index as usize] == key && !needs_remake() {
+            if self.made[index as usize].load(Ordering::Acquire) == key && !needs_remake() {
                 return Some(view);
             }
         }
-        {
-            self.ready[index as usize].store(0, Ordering::Relaxed);
+        let displaced = {
+            self.ready[index as usize].store(0, Ordering::Release);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
-                // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
-            made[index as usize] = key;
-            self.set_made_nonzero(index, true);
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -1038,10 +1095,16 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             let kept = kept.flatten();
-            // A texture's view left null is made again when a draw reads it.
             let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
-            self.keep(index, kept);
+            let displaced = self.replace_kept(index, kept);
+            self.made[index as usize].store(key, Ordering::Release);
+            self.set_made_nonzero(index, true);
             self.ready[index as usize].store(ready, Ordering::Release);
+            displaced
+        };
+        drop(guard);
+        if let Some(old) = displaced {
+            crate::host::retire(old);
         }
         Some(view)
     }
@@ -1051,10 +1114,11 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
-        // A view the host could not make leaves a null view, its record
-        // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
+        let key = self.made.get(index as usize)?.load(Ordering::Acquire);
+        let kept = self
+            .kept_raw
+            .get(index as usize)
+            .is_some_and(|a| a.load(Ordering::Acquire) != 0);
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -1068,52 +1132,63 @@ impl HostHeap {
     }
 
     /// Title slots viewing one of the host textures `textures` (raw pointers),
-    /// which are given up: each gets a null view of its kind and holds the
-    /// texture no more (retired until the running submission has run), its
-    /// record stays noted so heap syncs leave it, and the next draw reading
-    /// it through a table or shader reading it through the heap (its read
-    /// mark, cleared) makes it again. Slots past `count` stay made: recorded
-    /// lists and host copies already name them, and there is no title record
-    /// from which to make them again.
-    /// The slots are found by a walk of the heap, once per pass that gives
-    /// textures up: a map of each texture's slots, kept at every slot the
-    /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
-    /// slots had its list searched each time; 62,000 slots a frame, run
-    /// evict3).
+    /// which are given up: walked stripe by stripe, retiring displaced
+    /// textures outside all stripe locks.
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
-        // Keep a title slot from being rebound between testing its held texture
-        // and clearing the descriptor. Mirroring takes made before kept as well.
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let slots: Vec<u32> = {
-            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.iter()
-                .filter(|&(i, k)| {
-                    i < self.count as usize
-                        && k.1.is_none()
-                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
-                })
-                .map(|(i, _)| i as u32)
-                .collect()
-        };
-        for index in slots {
-            if let Some(ready) = self.ready.get(index as usize) {
-                ready.store(0, Ordering::Relaxed);
-            }
-            let key = made.get(index as usize).copied().unwrap_or(0);
-            let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-            match &view {
-                Some(v) => null_for(v, self.cpu(index)),
-                None => null_view(self.cpu(index)),
-            }
-            self.keep(index, None);
-            if index < self.count {
-                self.viewed.set(index, view.as_deref(), false);
-                crate::shadow::forget_read(index);
-                if view.as_deref().is_some_and(is_unordered_texture) {
-                    self.nulled_unordered.lock().unwrap_or_else(|e| e.into_inner()).push(index);
+        let mut displaced = Vec::new();
+        let mut unordered = Vec::new();
+        for stripe in 0..SLOT_LOCK_STRIPES {
+            let _slot_guard = self.slot_locks[stripe]
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let slots: Vec<u32> = {
+                let kept = self.kept[stripe]
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                kept.iter()
+                    .filter_map(|(local, k)| {
+                        let index = (local << SLOT_LOCK_SHIFT) | stripe;
+                        (index < self.count as usize
+                            && k.1.is_none()
+                            && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                        .then_some(index as u32)
+                    })
+                    .collect()
+            };
+            for index in slots {
+                if let Some(ready) = self.ready.get(index as usize) {
+                    ready.store(0, Ordering::Release);
+                }
+                let key = self
+                    .made
+                    .get(index as usize)
+                    .map_or(0, |m| m.load(Ordering::Acquire));
+                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+                match &view {
+                    Some(v) => null_for(v, self.cpu(index)),
+                    None => null_view(self.cpu(index)),
+                }
+                if let Some(old) = self.replace_kept(index, None) {
+                    displaced.push(old);
+                }
+                if index < self.count {
+                    self.viewed.set(index, view.as_deref(), false);
+                    crate::shadow::forget_read(index);
+                    if view.as_deref().is_some_and(is_unordered_texture) {
+                        unordered.push(index);
+                    }
                 }
             }
         }
+        if !unordered.is_empty() {
+            self.nulled_unordered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(unordered);
+        }
+        Self::retire_all(displaced);
     }
 
     /// Makes again the unordered texture views [`HostHeap::evict`] left
@@ -1122,9 +1197,10 @@ impl HostHeap {
     pub(crate) fn remake_unordered(&self, start: u64, step: u64) -> usize {
         let slots = std::mem::take(&mut *self.nulled_unordered.lock().unwrap_or_else(|e| e.into_inner()));
         for &index in &slots {
-            {
-                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                made[index as usize] = 0;
+            if let Some(m) = self.made.get(index as usize) {
+                let _guard = self.slot_lock(index);
+                self.ready[index as usize].store(0, Ordering::Release);
+                m.store(0, Ordering::Release);
                 self.set_made_nonzero(index, false);
             }
             self.mirror(index, start + u64::from(index) * step, true);
@@ -1134,27 +1210,40 @@ impl HostHeap {
 
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
-            .filter_map(|&i| kept.get(i as usize).filter(|k| k.1.is_none()))
-            .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+            .filter_map(|&i| {
+                let (stripe, local) = self.kept_slot(i)?;
+                let kept = self.kept[stripe]
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                kept.get(local)
+                    .filter(|k| k.1.is_none())
+                    .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+            })
             .collect()
     }
 
     /// The view of slot `index` if it is a placed texture's left without a
     /// host view (made when read).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = self.made.get(index as usize)?.load(Ordering::Acquire);
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
+        let kept = self
+            .kept_raw
+            .get(index as usize)
+            .is_some_and(|a| a.load(Ordering::Acquire) != 0);
         (is_placed_texture(&view) && !kept).then(|| (*view).clone())
     }
 
     /// A shader read slot `index` through the heap: the texture it views
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
-        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        let key = self
+            .made
+            .get(index as usize)
+            .map_or(0, |m| m.load(Ordering::Acquire));
         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
@@ -1170,13 +1259,23 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        self.made
+            .get(index as usize)
+            .is_some_and(|m| m.load(Ordering::Acquire) != 0)
     }
 
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
-        self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some()
+        let Some((stripe, local)) = self.kept_slot(index) else {
+            return false;
+        };
+        self.kept[stripe]
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(local)
+            .is_some()
     }
 }
 
@@ -2991,19 +3090,14 @@ mod tests {
             ));
             assert!(heap.mirror(idx as u32, slot_addr, false).is_some());
             assert!(
-                heap.kept.lock().unwrap().get(idx).is_none(),
+                !heap.kept(idx as u32),
                 "case {idx} mirror(false) should defer host creation"
             );
             let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
             let dyn_slot = heap.count + idx as u32;
             heap.make_at(dyn_slot, &mirrored);
-            let kept = heap.kept.lock().unwrap();
-            assert_eq!(kept.get(idx).is_some(), expect_real, "case {idx} mirror");
-            assert_eq!(
-                kept.get(dyn_slot as usize).is_some(),
-                expect_real,
-                "case {idx} make_at"
-            );
+            assert_eq!(heap.kept(idx as u32), expect_real, "case {idx} mirror");
+            assert_eq!(heap.kept(dyn_slot), expect_real, "case {idx} make_at");
         }
         for (offset, (res_fmt, view_fmt, expect_real)) in [
             (39u32, 40u32, false), // R32_TYPELESS + D32_FLOAT SRV -> null fallback
@@ -3021,11 +3115,7 @@ mod tests {
             let slot_addr = slots[idx].as_mut_ptr() as u64;
             crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot_addr);
             heap.mirror(idx as u32, slot_addr, true).unwrap();
-            assert_eq!(
-                heap.kept.lock().unwrap().get(idx).is_some(),
-                expect_real,
-                "srv case {offset}"
-            );
+            assert_eq!(heap.kept(idx as u32), expect_real, "srv case {offset}");
         }
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
@@ -3263,5 +3353,105 @@ mod tests {
 
         crate::object::release(resource);
         let _ = title_heap.as_mut_ptr();
+    }
+
+    #[test]
+    fn concurrent_striped_mirror_and_fast_path_benchmark() {
+        let Some(host_gpu) = host() else {
+            return;
+        };
+        const SLOTS: usize = 4_096;
+        const THREADS: usize = 8;
+        const HITS_PER_THREAD: usize = 25_000;
+
+        let Some(heap) = HostHeap::new(false, SLOTS as u32) else {
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        let _ = host_gpu.log_messages();
+
+        let buffer_res = crate::resource::test_buffer(64 * 1024);
+        let (buf_ptr, _) = crate::resource::buffer_bytes(buffer_res).unwrap();
+        let base_addr = buf_ptr as u64;
+        let mut records = vec![[0u32; 8]; SLOTS];
+        for (i, rec) in records.iter_mut().enumerate() {
+            let offset_elems = ((i % 128) * 64) as u32;
+            let addr = base_addr + u64::from(offset_elems) * 4;
+            let handle = rec.as_mut_ptr() as u64;
+            if i.is_multiple_of(2) {
+                crate::descriptor::create_cbv(
+                    std::ptr::null(),
+                    &[addr as u32, (addr >> 32) as u32, 256, 0],
+                    handle,
+                );
+            } else {
+                let srv_desc = [
+                    39u32, // DXGI_FORMAT_R32_TYPELESS
+                    1,     // D3D12_SRV_DIMENSION_BUFFER
+                    5768,  // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                    0,     // 64-bit alignment padding before FirstElement
+                    offset_elems,
+                    0,
+                    64, // NumElements
+                    0,  // StructureByteStride
+                    1,  // D3D12_BUFFER_SRV_FLAG_RAW
+                    0,
+                ];
+                crate::descriptor::create_srv(std::ptr::null(), buffer_res, &srv_desc, handle);
+            }
+        }
+
+        // Phase 1: 8-thread 256-striped distinct-slot Create*View storm.
+        let barrier = std::sync::Barrier::new(THREADS);
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for tid in 0..THREADS {
+                let (heap, records, barrier) = (&heap, &records, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    for idx in (tid..SLOTS).step_by(THREADS) {
+                        let handle = records[idx].as_ptr() as u64;
+                        assert!(heap.mirror(idx as u32, handle, true).is_some());
+                    }
+                });
+            }
+        });
+        let create_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let create_kops = SLOTS as f64 / (create_ms / 1e3).max(1e-6) / 1e3;
+        for idx in 0..SLOTS as u32 {
+            assert!(heap.made(idx) && heap.kept(idx));
+        }
+
+        // Phase 2: 8-thread lock-free cache-hit storm across all 4,096 slots.
+        let barrier = std::sync::Barrier::new(THREADS);
+        let t1 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for tid in 0..THREADS {
+                let (heap, records, barrier) = (&heap, &records, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    for iter in 0..HITS_PER_THREAD {
+                        let idx = (iter * 131 + tid * 97) % SLOTS;
+                        let handle = records[idx].as_ptr() as u64;
+                        std::hint::black_box(heap.mirror(idx as u32, handle, true).unwrap());
+                    }
+                });
+            }
+        });
+        let hit_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let hit_mops = (THREADS * HITS_PER_THREAD) as f64 / (hit_ms / 1e3).max(1e-6) / 1e6;
+        println!(
+            "[HostHeap::mirror bench] 8t striped create: {SLOTS} views in {create_ms:.2} ms ({create_kops:.1} Kviews/s); 8t lock-free hits: {} ops in {hit_ms:.2} ms ({hit_mops:.1} Mops/s)",
+            THREADS * HITS_PER_THREAD
+        );
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(host_gpu.log_messages(), None);
+        drop(heap);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(buffer_res, 0x10)(
+            buffer_res,
+        );
     }
 }

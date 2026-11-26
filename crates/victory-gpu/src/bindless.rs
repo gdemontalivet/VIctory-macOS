@@ -710,4 +710,97 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
+
+    /// Submissions only sync shader-visible heaps that are actually bound on
+    /// one of the submitted command lists: an unbound placed heap touched by
+    /// raw byte copies stays unsynced (retaining its dirty page marks) until a
+    /// submission binds it.
+    #[test]
+    fn submissions_only_sync_bound_heaps() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let pool_bound = crate::watch::tests::pool(1);
+        let pool_unbound = crate::watch::tests::pool(1);
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let make_placed_heap = |addr: usize| {
+            let ext: [u64; 4] = [
+                (64u64 << 32), // VIEWS_KIND=0, count=64
+                1,             // SHADER_VISIBLE=1
+                addr as u64,
+                64 * 32,
+            ];
+            let mut h = std::ptr::null();
+            assert_eq!(
+                crate::descriptor::create_heap(std::ptr::null(), ext.as_ptr().cast(), &iid, &mut h),
+                S_OK
+            );
+            h
+        };
+        let bound_h = make_placed_heap(pool_bound);
+        let unbound_h = make_placed_heap(pool_unbound);
+        let bound_host = crate::descriptor::heap(bound_h).host().unwrap();
+        let unbound_host = crate::descriptor::heap(unbound_h).host().unwrap();
+
+        // Copy a valid CBV record as raw bytes into slot 3 of BOTH heaps.
+        let mut raw_rec = [0u32; 8];
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[0, 0, 256, 0],
+            raw_rec.as_mut_ptr() as u64,
+        );
+        // SAFETY: both placed heaps have 64 * 32 bytes in tracked pool pages.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw_rec.as_ptr().cast::<u8>(),
+                (pool_bound + 3 * 32) as *mut u8,
+                32,
+            );
+            std::ptr::copy_nonoverlapping(
+                raw_rec.as_ptr().cast::<u8>(),
+                (pool_unbound + 3 * 32) as *mut u8,
+                32,
+            );
+        }
+        assert!(!bound_host.made(3) && !unbound_host.made(3));
+
+        // Submit two lists binding ONLY `bound_h`: `bound_host` slot 3 is
+        // synced, while `unbound_host` slot 3 is untouched!
+        let list_a = host.new_list().unwrap();
+        let list_b = host.new_list().unwrap();
+        list_a.note_bound_heap(bound_h as usize);
+        list_a.defer_heap(&bound_host.viewed);
+        list_b.defer_heap(&bound_host.viewed);
+        list_a.close();
+        list_b.close();
+        host.execute(&[&list_a, &list_b]);
+
+        assert!(bound_host.made(3), "bound heap synced at submission");
+        assert!(
+            !unbound_host.made(3),
+            "unbound heap was not swept while another heap submitted"
+        );
+
+        // Now submit a list binding `unbound_h`: its preserved dirty range syncs!
+        list_a.reset();
+        list_a.note_bound_heap(unbound_h as usize);
+        list_a.close();
+        host.execute(&[&list_a]);
+        assert!(
+            unbound_host.made(3),
+            "unbound heap retained its dirty range until bound"
+        );
+
+        crate::object::slot::<extern "system" fn(This) -> u32>(bound_h, 0x10)(bound_h);
+        crate::object::slot::<extern "system" fn(This) -> u32>(unbound_h, 0x10)(unbound_h);
+        crate::watch::title_memory_remapped(pool_bound, PAGE_BYTES);
+        crate::watch::title_memory_remapped(pool_unbound, PAGE_BYTES);
+        crate::watch::tests::free(pool_bound);
+        crate::watch::tests::free(pool_unbound);
+    }
 }
