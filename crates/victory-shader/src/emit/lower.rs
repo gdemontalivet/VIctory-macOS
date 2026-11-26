@@ -792,6 +792,9 @@ impl<'a> Lower<'a> {
             }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });
+            } else if synced && !step_plan.lockstep_headers.is_empty() {
+                // Lockstep loops exchange wave ballots via 32-lane `half_words`.
+                s.wave_size = Some(32);
             }
             if halves || synced {
                 pred = step_plan;
