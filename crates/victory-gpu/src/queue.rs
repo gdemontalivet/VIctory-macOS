@@ -666,6 +666,10 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
+    let mut black_frame = false;
+    #[cfg(not(windows))]
+    let black_frame = false;
+    #[cfg(windows)]
     let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
     let shown = shown_plane(&found);
@@ -692,6 +696,7 @@ extern "system" fn present(
         });
         let overlay = other.as_ref().zip(overlay_state).map(|((_, t), s)| (t, s));
         let shown = host.present(&texture, state, overlay, frame);
+        black_frame = shown.unwrap_or(false);
         if let Some(((o, _), s)) = other.as_ref().zip(overlay_state) {
             crate::resource::host_transition(*o, s);
         }
@@ -703,6 +708,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
+    crate::bench::on_present(drawn, black_frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

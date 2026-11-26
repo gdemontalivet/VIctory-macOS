@@ -18,6 +18,7 @@
 
 #[cfg(windows)]
 mod alias;
+pub mod bench;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
