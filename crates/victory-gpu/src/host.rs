@@ -1141,6 +1141,64 @@ pub(crate) mod tests {
         assert_eq!(d, a, "scratch restarts from chunk 0 after reset");
         list.close();
     }
+
+    #[test]
+    fn host_list_epoch_and_deferred_steps_track_mutations() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let start_epoch = list.epoch();
+        assert_ne!(start_epoch, 0);
+        assert_eq!(list.deferred_steps(), 0);
+
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, crate::watch::PAGE as u64);
+        let shadow = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("shadow");
+
+        // First refresh bumps epoch and queues 1 deferred step; identical repeat does neither.
+        list.defer_refresh(&shadow, p, 256);
+        let after_first = list.epoch();
+        assert_ne!(after_first, start_epoch);
+        assert_eq!(list.deferred_steps(), 1);
+
+        list.defer_refresh(&shadow, p, 256);
+        assert_eq!(list.epoch(), after_first, "deduplicated refresh keeps epoch");
+        assert_eq!(list.deferred_steps(), 1, "deduplicated refresh adds no step");
+
+        // Deferred copy bumps epoch, adds a step, and clears refresh dedup.
+        let src = [0x22u8; 16];
+        list.defer_copy(p as *mut u8, src.as_ptr(), src.len());
+        let after_copy = list.epoch();
+        assert_ne!(after_copy, after_first);
+        assert_eq!(list.deferred_steps(), 2);
+
+        // need_rebind and defer_gpu_write each bump epoch.
+        list.need_rebind();
+        let after_rebind = list.epoch();
+        assert_ne!(after_rebind, after_copy);
+        assert!(list.take_rebind());
+
+        list.defer_gpu_write(&shadow, p, 256, false);
+        let after_uav = list.epoch();
+        assert_ne!(after_uav, after_rebind);
+        assert_eq!(list.deferred_steps(), 3);
+
+        // Reset advances epoch and clears queued deferred steps.
+        list.close();
+        list.reset();
+        assert_ne!(list.epoch(), after_uav);
+        assert_eq!(list.deferred_steps(), 0);
+        list.close();
+
+        crate::shadow::unregister(p, p as u64);
+    }
+}
+
+/// Monotonic command-list mutation epoch shared across all [`HostList`]s so
+/// resets and newly created lists never reuse an earlier epoch.
+static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
@@ -1156,6 +1214,9 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
+    /// Monotonic epoch bumped on every mutation that changes what subsequent
+    /// descriptor preparation must record ([`HostList::changed_something`]).
+    epoch: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1566,6 +1627,7 @@ impl Host {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
+                epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -2620,6 +2682,24 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.changed_something();
+    }
+
+    /// Bumps the list's mutation epoch whenever a recorded transition, twin
+    /// copy, deferred step, widened-buffer event, rebind, or reset changes
+    /// what subsequent descriptor preparation would need to do.
+    pub(crate) fn changed_something(&self) {
+        self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// Monotonic epoch of the last mutation recorded on this list.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Number of deferred submission-time steps currently queued on this list.
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -2663,11 +2743,17 @@ impl HostList {
                     copy.stamp();
                 }
                 v.insert((wanted, wanted, copy.clone()));
+                self.changed_something();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                if before != wanted {
+                    self.changed_something();
+                    Some(before)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -2702,9 +2788,16 @@ impl HostList {
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(crate::twin::Use::new(depth, side, writes));
+                self.changed_something();
                 None
             }
-            std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let copy = o.get_mut().again(side, writes);
+                if copy.is_some() || writes {
+                    self.changed_something();
+                }
+                copy
+            }
         }
     }
 
@@ -2730,6 +2823,7 @@ impl HostList {
     /// A copy of ours replaced the compute root signature and pipeline.
     pub(crate) fn need_rebind(&self) {
         self.rebind.store(true, Ordering::Relaxed);
+        self.changed_something();
     }
 
     /// Whether the list's compute root signature and pipeline must be set
@@ -2769,6 +2863,7 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(WidenedEvent::Write((shadow.clone(), address, len)));
+        self.changed_something();
     }
 
     /// A heap-indexing shader may write through any of this heap's current
@@ -2781,6 +2876,7 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(WidenedEvent::Heap(heap.clone()));
+        self.changed_something();
     }
 
     /// Keeps an exact source shadow's arena slice alive until the list resets.
@@ -2844,6 +2940,7 @@ impl HostList {
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
         pending.clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).extend(views);
+        self.changed_something();
     }
 
     /// Moves widened buffers into the unordered state for widening copies.
@@ -3063,6 +3160,7 @@ impl HostList {
         deferred.refreshed.clear();
         deferred.slots.clear();
         deferred.filled_scratch.clear();
+        self.changed_something();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3071,6 +3169,7 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+        self.changed_something();
     }
 
     /// Host GPU address of scratch memory holding `len` bytes from `src` as of
@@ -3086,6 +3185,7 @@ impl HostList {
             .copies
             .push(Step::Fill(to as usize, src as usize, len as usize));
         deferred.filled_scratch.insert(key, gpu);
+        self.changed_something();
         Some(gpu)
     }
 
@@ -3104,6 +3204,7 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+            self.changed_something();
         }
     }
 
@@ -3118,6 +3219,7 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
         if deferred.slots.insert(key) {
             deferred.copies.push(Step::Slot(viewed.clone(), index));
+            self.changed_something();
         }
     }
 
@@ -3135,6 +3237,7 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        self.changed_something();
     }
 
     /// Shaders of the list take views from the heap itself
@@ -3145,6 +3248,7 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
+            self.changed_something();
         }
     }
 
@@ -3152,6 +3256,7 @@ impl HostList {
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
         self.deferred().copies.push(Step::Memory(heap));
+        self.changed_something();
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -3164,11 +3269,13 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+        self.changed_something();
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+        self.changed_something();
     }
 
     /// A memory value the list waits for before it starts.
@@ -3348,6 +3455,7 @@ impl HostList {
     /// Runs `work` on host memory at submission, in order with the copies.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+        self.changed_something();
     }
 
     /// Brings a texture's staging buffer and host texture `copy` up to date
@@ -3359,6 +3467,7 @@ impl HostList {
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
         self.deferred().copies.push(Step::Texture(staging, copy));
+        self.changed_something();
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -4301,6 +4410,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            crate::draw::table_memo_line(report_frames);
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
