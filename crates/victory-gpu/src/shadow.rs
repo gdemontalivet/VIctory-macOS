@@ -440,17 +440,18 @@ impl Shadow {
         if self.has_widened.load(Ordering::Acquire) {
             self.refresh_widened(from, to);
         }
-        if let Some(t) = &self.tracked
-            && t.changed(page / PAGE)
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    page = format_args!("{page:#x}"),
-                    "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
-                )
-            });
-            return 0;
+        if let Some(t) = &self.tracked {
+            t.unarm(page / PAGE);
+            if t.changed(page / PAGE) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        page = format_args!("{page:#x}"),
+                        "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
+                    )
+                });
+                return 0;
+            }
         }
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
@@ -616,7 +617,15 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .insert((address, address + len));
         if marked && let Some(t) = &self.tracked {
-            t.arm(address, address + len);
+            if t.arm(address, address + len) {
+                // Cooling hot/resting pages guarded them after any silent CPU
+                // writes; pull those whole pages into the shadow now (zero
+                // extra `VirtualProtect` calls via `rearmed`) so copy-back
+                // merges against the guarded baseline rather than stale bytes.
+                let (from, page_len) = self.page_range(address as u64, len as u64);
+                let busy = !self.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty();
+                self.update_tracked(from as usize, (from + page_len) as usize, busy);
+            }
             return;
         }
         let (from, to) = self.inside(address, len);
@@ -3776,6 +3785,143 @@ pub(crate) mod tests {
                 );
             });
         });
+        drop(copy);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A hot or resting (`PAGE_READWRITE`) page must never let `copy_back_marked`
+    /// or `copy_back_page` clobber a silent CPU write made while the page stayed
+    /// open; and an armed hot page must pull pre-arm silent writes into the
+    /// shadow so 3-way merge preserves GPU + pre-arm CPU + post-arm CPU bytes.
+    #[test]
+    fn hot_and_resting_shadow_copy_back_preserves_cpu_writes() {
+        use std::time::Duration;
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        let gpu_word = p as *mut u32;
+        let cpu_word = (p + 16) as *mut u32;
+
+        // 1) Hot page + unarmed `copy_back_marked`.
+        crate::watch::tests::with_hot_pages(true, || {
+            crate::watch::tests::with_guard_rest(Duration::ZERO, || {
+                // SAFETY: committed pool page of ours.
+                unsafe {
+                    gpu_word.write_volatile(0x1111_1111);
+                    cpu_word.write_volatile(0x2222_2222);
+                }
+                copy.update(p, PAGE);
+                for v in [1u32, 2] {
+                    // SAFETY: committed pool page of ours.
+                    unsafe { ((p + 64) as *mut u32).write_volatile(v) };
+                    copy.update(p, PAGE);
+                }
+                assert!(crate::watch::writable(p), "page promoted to hot");
+                // Simulate GPU write `[0..4)` in shadow and silent CPU write `[16..20)`.
+                // SAFETY: inside shadow mapping.
+                unsafe { (copy.data as *mut u32).write(0xDEAD_BEEF) };
+                // SAFETY: silent write to hot `PAGE_READWRITE` page.
+                unsafe { cpu_word.write_volatile(0xCAFE_BABE) };
+                copy.copy_back_marked(&[p]);
+                // SAFETY: reading back our pool page.
+                let cpu_after = unsafe { cpu_word.read_volatile() };
+                assert_eq!(
+                    cpu_after, 0xCAFE_BABE,
+                    "unarmed copy_back_marked must not clobber silent CPU write on hot page"
+                );
+            });
+        });
+
+        // 2) Resting page (`guard_rest`) + `copy_back_page`.
+        let p2 = crate::watch::tests::pool(1);
+        register(p2, p2 as u64, PAGE as u64);
+        let copy2 = find(p2 as u64, PAGE as u64).expect("second shadow");
+        crate::watch::tests::with_hot_pages(false, || {
+            crate::watch::tests::with_guard_rest(Duration::from_millis(500), || {
+                // SAFETY: committed pool page of ours.
+                unsafe {
+                    (p2 as *mut u32).write_volatile(0x1111_1111);
+                    ((p2 + 16) as *mut u32).write_volatile(0x2222_2222);
+                }
+                copy2.update(p2, PAGE);
+                // First fault opens `p2` and starts rest cooldown.
+                // SAFETY: committed pool page of ours.
+                unsafe { ((p2 + 64) as *mut u32).write_volatile(1) };
+                copy2.update(p2, PAGE);
+                assert!(crate::watch::writable(p2), "page resting open");
+                // SAFETY: inside shadow mapping.
+                unsafe { (copy2.data as *mut u32).write(0xDEAD_BEEF) };
+                // SAFETY: silent write to resting `PAGE_READWRITE` page.
+                unsafe { ((p2 + 16) as *mut u32).write_volatile(0xCAFE_BABE) };
+                copy2.copy_back_page(p2);
+                // SAFETY: reading back our pool page.
+                let cpu_after = unsafe { ((p2 + 16) as *const u32).read_volatile() };
+                assert_eq!(
+                    cpu_after, 0xCAFE_BABE,
+                    "copy_back_page must not clobber silent CPU write on resting page"
+                );
+            });
+        });
+        drop(copy2);
+        unregister(p2, p2 as u64);
+        crate::watch::tests::free(p2);
+
+        // 3) Hot page + armed `writing(..., true)` with BOTH pre-arm and post-arm CPU writes.
+        let p3 = crate::watch::tests::pool(1);
+        register(p3, p3 as u64, PAGE as u64);
+        let copy3 = find(p3 as u64, PAGE as u64).expect("third shadow");
+        crate::watch::tests::with_hot_pages(true, || {
+            crate::watch::tests::with_guard_rest(Duration::ZERO, || {
+                // SAFETY: committed pool page of ours.
+                unsafe {
+                    (p3 as *mut u32).write_volatile(0x1111_1111);
+                    ((p3 + 16) as *mut u32).write_volatile(0x2222_2222);
+                    ((p3 + 24) as *mut u32).write_volatile(0x3333_3333);
+                }
+                copy3.update(p3, PAGE);
+                for v in [1u32, 2] {
+                    // SAFETY: committed pool page of ours.
+                    unsafe { ((p3 + 64) as *mut u32).write_volatile(v) };
+                    copy3.update(p3, PAGE);
+                }
+                assert!(crate::watch::writable(p3), "page promoted to hot");
+                // Pre-arm silent CPU write while hot.
+                // SAFETY: silent write to hot page.
+                unsafe { ((p3 + 16) as *mut u32).write_volatile(0xCAFE_BABE) };
+                // Arming cools, guards, and refreshes the shadow baseline.
+                copy3.writing(p3, PAGE, true);
+                // Post-arm guarded CPU write faults and saves the refreshed baseline.
+                // SAFETY: guarded pool page.
+                unsafe { ((p3 + 24) as *mut u32).write_volatile(0xFACE_FEED) };
+                // Simulate GPU write to `[0..4)`.
+                // SAFETY: inside shadow mapping.
+                unsafe { (copy3.data as *mut u32).write(0xDEAD_BEEF) };
+                copy3.copy_back_marked(&[p3]);
+                // SAFETY: reading back our pool page.
+                unsafe {
+                    assert_eq!((p3 as *const u32).read_volatile(), 0xDEAD_BEEF, "GPU write merged");
+                    assert_eq!(
+                        ((p3 + 16) as *const u32).read_volatile(),
+                        0xCAFE_BABE,
+                        "pre-arm silent CPU write preserved"
+                    );
+                    assert_eq!(
+                        ((p3 + 24) as *const u32).read_volatile(),
+                        0xFACE_FEED,
+                        "post-arm CPU write preserved"
+                    );
+                }
+            });
+        });
+        drop(copy3);
+        unregister(p3, p3 as u64);
+        crate::watch::tests::free(p3);
+
         drop(copy);
         unregister(p, p as u64);
         crate::watch::tests::free(p);

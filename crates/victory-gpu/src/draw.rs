@@ -2386,6 +2386,199 @@ void main() {
         crate::shadow::unregister(buf as usize, p as u64);
     }
 
+    /// Live D3DMetal GPU regression test: CPU writes to a hot or resting
+    /// (`PAGE_READWRITE`) write-watched page right before marked GPU copy-back
+    /// must never be clobbered by stale shadow bytes.
+    #[test]
+    fn hot_and_resting_uav_copy_back_preserves_cpu_writes() {
+        use std::time::Duration;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LIVE_MARKED_WRITE: &str = r#"
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer writes : register(u1);
+cbuffer c : register(b0) { uint byte_offset; uint value; uint mark_word_bytes; uint mark_mask; }
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(byte_offset, value);
+    if (mark_mask != 0) {
+        writes.Store(mark_word_bytes, mark_mask);
+    }
+}
+"#;
+        const LIVE_PARAMS: &[Param] = &[
+            Param::Table(&[uav(0, 1)]),
+            Param::Uav { register: 1 },
+            Param::Constants { register: 0, count: 4 },
+        ];
+        let (root, pso) = compile_cs(LIVE_MARKED_WRITE, LIVE_PARAMS);
+        let dispatch = |list: &HostList,
+                        heap_host: &crate::descriptor::host::HostHeap,
+                        table_slot: u32,
+                        byte_offset: u32,
+                        value: u32,
+                        mark_bit: u32| {
+            let writes = crate::shadow::view_writes(false).expect("view_writes bitmap");
+            let constants = [byte_offset, value, (mark_bit >> 5) * 4, 1u32 << (mark_bit & 31)];
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(table_slot));
+                list.list.SetComputeRootUnorderedAccessView(1, writes);
+                list.list.SetComputeRoot32BitConstants(2, 4, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        let (_, title_heap, heap_host) = view_heap(8);
+        let uav_at_0: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let post_val = 0xFACE_FEEDu32.to_le_bytes();
+        let _ = host.log_messages();
+
+        // Case 1: Hot `PAGE_READWRITE` page + unarmed marked UAV (bindless path).
+        crate::watch::tests::with_hot_pages(true, || {
+            crate::watch::tests::with_guard_rest(Duration::ZERO, || {
+                let p = crate::watch::tests::pool(1);
+                // SAFETY: committed pool page of ours.
+                unsafe {
+                    (p as *mut u32).write_volatile(0x1111_1111);
+                    ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+                }
+                let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+                let shadow = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("shadow");
+                let mark_bit = shadow.mark_entry(p as u64).expect("marked").0;
+                let slot0 = title_heap.start;
+                crate::descriptor::create_uav(std::ptr::null(), buf, std::ptr::null(), &uav_at_0, slot0);
+                let _ = heap_host.mirror(0, slot0, true);
+
+                // Promote `p` to hot (`PAGE_READWRITE`).
+                shadow.update(p, crate::watch::PAGE);
+                for v in [1u32, 2] {
+                    // SAFETY: committed pool page of ours.
+                    unsafe { ((p + 64) as *mut u32).write_volatile(v) };
+                    shadow.update(p, crate::watch::PAGE);
+                }
+                assert!(crate::watch::writable(p), "page promoted to hot");
+
+                // Silent CPU write directly to the hot `PAGE_READWRITE` page
+                // right before GPU execution + unarmed `copy_back_marks`.
+                // SAFETY: committed writable pool page of ours.
+                unsafe { ((p + 16) as *mut u32).write_volatile(0xCAFE_BABE) };
+                let list = host.new_list().unwrap();
+                dispatch(&list, heap_host, 0, 0, 0xDEAD_BEEF, mark_bit);
+                list.close();
+                host.execute(&[&list]);
+                assert_eq!(host.log_messages(), None);
+                // SAFETY: bytes inside our page.
+                let cpu_after = unsafe { ((p + 16) as *const u32).read_volatile() };
+                assert_eq!(
+                    cpu_after, 0xCAFE_BABE,
+                    "unarmed marked UAV on hot page must not clobber silent CPU write"
+                );
+                crate::shadow::unregister(buf as usize, p as u64);
+            });
+        });
+
+        // Case 2: Resting `PAGE_READWRITE` page + unarmed marked UAV.
+        crate::watch::tests::with_hot_pages(false, || {
+            crate::watch::tests::with_guard_rest(Duration::from_millis(500), || {
+                let p = crate::watch::tests::pool(1);
+                // SAFETY: committed pool page of ours.
+                unsafe {
+                    (p as *mut u32).write_volatile(0x1111_1111);
+                    ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+                }
+                let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+                let shadow = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("shadow");
+                let mark_bit = shadow.mark_entry(p as u64).expect("marked").0;
+                let slot1 = title_heap.start + 32;
+                crate::descriptor::create_uav(std::ptr::null(), buf, std::ptr::null(), &uav_at_0, slot1);
+                let _ = heap_host.mirror(1, slot1, true);
+
+                // First fault opens `p` into rest cooldown.
+                shadow.update(p, crate::watch::PAGE);
+                // SAFETY: committed pool page of ours.
+                unsafe { ((p + 64) as *mut u32).write_volatile(1) };
+                shadow.update(p, crate::watch::PAGE);
+                assert!(crate::watch::writable(p), "page resting open");
+
+                // Silent CPU write directly to the resting `PAGE_READWRITE` page.
+                // SAFETY: committed writable pool page of ours.
+                unsafe { ((p + 16) as *mut u32).write_volatile(0xCAFE_BABE) };
+                let list = host.new_list().unwrap();
+                dispatch(&list, heap_host, 1, 0, 0xDEAD_BEEF, mark_bit);
+                list.close();
+                host.execute(&[&list]);
+                assert_eq!(host.log_messages(), None);
+                // SAFETY: bytes inside our page.
+                let cpu_after = unsafe { ((p + 16) as *const u32).read_volatile() };
+                assert_eq!(
+                    cpu_after, 0xCAFE_BABE,
+                    "unarmed marked UAV on resting page must not clobber silent CPU write"
+                );
+                crate::shadow::unregister(buf as usize, p as u64);
+            });
+        });
+
+        // Case 3: Hot `PAGE_READWRITE` page + armed marked UAV where CPU writes
+        // `[16..20)` silently BEFORE `arm` and `[24..28)` AFTER `arm` in one submission.
+        crate::watch::tests::with_hot_pages(true, || {
+            crate::watch::tests::with_guard_rest(Duration::ZERO, || {
+                let p = crate::watch::tests::pool(1);
+                // SAFETY: committed pool page of ours.
+                unsafe {
+                    (p as *mut u32).write_volatile(0x1111_1111);
+                    ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+                    ((p + 24) as *mut u32).write_volatile(0x3333_3333);
+                }
+                let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+                let shadow = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("shadow");
+                let mark_bit = shadow.mark_entry(p as u64).expect("marked").0;
+                let slot2 = title_heap.start + 64;
+                crate::descriptor::create_uav(std::ptr::null(), buf, std::ptr::null(), &uav_at_0, slot2);
+                let _ = heap_host.mirror(2, slot2, true);
+
+                shadow.update(p, crate::watch::PAGE);
+                for v in [1u32, 2] {
+                    // SAFETY: committed pool page of ours.
+                    unsafe { ((p + 64) as *mut u32).write_volatile(v) };
+                    shadow.update(p, crate::watch::PAGE);
+                }
+                assert!(crate::watch::writable(p), "page promoted to hot");
+
+                // Pre-arm silent CPU write directly to the hot `PAGE_READWRITE` page.
+                // SAFETY: committed writable pool page of ours.
+                unsafe { ((p + 16) as *mut u32).write_volatile(0xCAFE_BABE) };
+                let list = host.new_list().unwrap();
+                // Arm cools, guards, and refreshes the shadow baseline.
+                shadow.gpu_writes(&list, p as u64, crate::watch::PAGE as u64, true);
+                // Post-arm guarded CPU write faults and saves baseline.
+                list.defer_copy((p + 24) as *mut u8, post_val.as_ptr(), post_val.len());
+                dispatch(&list, heap_host, 2, 0, 0xDEAD_BEEF, mark_bit);
+                list.close();
+                host.execute(&[&list]);
+                assert_eq!(host.log_messages(), None);
+                // SAFETY: bytes inside our page.
+                unsafe {
+                    assert_eq!((p as *const u32).read_volatile(), 0xDEAD_BEEF, "GPU write merged");
+                    assert_eq!(
+                        ((p + 16) as *const u32).read_volatile(),
+                        0xCAFE_BABE,
+                        "pre-arm silent CPU write on hot page preserved"
+                    );
+                    assert_eq!(
+                        ((p + 24) as *const u32).read_volatile(),
+                        0xFACE_FEED,
+                        "post-arm CPU write on cooled page preserved"
+                    );
+                }
+                crate::shadow::unregister(buf as usize, p as u64);
+            });
+        });
+    }
+
     /// Unaligned and `< 64 KiB` / cross-page `Shadow`s clamp `page_range`
     /// cleanly and copy back marked sub-range UAV writes across the page
     /// boundary without disturbing surrounding title memory.

@@ -1496,14 +1496,12 @@ impl Tracked {
         self.build_copy_runs(&entries, &unmapped, from, to, use_parts)
     }
 
-    /// Whether page `page` (a page number) changed since it was taken.
+    /// Whether page `page` (a page number) may have been written by the title
+    /// since it was taken — including pages left writable while hot/resting
+    /// (`hot`) or cooled after being open without a fresh take (`rearmed`).
     pub(crate) fn changed(&self, page: usize) -> bool {
-        self.changed
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pages
-            .contains(&page)
+        let d = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        d.pages.contains(&page) || d.hot.contains(&page) || d.rearmed.contains(&page)
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
@@ -1591,11 +1589,13 @@ impl Tracked {
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
     /// pages there written next after they were taken have their bytes kept
-    /// first ([`Tracked::saved`]).
-    pub(crate) fn arm(&self, from: usize, to: usize) {
+    /// first ([`Tracked::saved`]). Returns whether any hot/resting pages in
+    /// `[from, to)` were cooled and re-guarded so the caller can pull pre-arm
+    /// silent CPU writes into its shadow copy before GPU execution.
+    pub(crate) fn arm(&self, from: usize, to: usize) -> bool {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
-            return;
+            return false;
         }
         let (first, last) = (from / PAGE, to.div_ceil(PAGE));
         self.changed
@@ -1616,12 +1616,16 @@ impl Tracked {
             if !hot_pages.is_empty() {
                 let mut g = guards();
                 cool_for_gpu(&mut g, &hot_pages, Some((&self.changed, first, last)));
+                return true;
             }
         }
+        false
     }
 
     /// Page `page` (a page number) needs no saving any more: its copy-back
-    /// is under way.
+    /// is under way. If `page` was left writable (hot or resting), cool it
+    /// into [`Dirty::pages`] so copy-back keeps any silent CPU writes while
+    /// future takes guard it again.
     pub(crate) fn unarm(&self, page: usize) {
         {
             let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
@@ -1639,7 +1643,7 @@ impl Tracked {
                 .contains(&page)
         {
             let mut g = guards();
-            cool_for_gpu(&mut g, &[page], Some((&self.changed, page, page + 1)));
+            cool_for_gpu(&mut g, &[page], None);
         }
     }
 
@@ -2431,9 +2435,8 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
         for c in holders {
             let first_write = {
                 let mut d = c.0.lock().unwrap_or_else(|e| e.into_inner());
-                d.hot.remove(&page);
-                d.rearmed.remove(&page);
-                let first_write = d.pages.insert(page);
+                let was_open = d.hot.remove(&page) | d.rearmed.remove(&page);
+                let first_write = d.pages.insert(page) && !was_open;
                 set_dirty(c.2, true);
                 first_write
             };
@@ -2988,7 +2991,7 @@ fn read_only(at: usize) -> bool {
 }
 
 /// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+pub(crate) fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE,
         VirtualQuery,
@@ -3589,7 +3592,7 @@ pub(crate) mod tests {
         f()
     }
 
-    fn with_hot_pages<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_hot_pages<R>(on: bool, f: impl FnOnce() -> R) -> R {
         struct Reset(Option<bool>);
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -3600,7 +3603,7 @@ pub(crate) mod tests {
         f()
     }
 
-    fn with_guard_rest<R>(rest: Duration, f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_guard_rest<R>(rest: Duration, f: impl FnOnce() -> R) -> R {
         struct Reset(Option<Duration>);
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -3947,12 +3950,18 @@ pub(crate) mod tests {
                 unsafe { (p as *mut u8).write_volatile(v) };
                 assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
             }
-            assert!(writable(p) && !t.changed(p / PAGE) && !t.clean());
+            assert!(writable(p) && t.changed(p / PAGE) && !t.clean());
             // SAFETY: silent write while hot.
             unsafe { ((p + 24) as *mut u8).write_volatile(0x5a) };
 
-            t.arm(p, p + PAGE);
+            assert!(t.arm(p, p + PAGE), "arm reports cooled hot page");
             assert!(read_only(p), "arm immediately guards a hot page");
+            assert!(
+                t.changed(p / PAGE),
+                "rearmed page stays changed until the shadow pulls pre-arm bytes"
+            );
+            assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+            assert!(!t.changed(p / PAGE) && read_only(p));
             // SAFETY: guarded again; handler snapshots 0x5a before 0xa5 lands.
             unsafe { ((p + 24) as *mut u8).write_volatile(0xa5) };
             // SAFETY: pool byte just written.
@@ -3974,8 +3983,9 @@ pub(crate) mod tests {
             // SAFETY: silent write through alias while hot.
             unsafe { ((va + 12) as *mut u8).write_volatile(0x33) };
 
-            t.arm(vb, vb + PAGE);
+            assert!(t.arm(vb, vb + PAGE), "arm reports cooled aliased hot page");
             assert!(read_only(va) && read_only(vb), "alias guarded on arm too");
+            assert_eq!(t.take(vb, vb + PAGE), [(vb, vb + PAGE)]);
             // SAFETY: guarded alias; faults and saves `vb` before 0x77 lands.
             unsafe { ((va + 12) as *mut u8).write_volatile(0x77) };
             assert_eq!(t.saved(vb / PAGE).expect("saved via alias")[12], 0x33);
@@ -4015,7 +4025,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gpu_copy_back_cools_hot_page_without_false_title_change() {
+    fn gpu_copy_back_cools_hot_page_and_preserves_title_writes() {
         let p = pool(1);
         with_hot_pages(true, || {
             let t = track_copy(p, PAGE, true).expect("tracked");
@@ -4025,13 +4035,13 @@ pub(crate) mod tests {
                 unsafe { (p as *mut u8).write_volatile(v) };
                 assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
             }
-            assert!(writable(p) && !t.clean());
+            assert!(writable(p) && t.changed(p / PAGE) && !t.clean());
 
             let page = p / PAGE;
             t.unarm(page);
             assert!(
-                !t.changed(page),
-                "hot state must not look like an unmerged title write to copy_back_marked"
+                t.changed(page),
+                "an unguarded hot page may hold silent CPU writes, so copy_back_marked must keep title bytes"
             );
             t.taken(&[page]);
             assert!(read_only(p) && t.clean());
@@ -4062,7 +4072,10 @@ pub(crate) mod tests {
                 let before = PROTECTS.with(std::cell::Cell::get);
                 assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
                 assert!(writable(p), "page rests open across immediate takes");
-                assert!(!t.changed(p / PAGE), "no false title change while resting");
+                assert!(
+                    t.changed(p / PAGE),
+                    "writable resting page counts as changed so copy-back never clobbers silent CPU writes"
+                );
 
                 // Silent writes during the rest window keep being returned by `take`
                 // with zero `VirtualProtect` calls.
