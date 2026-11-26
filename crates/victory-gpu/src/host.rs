@@ -1410,6 +1410,12 @@ struct Deferred {
     slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title textures written by GPU shaders that match `VICTORY_TEXTURE_BACK`,
+    /// copied into readback buffers when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Recorded GPU-to-CPU texture readbacks to retile into title memory once
+    /// the submission completes.
+    texture_backs: Vec<crate::texback::Back>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2203,6 +2209,11 @@ impl Host {
             }
         }
         for list in runs {
+            for back in &list.deferred().texture_backs {
+                crate::texback::land(back);
+            }
+        }
+        for list in runs {
             for work in &list.deferred().after {
                 work();
             }
@@ -2585,6 +2596,7 @@ impl HostList {
                     .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.textures_back();
         self.widen_close();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -2725,6 +2737,65 @@ impl HostList {
         }
         self.memory_writer.store(uses, Ordering::Relaxed);
         Reset(&self.memory_writer)
+    }
+
+    /// Marks title texture `resource` as GPU-written on this command list so
+    /// eligible 2D textures (`VICTORY_TEXTURE_BACK`) are copied into a readback
+    /// buffer when the list closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred
+            .back_wanted
+            .iter()
+            .any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Whether this command list has recorded GPU-to-CPU texture readbacks.
+    #[allow(dead_code)]
+    pub(crate) fn has_texture_backs(&self) -> bool {
+        !self.deferred().texture_backs.is_empty()
+    }
+
+    /// Destination title-memory ranges `[start, end)` updated when this command
+    /// list's GPU-to-CPU texture readbacks land.
+    #[allow(dead_code)]
+    pub(crate) fn texture_back_ranges(&self) -> Vec<(usize, usize)> {
+        self.deferred()
+            .texture_backs
+            .iter()
+            .map(crate::texback::Back::range)
+            .collect()
+    }
+
+    /// Before the list closes: copies eligible GPU-written textures into host
+    /// readback buffers (`crate::texback::record`).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            if !target.is_valid() {
+                continue;
+            }
+            if let Some(barrier) = self.move_texture(&target.copy, COPY_SOURCE) {
+                // SAFETY: open command list and valid resource transition.
+                unsafe { self.list.ResourceBarrier(&[barrier]) };
+            }
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keep_upload_for_test(&self, upload: ID3D12Resource) {
+        self.deferred().uploads.push(upload);
     }
 
     /// A copy of ours replaced the compute root signature and pipeline.
@@ -4074,6 +4145,47 @@ impl Host {
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         self.mapped_buffer(size, false)
+    }
+
+    /// An unmapped `D3D12_HEAP_TYPE_READBACK` buffer of `size` bytes in
+    /// `D3D12_RESOURCE_STATE_COPY_DEST`.
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
+                None
+            }
+        }
     }
 
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
