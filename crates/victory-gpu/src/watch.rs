@@ -241,18 +241,25 @@ thread_local! {
 static OPENED_UNDER_LOCK: [std::sync::atomic::AtomicUsize; 64] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
 
+/// Whether any block waits in them: the next holder of the lock scans
+/// [`OPENED_UNDER_LOCK`] only when one was opened, not on every take. Only
+/// touched while the lock is held, so a clear scan leaves no block behind.
+static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A fault on the block `page` by the thread holding the guard lock: write
 /// access back now, marked changed by the lock's next holder.
 // shortcut: assumes a read-only block this thread writes while
 // holding the lock is one of ours; with all 64 slots taken the block stays
 // open without being marked (counted); a bigger table if that shows up.
 fn open_under_lock(page: usize) {
-    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
     // SAFETY: a block of this process; fails harmlessly if it is gone.
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
-    if !OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
+    if OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
+        OPENED.store(true, Release);
+    } else {
         static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         LOST.fetch_add(1, Relaxed);
     }
@@ -280,10 +287,12 @@ fn guards() -> Held {
         #[cfg(feature = "diagnostics")]
         line: std::panic::Location::caller().line(),
     };
-    for slot in &OPENED_UNDER_LOCK {
-        let page = slot.swap(0, AcqRel);
-        if page != 0 {
-            changed(&mut held, page, page + 1, false);
+    if OPENED.swap(false, AcqRel) {
+        for slot in &OPENED_UNDER_LOCK {
+            let page = slot.swap(0, AcqRel);
+            if page != 0 {
+                changed(&mut held, page, page + 1, false);
+            }
         }
     }
     held

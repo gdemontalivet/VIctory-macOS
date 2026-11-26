@@ -402,6 +402,46 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Run in isolation with VICTORY_PRESENT_MAX=1280x720. Exercise the
+    /// real swap chain and its resize path without opening a visible window.
+    #[test]
+    #[ignore = "requires DXGI and an explicit 720p presentation cap"]
+    fn capped_presentation_resizes_a_hidden_swap_chain() {
+        use super::*;
+        let host = host().expect("a host GPU");
+        assert_eq!(crate::composite::output_size(1920, 1080), (1280, 720));
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // SAFETY: a hidden Win32 control owned by this test thread.
+        let hwnd = unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("VIctory display test"),
+                WS_OVERLAPPEDWINDOW, 0, 0, 320, 180, None, None, None, None)
+        }.unwrap();
+        let presenter = host.presenter_for_window(hwnd, 320, 180, format).unwrap();
+        host.presenter.lock().unwrap().presenter = Some(presenter);
+        let state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+        let picture = crate::composite::result_texture(&host.device, 1920, 1080, format).unwrap();
+        let ui = crate::composite::result_texture(&host.device, 3840, 2160, format).unwrap();
+        let small = crate::composite::result_texture(&host.device, 640, 360, format).unwrap();
+        for (frame, (source, overlay, expected)) in [
+            (&picture, None, (1280, 720)),
+            (&picture, Some((&ui, state)), (1280, 720)),
+            (&small, None, (640, 360)),
+        ].into_iter().enumerate() {
+            assert!(host.present(source, state, overlay, frame as u64 + 1).is_some());
+            let presentation = host.presenter.lock().unwrap();
+            let chain = &presentation.presenter.as_ref().unwrap().swap_chain;
+            // SAFETY: a live swap chain after presenting and waiting for the copy.
+            let desc = unsafe { chain.GetDesc1() }.unwrap();
+            assert_eq!((desc.Width, desc.Height), expected);
+            // SAFETY: plain query after executing the presentation command list.
+            unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+            eprintln!("presented frame {} on a {}x{} DXGI swap chain", frame + 1, desc.Width, desc.Height);
+        }
+        host.presenter.lock().unwrap().presenter.take();
+        // SAFETY: the swap chain was released and this thread owns the window.
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
@@ -1300,6 +1340,8 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        batch.log_refreshes(*submitted + 1, runs.len());
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -2515,6 +2557,14 @@ struct Batch {
         usize,
         (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
     >,
+    /// Totals and the largest ranges refreshed by this submission, for a
+    /// bounded diagnostics line. No range contents or view attribution.
+    #[cfg(feature = "diagnostics")]
+    summary: crate::ranges::RefreshSummary,
+    /// Where each copy in `current` sits in memory, by copy: a title copy
+    /// reaches by its bytes only the copies that can hold them, not
+    /// every copy flushed.
+    extents: victory_formats::extents::Extents,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -2555,6 +2605,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.current.clear();
+        self.extents.clear();
     }
 
     /// As [`Batch::title_written`], before a copy into the title memory
@@ -2572,8 +2623,13 @@ impl Batch {
         }
         self.flush();
         let (from, to) = touched(at, at.saturating_add(len));
-        for (_, have) in self.current.values_mut() {
-            have.remove(from, to);
+        // Only the copies whose memory the bytes can be in: the rest
+        // hold nothing of the window, and what a no-op remove would
+        // leave whole it leaves whole.
+        for key in self.extents.overlapping(from, to) {
+            if let Some((_, have)) = self.current.get_mut(&key) {
+                have.remove(from, to);
+            }
         }
     }
 
@@ -2583,6 +2639,8 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
+        #[cfg(feature = "diagnostics")]
+        let mut counted = crate::copystat::hold();
         for (shadow, ranges) in self.refreshes.drain(..) {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
@@ -2591,19 +2649,43 @@ impl Batch {
                 let copied = shadow.update(from, to - from);
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::range(from, to - from, us, 0);
+                {
+                    counted.range(from, to - from, us, 0);
+                    self.summary
+                        .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
+                }
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 total += copied;
                 let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
-                self.current
-                    .entry(key)
-                    .or_insert_with(|| (shadow.clone(), Default::default()))
-                    .1
-                    .insert(from, to, 0);
+                // The copy's memory joins the index as its first range
+                // joins `current`: a later title copy reaches it by its
+                // bytes.
+                let (_, have) = match self.current.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        self.extents
+                            .flushed(key, start as usize, (start + len) as usize);
+                        vacant.insert((shadow.clone(), Default::default()))
+                    }
+                    std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+                };
+                have.insert(from, to, 0);
             }
         }
         total
+    }
+
+    /// Logs one compact line for the submission, if it refreshed title memory.
+    #[cfg(feature = "diagnostics")]
+    fn log_refreshes(&self, submission: u64, lists: usize) {
+        if !self.summary.is_empty() {
+            tracing::info!(
+                submission,
+                lists,
+                "title-memory refreshes: {}",
+                self.summary
+            );
+        }
     }
 }
 
@@ -3219,8 +3301,8 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let text = format!("{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text: Vec<u16> = crate::caption::with_stats(caption, &text);
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -3272,12 +3354,14 @@ impl Host {
             let f = swap_format(unsafe { o.GetDesc() }.Format)?;
             Some((o, s, f))
         });
-        let format = if overlay.is_some() {
-            crate::composite::result_format(picture_format)
-        } else {
-            picture_format
-        };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let native = (desc.Width as u32, desc.Height);
+        let size = crate::composite::output_size(native.0, native.1);
+        let can_sample = desc.SampleDesc.Count == 1
+            && desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE == D3D12_RESOURCE_FLAG_NONE
+            && (desc.Format == picture_format || crate::resource::family(desc.Format.0 as u32) == desc.Format.0 as u32);
+        let use_pass = overlay.is_some() || (size != native && can_sample);
+        let (width, height) = if use_pass { size } else { native };
+        let format = if use_pass { crate::composite::result_format(picture_format) } else { picture_format };
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() {
@@ -3294,7 +3378,7 @@ impl Host {
         let p = presenter.as_mut()?;
         // The blend pass and the texture it writes, made on first use.
         let mut blended = None;
-        if let Some(overlay) = overlay {
+        if use_pass {
             if p.compositor.is_none() {
                 p.compositor = Some(crate::composite::Compositor::new(&self.device).map_err(|e| {
                     tracing::warn!(error = %e, "no overlay blending: the pass did not compile");
@@ -3304,21 +3388,30 @@ impl Host {
                 let current = p.blended.as_ref().is_some_and(|t| {
                     // SAFETY: a live resource.
                     let d = unsafe { t.GetDesc() };
-                    (d.Width, d.Height, d.Format) == (desc.Width, desc.Height, format)
+                    (d.Width, d.Height, d.Format) == (u64::from(width), height, format)
                 });
                 if !current {
                     p.blended =
-                        crate::composite::result_texture(&self.device, desc.Width, desc.Height, format).ok();
+                        crate::composite::result_texture(&self.device, u64::from(width), height, format).ok();
                 }
                 if let Some(result) = &p.blended {
-                    blended = Some((compositor, result.clone(), overlay));
+                    blended = Some((compositor, result.clone()));
                 }
             }
         }
+        // If the pass or its output is unavailable, the back buffer must
+        // match the original texture before the direct CopyResource below.
+        let (width, height, format) = if blended.is_some() {
+            (width, height, format)
+        } else {
+            (native.0, native.1, picture_format)
+        };
         // What is presented, whenever it changes: the title's texture in its
         // host format, and the swap chain format it is copied into.
-        static SHOWN: Mutex<Option<(u64, u32, i32)>> = Mutex::new(None);
-        let shown = Some((desc.Width, desc.Height, desc.Format.0));
+        /// Width, height and format.
+        type Shape = (u32, u32, i32);
+        static SHOWN: Mutex<Option<(Shape, Shape)>> = Mutex::new(None);
+        let shown = Some(((native.0, native.1, desc.Format.0), (width, height, format.0)));
         let mut last = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
         if *last != shown {
             *last = shown;
@@ -3329,10 +3422,16 @@ impl Host {
                 texture_format = desc.Format.0,
                 flags = desc.Flags.0,
                 swap_format = format.0,
+                output_width = width,
+                output_height = height,
                 "presenting a title texture"
             );
         }
         drop(last);
+        // This also covers a swap chain created at the capped size when the
+        // blend pass later cannot be built: width, height and format were reset
+        // to the title texture's own above, so the buffers are resized to match
+        // before the direct copy.
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
@@ -3367,13 +3466,18 @@ impl Host {
             // What is copied to the back buffer: the blend or the picture,
             // and the state it returns to afterwards.
             let (source, state) = match &blended {
-                Some((compositor, result, (o, ostate, oformat))) => {
-                    let ostate = D3D12_RESOURCE_STATES(*ostate as i32);
-                    list.ResourceBarrier(&[transition(texture, state, READ), transition(o, ostate, READ)]);
-                    compositor.record(&self.device, list, (texture, picture_format), (o, *oformat), result, format);
+                Some((compositor, result)) => {
+                    list.ResourceBarrier(&[transition(texture, state, READ)]);
+                    if let Some((o, ostate, _)) = overlay {
+                        list.ResourceBarrier(&[transition(o, D3D12_RESOURCE_STATES(ostate as i32), READ)]);
+                    }
+                    compositor.record(&self.device, list, (texture, picture_format),
+                        overlay.map(|(o, _, f)| (o, f)), result, format);
+                    if let Some((o, ostate, _)) = overlay {
+                        list.ResourceBarrier(&[transition(o, READ, D3D12_RESOURCE_STATES(ostate as i32))]);
+                    }
                     list.ResourceBarrier(&[
                         transition(texture, READ, state),
-                        transition(o, READ, ostate),
                         transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
                     ]);
                     (result.clone(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
@@ -3431,6 +3535,16 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height).map_err(|e| ("window", e))?,
         };
+        self.presenter_for_window(hwnd, width, height, format)
+    }
+
+    fn presenter_for_window(
+        &self,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))

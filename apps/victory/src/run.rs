@@ -93,7 +93,8 @@ pub fn run(
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {
         let wanted = victory_loader::masked::wanted_from(Some(&which));
-        let n = victory_loader::masked::patch(image.base() as u64, image.info(), &original, wanted);
+        let n =
+            victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
     }
     let resolver = HleResolver::new(if strict {

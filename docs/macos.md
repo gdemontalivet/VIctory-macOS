@@ -49,6 +49,8 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 
 After these fixes the whole suite passed under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored. After the merge of 25 November 2026 and the fixes below it gives 481 passed, 0 failed and 7 ignored.
 
+A Wine built with a macOS 27 SDK used to crash on macOS 26 at its first start, in `server_pipe`. Configure found `pipe2`, which only macOS 27 has (MarshallStunt, #50). Of the 33 functions Wine's configure checks for, it is the only one that macOS 27.0.1 exports and the macOS 26.5 SDK lacks. `build-crossover-wine.sh` now tells configure that `pipe2` is missing, and Wine falls back to `pipe` and `fcntl`. A Wine that crashes this way has to be built again: remove `target/crossover/build` and `target/wine-cx`, then run `./setup.sh`.
+
 ## Run-time HLSL and textures under Wine and D3DMetal
 
 Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26.3 Wine it differs from Microsoft's compilers in four ways that matter here:
@@ -57,6 +59,20 @@ Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26
 - `RWByteAddressBuffer` has no `Load`, and `RWStructuredBuffer` stores are not implemented. The depth converter in `twin.rs` reads its scratch buffer through a structured view and writes it through a raw one.
 - Shader model 5.1 resource arrays are not implemented, bounded or unbounded (`E_NOTIMPL`), and `NonUniformResourceIndex` is not defined. So `lists_share_a_table_and_copies_keep_their_views` skips under Wine. Embedding FXC's bytes instead is ruled out by VIctory's asset policy, which refuses long runs of embedded hex.
 - It still compiles plain `cs_5_1` shaders, and D3DMetal runs their bytecode.
+
+### Building the indirect argument clamp with DXC
+
+If you have DXC, you can build the 64-thread argument clamp from its HLSL source when cross-compiling VIctory. The compiled shader stays in Cargo’s build output. Set `VICTORY_HELPER_DXC` to a native DXC executable, or use the Wine wrapper with an x64 Microsoft DXC distribution:
+
+```sh
+export DXC_WINE="$WINE"
+export DXC_EXE="/absolute/path/to/dxc.exe"
+export VICTORY_HELPER_DXC="$PWD/tools/macos/dxc-wine.sh"
+cargo build --locked --target x86_64-pc-windows-gnullvm -p victory
+tools/macos/test-wine.sh -p victory-gpu --lib hardware_uses_precompiled_clamp -- --ignored
+```
+
+Keep the compiler and its companion DLLs together. DXC signs its output (the digest in the container header and the digest in the `HASH` part, which D3DMetal uses to find compiled shaders) only when `dxil.dll` sits next to `dxc.exe`. Without it the output is unsigned, with both digests zero, and zero digests once made unrelated shaders run each other's code (#4). The runtime therefore checks the compiled clamp when it loads it and sets both digests from the program if they are zero, and it logs when it had to. CI never builds this path, because it never sets `VICTORY_HELPER_DXC`; the ignored test runs the precompiled clamp and the runtime-compiled one on the same records and compares every word they write. On success the runtime logs `argument clamp: using precompiled 64-thread shader`. Without a configured compiler, or if the device rejects the compiled shader, the existing runtime compilation paths remain available.
 
 D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
 
@@ -140,3 +156,10 @@ VIctory used both kinds of protection to see which title GPU memory changed. Und
 
 
 The game's executable holds 1130 masked stores (789 `vpmaskmovd`, 160 `vpmaskmovq`, 180 `vmaskmovps` and 1 `vmaskmovpd`), which `victory` reports at start-up. `VICTORY_PATCH_MASKED=all` (or a comma list of hex RVAs) rewrites each one at load time as a jump to a small trampoline that does the same stores one lane at a time with plain `mov`s, which Rosetta can resume after a fault (`victory-loader/src/masked.rs`). With that, `VICTORY_FAULT_TRACKING=1` can be tried under Rosetta, so copies of title memory no longer have to be taken whole (about 129 GB per frame once the world streams in, #50). Both switches are off by default until runs with the game confirm them. The scan reads bytes, so a rare false match could be patched with `all`, and naming RVAs avoids that. Run 11 in #50 showed that `vcvtps2ph` stores to memory hang Rosetta the same way, so the scan and the patch also cover `vcvtps2ph`, `vextractf128` and `vextracti128` stores. Those are redone into the stack and then copied out with plain `mov`s. With the masked stores patched, copies during loading fell from 158.7 MB to 0.7 MB per frame and frames from 125.7 ms to 38.3 ms.
+
+With every masked store patched and fault tracking on, #144 then stopped on a plain 256-bit store, `vmovups [r8+0x34], ymm0` at RVA 0x1E09B31, with the same Rosetta error. Plain stores like that are far more common than masked ones, so the scan does not look for them. Instead, an RVA in the list that the scan did not find is decoded as an unaligned 256-bit store (`vmovups`, `vmovupd` or `vmovdqu`) and redone the same way, into the stack and out with plain `mov`s. `all` and RVAs can be given together, as in `VICTORY_PATCH_MASKED=all,1e09b31,1e09b37`. A listed RVA that is neither kind is left alone with a warning, and so is a store shorter than the 5-byte jump.
+
+## Host presentation size
+
+Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.
+

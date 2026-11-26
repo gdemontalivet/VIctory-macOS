@@ -130,6 +130,44 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg(any(windows, test))]
+type Registration = (u64, u64, usize);
+
+/// Registers a heap, retiring any range it overlaps. Descriptor handles carry
+/// no heap identity, so two live heaps cannot unambiguously own one address.
+#[cfg(any(windows, test))]
+fn register_heap(heaps: &mut Vec<Registration>, (start, end): (u64, u64), at: usize) {
+    heaps.retain(|&(old_start, old_end, _)| old_end <= start || end <= old_start);
+    heaps.push((start, end, at));
+}
+
+/// Removes only this heap's registration.
+#[cfg(any(windows, test))]
+fn unregister_heap(heaps: &mut Vec<Registration>, at: usize) {
+    heaps.retain(|&(_, _, heap)| heap != at);
+}
+
+#[cfg(any(windows, test))]
+static AMBIGUOUS_RANGE: std::sync::Once = std::sync::Once::new();
+
+/// The heap owning `handle`, if exactly one registered range contains it.
+#[cfg(any(windows, test))]
+fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
+    let mut found = None;
+    for &(start, end, at) in heaps {
+        if (start..end).contains(&handle) && found.replace(at).is_some() {
+            AMBIGUOUS_RANGE.call_once(|| {
+                tracing::warn!(
+                    handle,
+                    "overlapping descriptor heaps: descriptor write refused"
+                )
+            });
+            return None;
+        }
+    }
+    found
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
@@ -140,10 +178,7 @@ fn mirror(handle: u64) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     drop(waited);
-    let Some(&(_, _, at)) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
-    else {
+    let Some(at) = heap_at(&heaps, handle) else {
         return;
     };
     // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
@@ -267,9 +302,10 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
     textures
 }
 
-/// Every shader-visible view heap's slots viewing one of the host textures
-/// `textures` (raw pointers) are left null, made again when read
-/// (`crate::resource::evict` gives those textures up).
+/// Every shader-visible view heap's title slots viewing one of the host
+/// textures `textures` (raw pointers) are left null, made again when read
+/// (`crate::resource::evict` gives those textures up). Dynamic slots stay
+/// made for the lists that recorded them.
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -314,7 +350,7 @@ impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        unregister_heap(&mut heaps, at);
     }
 }
 
@@ -779,14 +815,16 @@ pub(crate) extern "system" fn create_heap(
             .flatten(),
     });
     #[cfg(windows)]
-    if visible {
-        let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at));
-    }
+    let at = std::ptr::from_ref::<Heap>(&heap) as usize;
     #[cfg(not(windows))]
     let _ = visible;
-    object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
+    let result = object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out);
+    #[cfg(windows)]
+    if visible && result == crate::object::S_OK {
+        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        register_heap(&mut heaps, (start, start + size), at);
+    }
+    result
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -849,6 +887,52 @@ pub(crate) mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[test]
+    fn registering_a_heap_retires_overlapping_ranges_but_keeps_adjacent_ones() {
+        let mut heaps = vec![(10, 20, 1), (20, 30, 2), (30, 40, 3), (40, 50, 4)];
+        register_heap(&mut heaps, (15, 35), 5);
+        assert_eq!(heaps, [(40, 50, 4), (15, 35, 5)]);
+        register_heap(&mut heaps, (35, 40), 6);
+        assert_eq!(heaps, [(40, 50, 4), (15, 35, 5), (35, 40, 6)]);
+    }
+
+    #[test]
+    fn lookup_is_half_open_and_refuses_ambiguous_ranges() {
+        let heaps = [(10, 20, 1), (20, 30, 2)];
+        assert_eq!(heap_at(&heaps, 10), Some(1));
+        assert_eq!(heap_at(&heaps, 19), Some(1));
+        assert_eq!(heap_at(&heaps, 20), Some(2));
+        assert_eq!(heap_at(&heaps, 30), None);
+        assert_eq!(heap_at(&[(10, 30, 1), (20, 40, 2)], 25), None);
+    }
+
+    #[test]
+    fn unregistering_a_retired_heap_keeps_its_replacement() {
+        let mut heaps = vec![(10, 20, 1)];
+        register_heap(&mut heaps, (10, 20), 2);
+        unregister_heap(&mut heaps, 1);
+        assert_eq!(heaps, [(10, 20, 2)]);
+    }
+
+    #[cfg(windows)]
+    struct HeapOwner(This);
+
+    #[cfg(windows)]
+    impl Drop for HeapOwner {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn owner(desc: HeapDesc, placement: Placement) -> HeapOwner {
+        let mut this = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut this), S_OK);
+        HeapOwner(this)
     }
 
     #[test]
@@ -963,6 +1047,86 @@ pub(crate) mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    /// A placed heap reused at the same address replaces the stale range;
+    /// descriptor writes go only to the new heap.
+    #[cfg(windows)]
+    #[test]
+    fn overlapping_placed_heaps_mirror_into_the_replacement() {
+        let mut memory = vec![0u8; 2 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address,
+            size: 2 * 32,
+        };
+        let old = owner(desc, placement);
+        let new = owner(desc, placement);
+        {
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                heaps
+                    .iter()
+                    .filter(|&&(start, end, _)| (start..end).contains(&address))
+                    .count(),
+                1
+            );
+            assert_eq!(heap_at(&heaps, address), Some(new.0 as usize));
+        }
+
+        create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], address);
+        assert!(heap(old.0).pending.lock().unwrap().is_empty());
+        assert_eq!(heap(new.0).pending.lock().unwrap().as_slice(), [0]);
+
+        drop(old);
+        create_cbv(std::ptr::null(), &[0x2000, 1, 256, 0], address + 32);
+        assert_eq!(heap(new.0).pending.lock().unwrap().as_slice(), [0, 1]);
+    }
+
+    /// A creation that does not hand out a heap must not retire an existing
+    /// registration for the same memory.
+    #[cfg(windows)]
+    #[test]
+    fn failed_overlapping_creation_keeps_the_existing_heap() {
+        let mut memory = vec![0u8; 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement { address, size: 32 };
+        let existing = owner(desc, placement);
+        let extended = Extended(desc, placement);
+        let bad_iid = [0xff; 16];
+        let mut out = std::ptr::null();
+        assert_ne!(
+            create_heap(std::ptr::null(), &extended.0, &bad_iid, &mut out),
+            S_OK
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            create_heap(
+                std::ptr::null(),
+                &extended.0,
+                &HEAP_IIDS[0],
+                std::ptr::null_mut()
+            ),
+            crate::object::S_FALSE
+        );
+        {
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(heap_at(&heaps, address), Some(existing.0 as usize));
+        }
+        create_cbv(std::ptr::null(), &[0x3000, 1, 256, 0], address);
+        assert_eq!(heap(existing.0).pending.lock().unwrap().as_slice(), [0]);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

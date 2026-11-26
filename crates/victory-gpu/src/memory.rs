@@ -35,19 +35,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use victory_formats::pagetable::{self, BLOCK, CAPACITY, LEVEL1};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
 
-/// Pages per level-2 block: 4096 pages of 64 KiB, 256 MiB.
-const BLOCK: usize = 4096;
-/// Level-1 entries: 2^40 bytes in 256 MiB blocks.
-const LEVEL1: usize = 4096;
-/// Level-2 blocks a table has room for besides the null one: copies in 512
-/// distinct 256 MiB regions (the world's ~4,100 copies use a few dozen).
-const CAPACITY: usize = 512;
 /// The key of our own view heap ([`heap`]) among the title's.
 pub(crate) const OURS: usize = usize::MAX;
 
@@ -106,6 +100,10 @@ struct Shared {
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
+    /// The table's working buffers, kept between rewrites (grown as
+    /// needed, never shrunk): the copies' order, the level-1 index, each
+    /// entry's owner and the dwords ([`pagetable::Scratch`]).
+    scratch: pagetable::Scratch,
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -269,58 +267,6 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
         .as_ref()
 }
 
-/// The page table for host copies of title memory `copies` (start,
-/// bytes), copy k's view pair at heap index `pairs[k]`, `null` the null
-/// pair: the table's dwords, the level-1 index of each block, and the copy
-/// each entry names. At most [`CAPACITY`] blocks besides the null one.
-fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
-    let mut order: Vec<usize> = (0..copies.len()).collect();
-    order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
-    let mut level1 = vec![0u32; LEVEL1];
-    // Block 0 is the null block (no copy).
-    let mut blocks = vec![usize::MAX];
-    let mut owner: Vec<Option<(usize, bool)>> = vec![None; BLOCK];
-    let mut full = false;
-    for &k in &order {
-        let (start, len) = copies[k];
-        if len == 0 || start + len > 1 << 40 {
-            continue;
-        }
-        for page in start >> 16..=(start + len - 1) >> 16 {
-            let l1 = (page >> 12) as usize;
-            if level1[l1] == 0 {
-                if blocks.len() > CAPACITY {
-                    full = true;
-                    continue;
-                }
-                level1[l1] = blocks.len() as u32;
-                blocks.push(l1);
-                owner.resize(owner.len() + BLOCK, None);
-            }
-            let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
-            // Larger copies come first: a copy holding the whole page takes
-            // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= start + len;
-            if whole || owner[entry].is_none() {
-                owner[entry] = Some((k, whole));
-            }
-        }
-    }
-    if full {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
-    }
-    let mut dwords = level1;
-    for o in &owner {
-        let entry = match *o {
-            Some((k, _)) => [pairs[k], copies[k].0 as u32],
-            None => [null, 0],
-        };
-        dwords.extend(entry);
-    }
-    (dwords, blocks, owner.into_iter().map(|o| o.map(|o| o.0)).collect())
-}
-
 impl Shared {
     /// A page table for `heap`, named nothing yet (written at the first
     /// submission that uses it).
@@ -341,6 +287,7 @@ impl Shared {
             pairs: HashMap::new(),
             generation: u64::MAX,
             layout: Arc::default(),
+            scratch: pagetable::Scratch::default(),
         })
     }
 
@@ -379,18 +326,30 @@ impl Shared {
             slots.push(slot);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
-        // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
-        // keeps to; no submission runs.
-        unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
-        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        // The last table's blocks and owners, built back into if no list
+        // still reads them (a reader clones the layout, under the lock
+        // this holds); their buffers are kept between rewrites.
+        let spent = std::mem::take(&mut self.layout);
+        let mut out = match Arc::try_unwrap(spent) {
+            Ok(Layout { blocks, owner, .. }) => pagetable::Outputs { blocks, owners: owner },
+            Err(_) => pagetable::Outputs::default(),
+        };
+        let built = self.scratch.build(&ranges, &slots, self.null, &mut out);
+        // SAFETY: the mapping has room for `CAPACITY` blocks, which the
+        // builder keeps to; no submission runs.
+        unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
+        tracing::debug!(copies = ranges.len(), blocks = built.blocks.len() - 1, "title memory page table");
+        if built.full {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
+        }
+        self.generation = now;
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
-            blocks,
-            owner,
+            blocks: out.blocks,
+            owner: out.owners,
         });
-        self.generation = now;
         stats(|s| s.tables += 1);
     }
 }
@@ -565,6 +524,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_formats::pagetable::table;
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.
@@ -720,6 +680,42 @@ void main(uint3 id : SV_DispatchThreadID) {
             .copied()
     }
 
+    /// A pool of title memory (below 2^40, as the runtime places it),
+    /// `pages` 64 KiB pages, write-watched as its pools.
+    fn pool(pages: usize) -> usize {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
+            PAGE_READWRITE, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // Placed by address requirements, as the runtime places title
+        // memory (`XMemVirtualAlloc`): Wine refuses fixed addresses there.
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 32) as *mut _,
+            HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a fresh allocation; the parameter points at
+        // `requirements`, which outlives the call.
+        let p = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+                &mut parameter,
+                1,
+            )
+        } as usize;
+        assert!(p != 0 && p < 1 << 40, "memory below 2^40");
+        p
+    }
+
     /// Two lists of a submission read title memory through one page table;
     /// the copies' views stay where they are for later lists and
     /// submissions, also when another copy comes; none takes a per-draw
@@ -736,40 +732,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
-        // Title memory (below 2^40, as the runtime places it): 1, 2 and
-        // (from the second submission on) 1 page, write-watched as its pools.
-        let pool = |pages: usize| -> usize {
-            use windows_sys::Win32::System::Memory::{
-                MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
-                PAGE_READWRITE, VirtualAlloc2,
-            };
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            // Placed by address requirements, as the runtime places title
-            // memory (`XMemVirtualAlloc`): Wine refuses fixed addresses there.
-            let mut requirements = MEM_ADDRESS_REQUIREMENTS {
-                LowestStartingAddress: (1usize << 32) as *mut _,
-                HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
-                Alignment: 0,
-            };
-            let mut parameter = MEM_EXTENDED_PARAMETER::default();
-            parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
-            parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
-            // SAFETY: a fresh allocation; the parameter points at
-            // `requirements`, which outlives the call.
-            let p = unsafe {
-                VirtualAlloc2(
-                    GetCurrentProcess(),
-                    std::ptr::null(),
-                    pages * PAGE,
-                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
-                    PAGE_READWRITE,
-                    &mut parameter,
-                    1,
-                )
-            } as usize;
-            assert!(p != 0 && p < 1 << 40, "memory below 2^40");
-            p
-        };
+        // Title memory: 1, 2 and (from the second submission on) 1 page.
         let memory = [pool(1), pool(2), pool(1)];
         let copy = |p: usize, pages: usize| {
             crate::shadow::register(p, p as u64, (pages * PAGE) as u64);
@@ -949,5 +912,78 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// A copy unregistered between submissions: the next rewrite drops its
+    /// name — a lagging table would name a freed pair, and a pair reused
+    /// for another copy silently redirects shader reads, worse than a
+    /// miss. The copy made after it (whose views may take the freed
+    /// pair) and the one still live read their own bytes.
+    #[test]
+    fn an_unregistered_copy_leaves_the_next_table() {
+        use crate::watch::PAGE;
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let Some((root, pso)) = pipeline(SOURCE) else {
+            return; // no compiler for the shader here
+        };
+        let (out, at) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let memory = [pool(1), pool(1), pool(1)];
+        let register = |p: usize| {
+            crate::shadow::register(p, p as u64, PAGE as u64);
+            crate::shadow::find(p as u64, PAGE as u64).unwrap()
+        };
+        let (a, b) = (register(memory[0]), register(memory[1]));
+        let list = host.new_list().unwrap();
+        let read = |address: usize| -> Vec<u32> {
+            let map = bind(&list, OURS).expect("a page table");
+            let constants = [address as u32, (address >> 32) as u32, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the mapped output, the GPU done with it.
+            unsafe { std::slice::from_raw_parts(at.cast::<u32>(), 4).to_vec() }
+        };
+        // SAFETY: our pools (a guarded page faults into the handler).
+        let fill = |p: usize, base: u32| {
+            for k in 0..4 {
+                // SAFETY: p points into our pools, which guard their
+                // pages; a faulting page goes to the guard's handler.
+                unsafe { (p as *mut u32).add(k).write_volatile(base + k as u32) };
+            }
+        };
+        // The table names both copies, each read through its own pair.
+        fill(memory[0] + 16, 0x100);
+        fill(memory[1] + 16, 0x200);
+        assert_eq!(read(memory[0] + 16), [0x100, 0x101, 0x102, 0x103]);
+        assert_eq!(read(memory[1] + 16), [0x200, 0x201, 0x202, 0x203]);
+        assert!(pair_of(OURS, &a).is_some());
+        // The title released the first copy between submissions and made
+        // another, whose views may well take the freed pair's slots.
+        crate::shadow::unregister(memory[0], memory[0] as u64);
+        let c = register(memory[2]);
+        fill(memory[2] + 16, 0x300);
+        assert_eq!(read(memory[0] + 16), [0, 0, 0, 0], "memory the freed copy held reads as missing, not the new copy's bytes");
+        assert!(pair_of(OURS, &a).is_none(), "the freed copy's pair is not named");
+        assert_eq!(read(memory[1] + 16), [0x200, 0x201, 0x202, 0x203], "the live copy reads its own bytes");
+        assert_eq!(read(memory[2] + 16), [0x300, 0x301, 0x302, 0x303], "the new copy reads its own bytes");
+        drop(a);
+        crate::shadow::unregister(memory[1], memory[1] as u64);
+        crate::shadow::unregister(memory[2], memory[2] as u64);
+        drop((b, c));
     }
 }

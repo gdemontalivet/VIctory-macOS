@@ -42,6 +42,8 @@ pub(crate) struct HostHeap {
     /// taken, those given back, and where they end.
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
+    /// Null raw SRV for explicitly bound root descriptors. Its UAV is one slot below.
+    null_root_srv: Option<u32>,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
@@ -199,7 +201,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        let h = HostHeap {
+        let mut h = HostHeap {
             heap,
             cpu,
             step,
@@ -210,6 +212,7 @@ impl HostHeap {
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
+            null_root_srv: None,
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
@@ -234,14 +237,27 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
-            h.raw_view_at(null, None, 0, 0, false);
-            h.raw_view_at(null - 1, None, 0, 0, true);
-        } else if !sampler {
-            tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+        if !sampler {
+            let fixed = victory_shader::emit::NULL_BUFFER_VIEW;
+            let null = if fixed > count + extra && fixed < total {
+                Some(fixed)
+            } else {
+                tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
+                // Root descriptors receive a heap index at bind time and can
+                // use a pair inside a capped heap. Keep it for the heap's life.
+                h.pair().map(|first| first + 1)
+            };
+            if let Some(srv) = null {
+                h.raw_view_at(srv, None, 0, 0, false);
+                h.raw_view_at(srv - 1, None, 0, 0, true);
+                h.null_root_srv = Some(srv);
+            }
         }
         Some(h)
+    }
+
+    pub(crate) fn null_root_view(&self, uav: bool) -> Option<u32> {
+        self.null_root_srv.map(|srv| srv - u32::from(uav))
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
@@ -793,12 +809,14 @@ impl HostHeap {
         Some(text)
     }
 
-    /// Slots viewing one of the host textures `textures` (raw pointers),
+    /// Title slots viewing one of the host textures `textures` (raw pointers),
     /// which are given up: each gets a null view of its kind and holds the
     /// texture no more (retired until the running submission has run), its
     /// record stays noted so heap syncs leave it, and the next draw reading
     /// it through a table or shader reading it through the heap (its read
-    /// mark, cleared) makes it again.
+    /// mark, cleared) makes it again. Slots past `count` stay made: recorded
+    /// lists and host copies already name them, and there is no title record
+    /// from which to make them again.
     /// The slots are found by a walk of the heap, once per pass that gives
     /// textures up: a map of each texture's slots, kept at every slot the
     /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
@@ -808,7 +826,11 @@ impl HostHeap {
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             kept.iter()
-                .filter(|(_, k)| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                .filter(|&(i, k)| {
+                    i < self.count as usize
+                        && k.1.is_none()
+                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                })
                 .map(|(i, _)| i as u32)
                 .collect()
         };

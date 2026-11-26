@@ -64,7 +64,11 @@ if [[ ! -f Makefile ]]; then
   echo "configuring CrossOver Wine"
   # The prefix has spaces in it, so autoconf's default site file path would
   # be split at the first one. No site file is needed.
+  # pipe2 is new in macOS 27. With a macOS 27 SDK configure finds it, and
+  # on macOS 26 Wine then calls a missing pipe2 and crashes at its first
+  # start (#50). Wine's fallback, pipe and fcntl, works on every macOS.
   CONFIG_SITE=/dev/null x86 "$SRC/configure" --prefix="$PREFIX" --enable-archs=x86_64 \
+    ac_cv_func_pipe2=no \
     CC="clang -arch x86_64" CXX="clang++ -arch x86_64" \
     CFLAGS="-g -O2 -I$DEPS/include -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion" \
     LDFLAGS="-L$DEPS/lib -Wl,-rpath,@loader_path/../.." \
