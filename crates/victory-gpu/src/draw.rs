@@ -753,7 +753,13 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.used_written,
+                t.write_unknown,
+                compute,
+            );
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1296,7 +1302,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, writes: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -1308,7 +1314,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view, true);
+            readable_entry(list, u, &view, true, writes);
         }
         if !heap.samplers() {
             list.defer_slot(&host.viewed, index);
@@ -1324,7 +1330,23 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        written: &[bool],
+        write_unknown: bool,
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
+        let writes = |u: &UsedResource| -> bool {
+            if write_unknown || !table_uav_write_skip() {
+                return true;
+            }
+            used.iter()
+                .position(|x| std::ptr::eq(x, u))
+                .and_then(|i| written.get(i).copied())
+                .unwrap_or(true)
+        };
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
@@ -1352,7 +1374,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, writes(u));
             }
         }
         let mut made = Vec::new();
@@ -1391,7 +1413,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view, true);
+                        readable_entry(list, u, &view, true, writes(u));
                     }
                 }
                 made.push((slot, first * 32));
@@ -1413,18 +1435,18 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used_entry = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
                 match view.as_deref() {
                     Some(view) => {
                         host.make_at(index, view);
-                        if let Some(u) = used {
-                            readable(list, u, view, true);
+                        if let Some(u) = used_entry {
+                            readable_entry(list, u, view, true, writes(u));
                         }
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if used_entry.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
@@ -1951,11 +1973,25 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+/// Whether table UAV buffer writebacks are skipped for descriptors a shader
+/// never stores to (`VICTORY_TABLE_UAV_WRITE_SKIP=0` disables; on by default).
+fn table_uav_write_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_TABLE_UAV_WRITE_SKIP") {
+        Some(v) => crate::switch::value_is_on(Some(&v)),
+        None => true,
+    })
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. `marked`: a shader's
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
+    readable_entry(list, u, view, marked, true);
+}
+
+fn readable_entry(list: &HostList, u: &UsedResource, view: &View, marked: bool, writes: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1974,14 +2010,14 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     if let Some((shadow, address, len)) = range
         && len > 0
     {
-        let uav = u.kind == ResourceType::Uav;
-        let (refresh_at, refresh_len) = if uav && marked && shadow.marked() {
+        let uav_writes = u.kind == ResourceType::Uav && writes;
+        let (refresh_at, refresh_len) = if uav_writes && marked && shadow.marked() {
             shadow.page_range(address, len)
         } else {
             (address, len)
         };
         shadow.refresh(list, refresh_at, refresh_len);
-        if uav {
+        if uav_writes {
             shadow.gpu_writes(list, address, len, marked);
         } else if u.kind == ResourceType::Srv && crate::descriptor::host::three_channel_srv(view) {
             for widened in
@@ -3353,7 +3389,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
         state.set_table(true, 0, title_heap.start);
         assert!(
             state
-                .tables(&list, &[used(ResourceType::Srv)], true)
+                .tables(&list, &[used(ResourceType::Srv)], &[false], false, true)
                 .is_empty(),
             "an in-place table"
         );
@@ -4173,6 +4209,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::pipeline::Translated {
                 host: host_shader,
                 used: used_entries,
+                used_written: Vec::new(),
+                write_unknown: true,
             },
         );
         let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
