@@ -1154,21 +1154,21 @@ pub(crate) mod tests {
         crate::shadow::register(p, p as u64, crate::watch::PAGE as u64);
         let shadow = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("shadow");
 
-        // First refresh bumps epoch and queues 1 deferred step; identical repeat does neither.
+        // First refresh queues 1 deferred step without invalidating other
+        // already-recorded read entries; identical repeat adds no step.
         list.defer_refresh(&shadow, p, 256);
-        let after_first = list.epoch();
-        assert_ne!(after_first, start_epoch);
+        assert_eq!(list.epoch(), start_epoch);
         assert_eq!(list.deferred_steps(), 1);
 
         list.defer_refresh(&shadow, p, 256);
-        assert_eq!(list.epoch(), after_first, "deduplicated refresh keeps epoch");
+        assert_eq!(list.epoch(), start_epoch, "deduplicated refresh keeps epoch");
         assert_eq!(list.deferred_steps(), 1, "deduplicated refresh adds no step");
 
         // Deferred copy bumps epoch, adds a step, and clears refresh dedup.
         let src = [0x22u8; 16];
         list.defer_copy(p as *mut u8, src.as_ptr(), src.len());
         let after_copy = list.epoch();
-        assert_ne!(after_copy, after_first);
+        assert_ne!(after_copy, start_epoch);
         assert_eq!(list.deferred_steps(), 2);
 
         // need_rebind and defer_gpu_write each bump epoch.
@@ -2743,7 +2743,6 @@ impl HostList {
                     copy.stamp();
                 }
                 v.insert((wanted, wanted, copy.clone()));
-                self.changed_something();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -3169,7 +3168,6 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
-        self.changed_something();
     }
 
     /// Host GPU address of scratch memory holding `len` bytes from `src` as of
@@ -3185,7 +3183,6 @@ impl HostList {
             .copies
             .push(Step::Fill(to as usize, src as usize, len as usize));
         deferred.filled_scratch.insert(key, gpu);
-        self.changed_something();
         Some(gpu)
     }
 
@@ -3204,7 +3201,6 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
-            self.changed_something();
         }
     }
 
@@ -3219,7 +3215,6 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
         if deferred.slots.insert(key) {
             deferred.copies.push(Step::Slot(viewed.clone(), index));
-            self.changed_something();
         }
     }
 
@@ -3248,7 +3243,6 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
             deferred.copies.push(Step::Heap(viewed.clone()));
-            self.changed_something();
         }
     }
 
@@ -3256,7 +3250,6 @@ impl HostList {
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
         self.deferred().copies.push(Step::Memory(heap));
-        self.changed_something();
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -3269,13 +3262,11 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
-        self.changed_something();
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
-        self.changed_something();
     }
 
     /// A memory value the list waits for before it starts.
@@ -3467,7 +3458,6 @@ impl HostList {
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
         self.deferred().copies.push(Step::Texture(staging, copy));
-        self.changed_something();
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
