@@ -376,6 +376,57 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+/// Minimum starting address for our own whole-section and fallback views under
+/// Wine (`2 TiB`): above the title's 40-bit address space (`< 1 TiB`) and
+/// above Metal's `~1 TiB` host GPU heaps on macOS, so an unpatched Wine's
+/// `try_map_free_area` does not step 64 KiB at a time across `< 4 GiB` or
+/// gigabytes of host mappings while holding `virtual_mutex`.
+const OWN_VIEW_FLOOR: usize = 2 << 40;
+
+/// Maps `[offset, offset + size)` of `section` writable for our own CPU writes
+/// (DirectStorage destinations), starting at or above [`OWN_VIEW_FLOOR`] under
+/// Wine and falling back to [`MapViewOfFile`] if the host refuses the hint.
+unsafe fn map_own_view(section: HANDLE, offset: u64, size: usize) -> MEMORY_MAPPED_VIEW_ADDRESS {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    if on_wine() {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: OWN_VIEW_FLOOR as *mut c_void,
+            HighestEndingAddress: std::ptr::null_mut(),
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: caller owns `section`; `parameter` points at `requirements`,
+        // which outlives the call.
+        let view = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                std::ptr::null(),
+                offset,
+                size,
+                0,
+                PAGE_READWRITE,
+                &mut parameter,
+                1,
+            )
+        };
+        if !view.Value.is_null() {
+            return view;
+        }
+    }
+    // SAFETY: caller owns `section`.
+    unsafe {
+        MapViewOfFile(
+            section,
+            FILE_MAP_WRITE,
+            (offset >> 32) as u32,
+            offset as u32,
+            size,
+        )
+    }
+}
 
 struct Section {
     handle: HANDLE,
@@ -407,10 +458,9 @@ impl Section {
         if let Some(shared) = &self.shared {
             return Some(shared.cpu_address());
         }
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let at = *self.whole.get_or_init(|| {
             // SAFETY: our section; the view is ours until the section drops.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.size) }.Value as usize
+            unsafe { map_own_view(self.handle, 0, self.size) }.Value as usize
         });
         (at != 0).then_some(at)
     }
@@ -638,7 +688,6 @@ struct View {
 impl View {
     /// `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         let section = slice.section.clone();
         if let Some(whole) = section.whole() {
@@ -651,15 +700,7 @@ impl View {
             });
         }
         // SAFETY: slices of a section we own; the view is ours until dropped.
-        let own = unsafe {
-            MapViewOfFile(
-                section.handle,
-                FILE_MAP_WRITE,
-                (offset >> 32) as u32,
-                offset as u32,
-                len,
-            )
-        };
+        let own = unsafe { map_own_view(section.handle, offset, len) };
         if own.Value.is_null() {
             return None;
         }
@@ -1700,6 +1741,32 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert!(section.upgrade().is_none());
     }
+
+    #[test]
+    fn own_section_views_start_above_two_tib_under_wine() {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        let pages = allocate(2);
+        let slice = physical().pages.get(&pages[1]).cloned().expect("known page");
+        let whole = slice.section.whole().expect("whole view");
+        // SAFETY: our section's second page, mapped and unmapped here to cover
+        // the per-slice `View::map` fallback path as well.
+        let fallback = unsafe { map_own_view(slice.section.handle, PAGE as u64, PAGE) };
+        assert!(!fallback.Value.is_null());
+        if on_wine() {
+            assert!(
+                whole >= OWN_VIEW_FLOOR,
+                "whole view {whole:#x} below {OWN_VIEW_FLOOR:#x}"
+            );
+            assert!(
+                fallback.Value as usize >= OWN_VIEW_FLOOR,
+                "fallback view {:p} below {OWN_VIEW_FLOOR:#x}",
+                fallback.Value
+            );
+        }
+        // SAFETY: mapped just above.
+        unsafe { UnmapViewOfFile(fallback) };
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
 }
 
 /// The space below 4 GiB, which the title's 32-bit memory (`XMemVirtualAlloc`
@@ -1713,8 +1780,10 @@ const FOUR_GIB: usize = 1 << 32;
 /// 32-bit placeholder at startup, the request was refused
 /// (`ERROR_NOT_ENOUGH_MEMORY`) and the title stopped at an assertion. The
 /// debug layer's memory did the same. So the free space below 4 GiB is
-/// reserved at startup, past [`low_guards::SLACK`] left for the host, and a
-/// 32-bit request that finds no room releases guards and tries again.
+/// reserved at startup, past [`low_guards::SLACK`] (or
+/// [`low_guards::WINE_SLACK`] under Wine) left for the host, and a 32-bit
+/// request that finds no room releases guards and tries again.
+/// `VICTORY_LOW_GUARDS=0` (`false`, `off`) disables these guards.
 pub mod low_guards {
     use std::sync::Mutex;
 
@@ -1725,8 +1794,17 @@ pub mod low_guards {
 
     use super::FOUR_GIB;
 
-    /// Free space left to the host below 4 GiB (the lowest free space).
+    /// Free space left to the host below 4 GiB on native Windows (the lowest
+    /// free space).
     pub(crate) const SLACK: usize = 256 << 20;
+    /// Free space left to the host below 4 GiB under Wine (`2.75 GiB`). Host
+    /// GPU drivers such as D3DMetal/Metal allocate outside Wine above 4 GiB,
+    /// while Wine's own heap segments and thread stacks search bottom-up from
+    /// `0x10000`: leaving 2.75 GiB at the bottom keeps them out of gigabytes
+    /// of host mappings on unpatched Wine (`try_map_free_area` under
+    /// `virtual_mutex`), while reserving the top `~1 GiB` below 4 GiB for the
+    /// title's 32-bit `XMemVirtualAlloc` requests.
+    pub(crate) const WINE_SLACK: usize = 2816 << 20;
     /// The allocation granularity of Windows.
     const GRANULE: usize = 64 << 10;
 
@@ -1735,6 +1813,34 @@ pub mod low_guards {
 
     fn guards() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
         GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `VICTORY_LOW_GUARDS` leaves low-address guards enabled.
+    fn enabled_from(value: Option<&str>) -> bool {
+        !value.is_some_and(|v| {
+            let v = v.trim();
+            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        })
+    }
+
+    /// Low-address slack to leave unguarded at the bottom of `< 4 GiB`.
+    const fn slack_for(wine: bool) -> usize {
+        if wine { WINE_SLACK } else { SLACK }
+    }
+
+    /// Skips the lowest `slack` free bytes across ascending `runs` so the
+    /// free headroom stays at the bottom of `< 4 GiB` and the guarded region
+    /// sits at the top.
+    fn plan_guards(runs: &[(usize, usize)], mut slack: usize) -> Vec<(usize, usize)> {
+        let mut planned = Vec::new();
+        for &(mut base, mut bytes) in runs {
+            let left = slack.min(bytes);
+            (base, bytes, slack) = (base + left, bytes - left, slack - left);
+            if bytes > 0 {
+                planned.push((base, bytes));
+            }
+        }
+        planned
     }
 
     /// The free runs in `[from, to)`, granule-aligned.
@@ -1771,15 +1877,18 @@ pub mod low_guards {
         at as usize == base
     }
 
-    /// Reserves the free space below 4 GiB but the lowest [`SLACK`]. Call
-    /// once, before the host allocates much (the GPU device, the caches).
+    /// Reserves the free space below 4 GiB past the lowest [`SLACK`] (or
+    /// [`WINE_SLACK`] under Wine). Call once, before the host allocates much
+    /// (the GPU device, the caches).
     pub fn install() {
+        if !enabled_from(std::env::var("VICTORY_LOW_GUARDS").ok().as_deref()) {
+            tracing::info!("space below 4 GiB left unguarded (VICTORY_LOW_GUARDS)");
+            return;
+        }
         let mut guards = guards();
-        let mut slack = SLACK;
-        for (mut base, mut bytes) in free_runs(0, FOUR_GIB) {
-            let left = slack.min(bytes);
-            (base, bytes, slack) = (base + left, bytes - left, slack - left);
-            if bytes > 0 && guard(base, bytes) {
+        let slack = slack_for(super::on_wine());
+        for (base, bytes) in plan_guards(&free_runs(0, FOUR_GIB), slack) {
+            if guard(base, bytes) {
                 guards.push((base, bytes));
             }
         }
@@ -1787,6 +1896,7 @@ pub mod low_guards {
         tracing::info!(
             guards = guards.len(),
             mb = total >> 20,
+            slack_mb = slack >> 20,
             "space below 4 GiB kept for the title"
         );
     }
@@ -1836,6 +1946,34 @@ pub mod low_guards {
         use super::*;
 
         static TEST: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn switch_and_wine_slack_leave_bottom_free_and_guard_top_gib() {
+            assert!(enabled_from(None));
+            assert!(enabled_from(Some("")));
+            assert!(enabled_from(Some("1")));
+            assert!(enabled_from(Some("true")));
+            assert!(enabled_from(Some("on")));
+            for off in ["0", "false", "FALSE", "off", "Off", " 0 "] {
+                assert!(!enabled_from(Some(off)), "{off:?}");
+            }
+            assert_eq!(slack_for(false), 256 << 20);
+            assert_eq!(slack_for(true), 2816 << 20);
+
+            // Across two free runs below 4 GiB (~4,073 MiB total, as at Wine
+            // startup), `plan_guards` leaves the lowest 2,816 MiB unguarded
+            // for bottom-up allocations and guards the top >1 GiB up to 4 GiB.
+            let runs = [
+                (GRANULE, (2047 << 20) - GRANULE),
+                (2048 << 20, (2048 << 20) - GRANULE),
+            ];
+            let planned = plan_guards(&runs, WINE_SLACK);
+            assert_eq!(planned.len(), 1);
+            let (guard_base, guard_len) = planned[0];
+            assert_eq!(guard_base + guard_len, FOUR_GIB - GRANULE);
+            assert!(guard_base > (2816 << 20));
+            assert!(guard_len >= (1024 << 20));
+        }
 
         #[test]
         fn a_refused_retry_leaves_the_guards_in_place() {
