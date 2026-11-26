@@ -19,6 +19,8 @@
 #[cfg(windows)]
 mod alias;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;

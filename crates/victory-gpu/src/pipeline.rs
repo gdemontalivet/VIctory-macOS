@@ -74,6 +74,9 @@ pub(crate) struct Shader {
     /// (`VICTORY_SPILL_SHADERS`, [`spill`]).
     #[cfg(windows)]
     spilled: OnceLock<[u8; 32]>,
+    /// Its part in the stand-in for the indirect light (`crate::ambient`).
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -175,6 +178,10 @@ impl Shader {
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             spilled: OnceLock::new(),
+            #[cfg(windows)]
+            ambient: (stage == "compute")
+                .then(|| crate::ambient::role(bytes))
+                .flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -382,6 +389,7 @@ impl Shader {
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
+            ambient: self.ambient,
             translated: cell,
         })
     }
@@ -521,6 +529,23 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).
@@ -531,7 +556,6 @@ pub(crate) fn held_back(this: This) -> bool {
 
 /// Whether the title's acceleration-structure builder runs this frame.
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) fn builder_runs() -> bool {
     builder::runs()
 }
