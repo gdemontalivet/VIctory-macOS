@@ -16,8 +16,15 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// Maximum number of target readbacks recorded during the single probed frame.
+/// Default maximum number of target readbacks recorded during the probed frame.
 pub(crate) const MAX_PROBES: usize = 80;
+
+/// Maximum extra frames to keep waiting if the target frame executes only
+/// pre-recorded command lists (recorded one frame ahead by pipelined workers).
+const MAX_WAIT_FRAMES: u64 = 4;
+
+/// Maximum probes configurable via `VICTORY_HDR_PROBE_MAX`.
+const MAX_PROBES_LIMIT: usize = 512;
 
 /// Draw-count threshold identifying the first rendered 3D world frame
 /// (matches `capture::presented`).
@@ -344,6 +351,17 @@ pub(crate) fn enabled() -> bool {
     configured_offset().is_some()
 }
 
+/// Configured probe cap (`VICTORY_HDR_PROBE_MAX`, defaults to [`MAX_PROBES`]).
+fn configured_max_probes() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_HDR_PROBE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(MAX_PROBES, |n| n.clamp(1, MAX_PROBES_LIMIT))
+    })
+}
+
 /// Sentinel indicating the target frame has not yet been armed.
 const UNARMED: u64 = u64::MAX;
 
@@ -354,6 +372,11 @@ struct ProbeClock {
     target_frame: AtomicU64,
     done: AtomicBool,
     probed: AtomicUsize,
+    skipped_no_copy: AtomicUsize,
+    skipped_twin: AtomicUsize,
+    skipped_dim_or_msaa: AtomicUsize,
+    skipped_format: AtomicUsize,
+    skipped_copy: AtomicUsize,
 }
 
 impl ProbeClock {
@@ -364,11 +387,16 @@ impl ProbeClock {
             target_frame: AtomicU64::new(UNARMED),
             done: AtomicBool::new(false),
             probed: AtomicUsize::new(0),
+            skipped_no_copy: AtomicUsize::new(0),
+            skipped_twin: AtomicUsize::new(0),
+            skipped_dim_or_msaa: AtomicUsize::new(0),
+            skipped_format: AtomicUsize::new(0),
+            skipped_copy: AtomicUsize::new(0),
         }
     }
 
     /// Updates state on presentation of `frame` with cumulative `total_drawn`.
-    fn on_present(&self, offset: u64, frame: u64, total_drawn: u64) {
+    fn on_present(&self, offset: u64, max_probes: usize, frame: u64, total_drawn: u64) {
         if self.done.load(Ordering::Relaxed) {
             return;
         }
@@ -386,18 +414,39 @@ impl ProbeClock {
                     world_first = frame,
                     target_frame = armed,
                     world_offset = offset,
-                    max_probes = MAX_PROBES,
+                    max_probes,
                     "VICTORY_HDR_PROBE armed"
                 );
             }
             return;
         }
-        if frame >= target && !self.done.swap(true, Ordering::Relaxed) {
+        if frame < target {
+            return;
+        }
+        let probed = self.probed.load(Ordering::Relaxed).min(max_probes);
+        // Pipelined titles can finish recording frame N's command lists during
+        // frame N-1, leaving 0 newly recorded passes on frame N itself. Keep
+        // the probe armed until at least one pass is recorded (bounded by
+        // `MAX_WAIT_FRAMES`).
+        if probed == 0 && frame < target.saturating_add(MAX_WAIT_FRAMES) {
+            tracing::info!(
+                frame,
+                target_frame = target,
+                "VICTORY_HDR_PROBE waiting for newly recorded passes (frame used pre-recorded command lists)"
+            );
+            return;
+        }
+        if !self.done.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 frame,
                 world_first = self.world_start.load(Ordering::Relaxed),
-                probed = self.probed.load(Ordering::Relaxed).min(MAX_PROBES),
-                max_probes = MAX_PROBES,
+                probed,
+                max_probes,
+                skipped_no_copy = self.skipped_no_copy.load(Ordering::Relaxed),
+                skipped_twin = self.skipped_twin.load(Ordering::Relaxed),
+                skipped_dim_or_msaa = self.skipped_dim_or_msaa.load(Ordering::Relaxed),
+                skipped_format = self.skipped_format.load(Ordering::Relaxed),
+                skipped_copy = self.skipped_copy.load(Ordering::Relaxed),
                 "VICTORY_HDR_PROBE complete"
             );
         }
@@ -405,18 +454,18 @@ impl ProbeClock {
 
     /// Whether probes should be recorded while building `next_frame`.
     #[inline]
-    fn active(&self, next_frame: u64) -> bool {
+    fn active(&self, next_frame: u64, max_probes: usize) -> bool {
         if self.done.load(Ordering::Relaxed) {
             return false;
         }
         let target = self.target_frame.load(Ordering::Relaxed);
-        target != UNARMED && next_frame == target && self.probed.load(Ordering::Relaxed) < MAX_PROBES
+        target != UNARMED && next_frame >= target && self.probed.load(Ordering::Relaxed) < max_probes
     }
 
-    /// Reserves the next pass index (`0..MAX_PROBES`), or `None` if capped.
-    fn reserve(&self) -> Option<usize> {
+    /// Reserves the next pass index (`0..max_probes`), or `None` if capped.
+    fn reserve(&self, max_probes: usize) -> Option<usize> {
         let idx = self.probed.fetch_add(1, Ordering::Relaxed);
-        (idx < MAX_PROBES).then_some(idx)
+        (idx < max_probes).then_some(idx)
     }
 
     fn world_offset(&self, frame: u64) -> u64 {
@@ -437,15 +486,15 @@ pub(crate) fn on_present(frame: u64) {
     let Some(offset) = configured_offset() else {
         return;
     };
-    CLOCK.on_present(offset, frame, crate::draw::drawn());
+    CLOCK.on_present(offset, configured_max_probes(), frame, crate::draw::drawn());
 }
 
 /// Fast check: `true` only while recording the single targeted world frame
-/// and still under [`MAX_PROBES`].
+/// and still under the probe cap.
 #[cfg(windows)]
 #[inline]
 pub(crate) fn active() -> bool {
-    enabled() && CLOCK.active(crate::queue::presented() + 1)
+    enabled() && CLOCK.active(crate::queue::presented() + 1, configured_max_probes())
 }
 
 /// Records an inline slice-0 readback of `resource` into `list` and logs one
@@ -458,30 +507,66 @@ pub(crate) fn probe_texture(
     kind: &'static str,
     shaders: &str,
 ) {
-    use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-
     if resource.is_null() || !active() {
         return;
     }
-    let (Some(host), Some(copy)) = (crate::host::host(), crate::resource::host_copy(resource))
-    else {
+    probe_texture_with_clock(
+        &CLOCK,
+        configured_max_probes(),
+        list,
+        resource,
+        restore_state,
+        kind,
+        shaders,
+        None,
+    );
+}
+
+#[cfg(windows)]
+type ProbeSink = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, HdrStats)>>>;
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn probe_texture_with_clock(
+    clock: &ProbeClock,
+    max_probes: usize,
+    list: &crate::host::HostList,
+    resource: crate::object::This,
+    restore_state: u32,
+    kind: &'static str,
+    shaders: &str,
+    sink: Option<ProbeSink>,
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    if resource.is_null() {
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        clock.skipped_no_copy.fetch_add(1, Ordering::Relaxed);
         return;
     };
     // Skip depth textures with writable twins so twin state routing stays untouched.
     if copy.twin.get().and_then(Option::as_ref).is_some() {
+        clock.skipped_twin.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let texture = &copy.texture;
     // SAFETY: `texture` is a live D3D12 resource held by `copy`.
     let desc = unsafe { texture.GetDesc() };
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.SampleDesc.Count > 1 {
+        clock.skipped_dim_or_msaa.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let Some(info) = format_info(desc.Format.0 as u32) else {
+        clock.skipped_format.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let Some(pass_idx) = CLOCK.reserve() else {
+    let Some(pass_idx) = clock.reserve(max_probes) else {
         return;
     };
 
@@ -511,6 +596,7 @@ pub(crate) fn probe_texture(
         );
     }
     if total == 0 {
+        clock.skipped_copy.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -544,6 +630,7 @@ pub(crate) fn probe_texture(
         )
     };
     let (Ok(()), Some(buffer)) = (created, buffer) else {
+        clock.skipped_copy.fetch_add(1, Ordering::Relaxed);
         return;
     };
 
@@ -599,7 +686,7 @@ pub(crate) fn probe_texture(
     let pitch = footprint.Footprint.RowPitch as usize;
     let res_addr = resource as usize;
     let frame = crate::queue::presented() + 1;
-    let world_offset = CLOCK.world_offset(frame);
+    let world_offset = clock.world_offset(frame);
 
     list.defer_after(move || {
         let mut data = std::ptr::null_mut();
@@ -611,6 +698,9 @@ pub(crate) fn probe_texture(
             let len = pitch.saturating_mul(height);
             let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
             if let Some(s) = compute_stats(format, width, height, pitch, rows) {
+                if let Some(sink) = &sink {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push((kind, s));
+                }
                 tracing::info!(
                     target: "victory_gpu::hdr_probe",
                     pass_idx,
@@ -801,26 +891,311 @@ mod tests {
 
         let clock = ProbeClock::new();
         // Loading frames (< 500 draws): never armed.
-        clock.on_present(24, 100, 120);
-        assert!(!clock.active(101));
+        clock.on_present(24, MAX_PROBES, 100, 120);
+        assert!(!clock.active(101, MAX_PROBES));
 
         // First world frame (frame 3406, +800 draws) arms target = 3430.
-        clock.on_present(24, 3406, 920);
-        assert!(!clock.active(3407));
-        assert!(!clock.active(3429));
-        assert!(clock.active(3430));
+        clock.on_present(24, MAX_PROBES, 3406, 920);
+        assert!(!clock.active(3407, MAX_PROBES));
+        assert!(!clock.active(3429, MAX_PROBES));
+        assert!(clock.active(3430, MAX_PROBES));
         assert_eq!(clock.world_offset(3430), 24);
+
+        // Pipelined frame 3430 executed pre-recorded lists (0 newly recorded
+        // probes): clock must remain armed for frame 3431 instead of finishing
+        // with `probed=0`.
+        clock.on_present(24, MAX_PROBES, 3430, 1500);
+        assert!(clock.active(3431, MAX_PROBES));
 
         // Cap enforces MAX_PROBES.
         for i in 0..MAX_PROBES {
-            assert_eq!(clock.reserve(), Some(i));
+            assert_eq!(clock.reserve(MAX_PROBES), Some(i));
         }
-        assert_eq!(clock.reserve(), None);
-        assert!(!clock.active(3430));
+        assert_eq!(clock.reserve(MAX_PROBES), None);
+        assert!(!clock.active(3431, MAX_PROBES));
 
-        // Presenting target frame marks done permanently.
-        clock.on_present(24, 3430, 50_000);
-        assert!(!clock.active(3430));
-        assert!(!clock.active(3431));
+        // Presenting frame 3431 with probes recorded marks done permanently.
+        clock.on_present(24, MAX_PROBES, 3431, 50_000);
+        assert!(!clock.active(3431, MAX_PROBES));
+        assert!(!clock.active(3432, MAX_PROBES));
+
+        // Safety bound: even if a scene never records any probes, clock disarms
+        // after `MAX_WAIT_FRAMES` frames past target.
+        let idle = ProbeClock::new();
+        idle.on_present(2, 10, 100, 600);
+        for f in 102..102 + MAX_WAIT_FRAMES {
+            idle.on_present(2, 10, f, 600);
+            assert!(idle.active(f + 1, 10), "still waiting after frame {f}");
+        }
+        idle.on_present(2, 10, 102 + MAX_WAIT_FRAMES, 600);
+        assert!(!idle.active(103 + MAX_WAIT_FRAMES, 10));
+    }
+
+    /// End-to-end live GPU test (D3DMetal under Wine): executes a real graphics
+    /// pass (`OMSetRenderTargets` + `DrawInstanced` into an `R16G16B16A16_FLOAT`
+    /// RT) AND a real compute pass (`Dispatch` writing an `R16G16B16A16_FLOAT`
+    /// UAV with `NaN`, `+Inf`, and `>100` radiance), verifying both probes fire
+    /// (`probed >= 2`) and report exact HDR stats.
+    #[cfg(windows)]
+    #[test]
+    fn d3dmetal_probes_graphics_rtv_and_compute_uav_hdr_passes() {
+        use std::sync::{Arc, Mutex};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::*;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+
+        const GFX_HLSL: &str = r#"
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps() : SV_Target {
+    return float4(2.0, 200.0, -1.5, 0.5);
+}
+"#;
+        const CS_HLSL: &str = r#"
+RWTexture2D<float4> out_tex : register(u0);
+[numthreads(4, 4, 1)]
+void cs(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x == 0 && tid.y == 0) {
+        out_tex[tid.xy] = float4(asfloat(0x7fc00000u), asfloat(0x7f800000u), 150.0, 1.0);
+    } else {
+        out_tex[tid.xy] = float4(1.0, 4.0, 12.0, 0.25);
+    }
+}
+"#;
+        let compile = |src: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR| {
+            let mut blob: Option<ID3DBlob> = None;
+            let mut errs: Option<ID3DBlob> = None;
+            // SAFETY: valid source slice and NUL-terminated entry/target strings.
+            let hr = unsafe {
+                D3DCompile(
+                    src.as_ptr().cast(),
+                    src.len(),
+                    s!("hdr_probe_test"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut blob,
+                    Some(&mut errs),
+                )
+            };
+            assert!(hr.is_ok(), "D3DCompile failed: {hr:?}");
+            blob.unwrap()
+        };
+
+        let vs = compile(GFX_HLSL, s!("vs"), s!("vs_5_1"));
+        let ps = compile(GFX_HLSL, s!("ps"), s!("ps_5_1"));
+        let cs = compile(CS_HLSL, s!("cs"), s!("cs_5_1"));
+
+        // SAFETY: reading bytes from live compiled ID3DBlobs.
+        let bytecode = |b: &ID3DBlob| unsafe {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            }
+        };
+
+        // Graphics root signature (empty) and PSO targeting R16G16B16A16_FLOAT.
+        let gfx_root = crate::compute::root_signature(&host.device, &[]).unwrap();
+        let mut gfx_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed for CreateGraphicsPipelineState.
+            pRootSignature: unsafe { std::mem::transmute_copy(&gfx_root) },
+            VS: bytecode(&vs),
+            PS: bytecode(&ps),
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        gfx_desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        gfx_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        gfx_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        gfx_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        // SAFETY: valid graphics PSO description on live host device.
+        let gfx_pso: ID3D12PipelineState =
+            unsafe { host.device.CreateGraphicsPipelineState(&gfx_desc) }.unwrap();
+
+        // Compute root signature (serialized via `crate::compute`) and PSO.
+        let cs_root = crate::compute::root_signature(
+            &host.device,
+            &[crate::compute::Param::Table(&[crate::compute::uav(0, 1)])],
+        )
+        .unwrap();
+        // SAFETY: valid compute PSO description with live root signature and CS blob.
+        let cs_pso: ID3D12PipelineState = unsafe {
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&cs_root),
+                CS: bytecode(&cs),
+                ..Default::default()
+            };
+            host.device.CreateComputePipelineState(&desc).unwrap()
+        };
+
+        // Real title textures (R16G16B16A16_FLOAT = 10; ALLOW_RENDER_TARGET = 1, ALLOW_UAV = 4).
+        let rt_res = crate::resource::test_texture_2d(4, 4, 10, 1);
+        let uav_res = crate::resource::test_texture_2d(4, 4, 10, 4);
+        let rt_host = crate::resource::host_resource(rt_res).expect("rt host texture");
+        let uav_host = crate::resource::host_resource(uav_res).expect("uav host texture");
+
+        // Descriptor heaps for the RTV and the compute UAV.
+        // SAFETY: plain descriptor heap creation on live host device.
+        let (rtv_heap, uav_heap): (ID3D12DescriptorHeap, ID3D12DescriptorHeap) = unsafe {
+            let rtv: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let uav: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .unwrap();
+            host.device
+                .CreateRenderTargetView(&rt_host, None, rtv.GetCPUDescriptorHandleForHeapStart());
+            let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            host.device.CreateUnorderedAccessView(
+                &uav_host,
+                None,
+                Some(&uav_desc),
+                uav.GetCPUDescriptorHandleForHeapStart(),
+            );
+            (rtv, uav)
+        };
+
+        let clock = ProbeClock::new();
+        let results: Arc<Mutex<Vec<(&'static str, HdrStats)>>> = Arc::new(Mutex::new(Vec::new()));
+        let list = host.new_list().unwrap();
+
+        const RENDER_TARGET: u32 = 0x4;
+        const UNORDERED: u32 = 0x8;
+        crate::list::ensure_state(&list, rt_res, RENDER_TARGET);
+        // SAFETY: open command list, live PSO/root/RTV heap.
+        unsafe {
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            let vp = D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: 4.0,
+                Height: 4.0,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            let sc = RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            };
+            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.list.RSSetViewports(&[vp]);
+            list.list.RSSetScissorRects(&[sc]);
+            list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.list.SetGraphicsRootSignature(&gfx_root);
+            list.list.SetPipelineState(&gfx_pso);
+            list.list.DrawInstanced(3, 1, 0, 0);
+        }
+        probe_texture_with_clock(
+            &clock,
+            MAX_PROBES,
+            &list,
+            rt_res,
+            RENDER_TARGET,
+            "rtv",
+            "[vs synthetic, ps synthetic]",
+            Some(Arc::clone(&results)),
+        );
+
+        crate::list::ensure_state(&list, uav_res, UNORDERED);
+        // SAFETY: open command list, live compute PSO/root/UAV descriptor heap.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(uav_heap.clone())]);
+            list.list.SetComputeRootSignature(&cs_root);
+            list.list
+                .SetComputeRootDescriptorTable(0, uav_heap.GetGPUDescriptorHandleForHeapStart());
+            list.list.SetPipelineState(&cs_pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        probe_texture_with_clock(
+            &clock,
+            MAX_PROBES,
+            &list,
+            uav_res,
+            UNORDERED,
+            "uav",
+            "[cs synthetic]",
+            Some(Arc::clone(&results)),
+        );
+
+        list.close();
+        host.execute(&[&list]);
+
+        assert!(
+            clock.probed.load(Ordering::Relaxed) >= 2,
+            "expected >= 2 probes (rtv + uav)"
+        );
+        let captured = results.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(captured.len(), 2, "both graphics RTV and compute UAV passes must report stats");
+
+        let (rt_kind, rt_stats) = captured[0];
+        assert_eq!(rt_kind, "rtv");
+        assert_eq!(rt_stats.nan_count, 0);
+        assert_eq!(rt_stats.inf_count, 0);
+        assert_eq!(rt_stats.neg_count, 16);
+        assert_eq!(rt_stats.gt100_count, 16);
+        approx(rt_stats.min, -1.5, 1e-3);
+        approx(rt_stats.p50, 2.0, 1e-3);
+        approx(rt_stats.p95, 200.0, 1e-2);
+        approx(rt_stats.max, 200.0, 1e-2);
+        approx(rt_stats.center[0], 2.0, 1e-3);
+        approx(rt_stats.center[1], 200.0, 1e-2);
+        approx(rt_stats.center[2], -1.5, 1e-3);
+        approx(rt_stats.center[3], 0.5, 1e-3);
+
+        let (uav_kind, uav_stats) = captured[1];
+        assert_eq!(uav_kind, "uav");
+        assert_eq!(uav_stats.nan_count, 1);
+        assert_eq!(uav_stats.inf_count, 1);
+        assert_eq!(uav_stats.neg_count, 0);
+        assert_eq!(uav_stats.gt100_count, 1);
+        approx(uav_stats.min, 1.0, 1e-3);
+        approx(uav_stats.p50, 4.0, 1e-3);
+        approx(uav_stats.p95, 12.0, 1e-2);
+        approx(uav_stats.max, 150.0, 1e-2);
+        approx(uav_stats.center[0], 1.0, 1e-3);
+        approx(uav_stats.center[1], 4.0, 1e-3);
+        approx(uav_stats.center[2], 12.0, 1e-2);
+        approx(uav_stats.center[3], 0.25, 1e-3);
+
+        let release = |o: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o)
+        };
+        assert_eq!(release(rt_res), 0);
+        assert_eq!(release(uav_res), 0);
     }
 }

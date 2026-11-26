@@ -1261,7 +1261,9 @@ impl State {
                 else {
                     continue;
                 };
-                let View::Unordered(r, ..) = &*view else {
+                let placed = crate::descriptor::host::placed_texture(&view);
+                let view = placed.as_ref().unwrap_or(&view);
+                let View::Unordered(r, ..) = view else {
                     continue;
                 };
                 let key = (self.pipeline, *r);
