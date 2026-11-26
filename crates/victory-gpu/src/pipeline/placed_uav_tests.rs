@@ -88,6 +88,8 @@ fn store_shader() -> Arc<Shader> {
         })),
         #[cfg(windows)]
         ambient: None,
+        #[cfg(windows)]
+        without_bvh: None,
     })
 }
 

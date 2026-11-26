@@ -94,6 +94,12 @@ fn allow_halves() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_BVH_BUILDER"))
 }
 
+/// Whether the builder cannot run on this host at all (32-lane waves without
+/// `VICTORY_BVH_BUILDER=1`), even before its pipelines are created.
+pub(crate) fn disabled() -> bool {
+    crate::host::host().is_some_and(crate::host::Host::wave32) && !allow_halves()
+}
+
 /// Whether the builder's dispatches run in the current frame: decided once
 /// per frame, so that a frame never runs part of the builder.
 pub(crate) fn runs() -> bool {
