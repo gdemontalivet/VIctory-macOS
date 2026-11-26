@@ -696,30 +696,31 @@ impl<'a> Lower<'a> {
                     )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
+            }) || (!x.native.wave64 && reads_exec_scc(p))
+                || {
+                    // Masks held as numbers or constant lane sets: the lane
+                    // tests its own bit by its console lane.
+                    let whens = x.st.exits.iter().filter_map(|e| match *e {
+                        LaneExit::Branch { when, .. } => Some(when),
+                        _ => None,
+                    });
+                    let mut all: Vec<Bool> =
+                        x.st.guards
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .copied()
+                            .chain(whens)
+                            .collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    all.into_iter().any(|g| {
+                        x.st.bools
+                            .support(g)
+                            .iter()
+                            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                    })
+                };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -1954,6 +1955,21 @@ impl<'a> Lower<'a> {
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
+        }
+        // SAVEEXEC and WREXEC set SCC when the resulting EXEC mask has any
+        // lane. A later scalar select reads that one value for the whole wave.
+        // Our packed low dword represents every lane on a required 32-lane wave.
+        if matches!(found, Some(Val::Missing(LANE_MASK)))
+            && self.s.wave_size == Some(32)
+            && !self.x.native.wave64
+            && let Some(inst) = self.def_inst(v)
+            && inst.write(Reg::Scc) == Some(v)
+            && writes_exec_scc(inst)
+            && let Some(exec) = inst.write(Reg::S(EXEC))
+        {
+            let bits = self.mask_dword(exec)?;
+            let zero = self.s.m.i32(0);
+            return Ok(Val::Bit(self.s.m.cmp(self.cur, pred::NE, bits, zero)));
         }
         if let Some(Val::Missing(w)) = found {
             return Err(w);
@@ -6593,6 +6609,15 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(&source) = self.x.res.restored_lanes.get(&(b, i)) {
+            // This lane was overwritten by a uniform scalar in the same block;
+            // other lanes of the VGPR may hold arbitrary vector data.
+            let word = match source {
+                crate::resource::Moved::Value(v) => self.i32_of(v)?,
+                crate::resource::Moved::Const(k) => self.s.m.i32(k),
+            };
+            return self.write_i(inst, word, None);
+        }
         if self.waterfall_compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
@@ -12036,6 +12061,21 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// An EXEC update whose scalar condition code says whether the resulting
+/// 32-bit mask is nonzero.
+fn writes_exec_scc(inst: &Inst) -> bool {
+    inst.name().ends_with("_wrexec_b32") || inst.name().ends_with("_saveexec_b32")
+}
+
+fn reads_exec_scc(p: &Program) -> bool {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let flags: Set<_> = insts()
+        .filter(|i| writes_exec_scc(i))
+        .filter_map(|i| i.write(Reg::Scc))
+        .collect();
+    !flags.is_empty() && insts().any(|i| i.read(Reg::Scc).is_some_and(|v| flags.contains(&v)))
 }
 
 pub(crate) use halves::{once_per_lane, split_wave_barriers};

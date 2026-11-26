@@ -10,6 +10,26 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
+fn scalar_select_reads_the_condition_code_of_a_wave32_exec_update() {
+    for update in [0xBE86_4707, 0xBE86_3C07] {
+        lowers(
+            &[
+                0xBE87_037E, // s_mov_b32 s7, exec_lo
+                0x7DA8_02FF,
+                1,           // v_cmpx_gt_u32 exec_lo, 1, v1
+                update,      // s_andn2_wrexec_b32 or s_and_saveexec_b32 s6, s7
+                0xBEFE_0307, // s_mov_b32 exec_lo, s7 (preserves SCC)
+                0x8503_8081, // s_cselect_b32 s3, 1, 0
+                0x7E00_0203, // v_mov_b32 v0, s3
+                S_ENDPGM,
+            ],
+            0,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
 fn direct_barycentric_modes_match_dxil_semantics() {
     use crate::io::Barycentric::*;
 

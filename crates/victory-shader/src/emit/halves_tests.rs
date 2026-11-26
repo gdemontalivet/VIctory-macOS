@@ -1382,3 +1382,38 @@ fn the_permlanex16_model_follows_the_instruction() {
     assert_eq!(permlanex16_console(32)[0], 63);
     assert_eq!(permlanex16_console(48)[0], 47);
 }
+
+/// Intra-block scalar spill into lane 40 of a VGPR that also holds `v0`:
+/// `restored_lanes` recovers `0x777` in every lane of both halves (even
+/// inside a loop where cross-half lane reads cannot barrier), while `v5`
+/// itself keeps `0x777` only in console lane 40 and `v0` elsewhere.
+#[test]
+fn intra_block_scalar_spills_stay_exact_on_mixed_vgprs() {
+    let mixed_spill = [
+        PROLOGUE.as_slice(),
+        &[
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0x7E0A_0300, // v_mov_b32 v5, v0
+            0xBE94_0380, // s_mov_b32 s20, 0
+            0xBE88_03FF,
+            0x0000_0777, // s_mov_b32 s8, 0x777
+            0xD761_0005,
+            0x0001_5008, // v_writelane_b32 v5, s8, 40
+            0xD760_000C,
+            0x0001_5105, // v_readlane_b32 s12, v5, 40
+            0x8014_8114, // s_add_u32 s20, s20, 1
+            0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+            0xBF85_FFF7, // s_cbranch_scc1 (back to s_mov s8, 0x777)
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ],
+        &store(1, 0),
+        &store(5, 4),
+        &[S_ENDPGM],
+    ]
+    .concat();
+    let want_spill: Vec<u32> = (0..64)
+        .flat_map(|l| [0x777, if l == 40 { 0x777 } else { l }])
+        .collect();
+    let failed = differences(&mixed_spill, 64, 2, &want_spill);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
