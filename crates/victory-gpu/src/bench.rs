@@ -116,7 +116,7 @@ fn config() -> &'static BenchConfig {
 pub fn ensure_outside_repo(path: &Path) -> Result<(), String> {
     let resolved = resolve_path(path)?;
     let compiled_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    if let Ok(root) = std::fs::canonicalize(compiled_root)
+    if let Ok(root) = resolve_path(&compiled_root)
         && root.join(ROOT_MARKER).is_file()
         && resolved.starts_with(&root)
     {
@@ -142,9 +142,41 @@ fn resolve_path(path: &Path) -> Result<PathBuf, String> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(|e| format!("cannot get current dir: {e}"))?
-            .join(path)
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("cannot get current dir: {e}"))?;
+        // On Windows/Wine, a root-relative path like `/Users/...` (such as a
+        // cross-compiled `CARGO_MANIFEST_DIR` or a POSIX path passed on macOS)
+        // has `RootDir` without `Prefix`. `PathBuf::join` would drop `cwd`'s
+        // drive prefix; prepend `cwd`'s prefix, falling back to `Z:` under Wine
+        // when the POSIX path lives on the host root mapped at `Z:\`.
+        if matches!(path.components().next(), Some(Component::RootDir)) {
+            let with_prefix = |prefix: &std::ffi::OsStr| {
+                let mut os = prefix.to_os_string();
+                os.push(path.as_os_str());
+                PathBuf::from(os)
+            };
+            let candidate = match cwd.components().next() {
+                Some(Component::Prefix(prefix)) => with_prefix(prefix.as_os_str()),
+                _ => cwd.join(path),
+            };
+            let deepest_existing = |p: &Path| {
+                p.ancestors()
+                    .find(|a| a.exists())
+                    .map_or(0, |a| a.components().count())
+            };
+            if cfg!(windows) {
+                let z = with_prefix(std::ffi::OsStr::new("Z:"));
+                if deepest_existing(&z) > deepest_existing(&candidate) {
+                    z
+                } else {
+                    candidate
+                }
+            } else {
+                candidate
+            }
+        } else {
+            cwd.join(path)
+        }
     };
     let mut normalized = PathBuf::new();
     for comp in abs.components() {
@@ -152,6 +184,13 @@ fn resolve_path(path: &Path) -> Result<PathBuf, String> {
             Component::CurDir => {}
             Component::ParentDir => {
                 normalized.pop();
+            }
+            Component::RootDir if !normalized.as_os_str().is_empty() => {
+                // On Windows, `PathBuf::push(r"\")` drops a preceding drive
+                // prefix (`Z:` -> `\`); preserve the prefix by appending raw.
+                let mut os = normalized.into_os_string();
+                os.push(comp.as_os_str());
+                normalized = PathBuf::from(os);
             }
             other => normalized.push(other.as_os_str()),
         }
