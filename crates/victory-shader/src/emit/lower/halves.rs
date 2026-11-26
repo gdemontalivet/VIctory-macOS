@@ -36,9 +36,11 @@
 //! LDS: the console compiler leaves out barriers between the lanes of one
 //! wave, and so between all of a group's threads only when the group is one
 //! wave. A group of 33 to 64 threads with LDS (two host waves sharing what
-//! the console's one wave ordered by itself) is refused; groups of several
-//! console waves order their LDS with barriers, and those of 32 threads or
-//! fewer are one host wave.
+//! the console's one wave ordered by itself) meets at group barriers between
+//! its LDS phases (`lds::barriers`), and is refused where no point every
+//! thread reaches separates them; groups of several console waves order
+//! their LDS with barriers, and those of 32 threads or fewer are one host
+//! wave.
 //!
 //! Approach after DexNom's fork (DexNom/Victory 5f4c3df, `set_host_max_wave`
 //! and the thread relabelling into halves) and upstream PR #2176
@@ -59,13 +61,6 @@ impl Lower<'_> {
     /// halves: the host's waves are 32 lanes at most.
     pub(super) fn halves_wanted(x: &Parts, needs_wave: bool) -> bool {
         needs_wave && x.native.wave64 && x.host_wave32
-    }
-
-    /// Why a program in halves cannot run: LDS a group of one console wave
-    /// shares without barriers, split across two host waves.
-    pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
@@ -334,10 +329,8 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     && (name.starts_with("buffer_load") || name.starts_with("tbuffer_load"))
                 {
                     let vector = |op: &Operand| match *op {
-                        Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
-                            inst.read(Reg::V(reg + k))
-                                .is_some_and(|v| known(&next, &v))
-                        }),
+                        Operand::Vector { reg, dwords } => (0..dwords)
+                            .all(|k| inst.read(Reg::V(reg + k)).is_some_and(|v| known(&next, &v))),
                         _ => true,
                     };
                     let scalar = |op: &Operand| match *op {

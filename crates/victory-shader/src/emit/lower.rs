@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod lds;
 mod mesh;
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
@@ -133,6 +134,7 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[allow(dead_code)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_pruned(parts, None)
 }
@@ -308,8 +310,6 @@ struct Lower<'a> {
     console_lanes: bool,
     /// A console wave64 program in host waves of 32 lanes (`halves`).
     halves: bool,
-    /// Why such a program cannot run in halves.
-    halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: VGPR values the same in every lane of the console wave
@@ -359,6 +359,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loop latches' barriers still ahead (`lds::Plan::drains`).
+    drains: HashMap<usize, usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -662,7 +664,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
-        let (mut halves, mut halves_refused) = (false, None);
+        let mut halves = false;
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -711,7 +713,7 @@ impl<'a> Lower<'a> {
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
-            if x.narrow_waves && one_wave && group > 32 && s.lds_dwords > 0 {
+            if x.narrow_waves && !x.host_wave32 && one_wave && group > 32 && s.lds_dwords > 0 {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
@@ -723,14 +725,11 @@ impl<'a> Lower<'a> {
             // A host whose waves are narrower than WaveSize(64) does not run
             // the dispatch (D3DMetal: nothing written): ask for the console's
             // width only where wave operations need it, or LDS is not synced.
-            // On a host of 32-lane waves that width is two halves, which
-            // refuse LDS only where no barriers sync it.
-            let fits = x.narrow_waves && (synced || group <= 32);
+            // On a host of 32-lane waves that width is two halves, whose LDS
+            // phases meet at group barriers (`lds::barriers`).
+            let fits = x.narrow_waves && !x.host_wave32 && (synced || group <= 32);
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
-            if halves && !synced {
-                halves_refused = Self::halves_lds(group, s.lds_dwords);
-            }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });
             }
@@ -840,7 +839,6 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             halves,
-            halves_refused,
             relabelled: None,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -880,6 +878,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            drains: HashMap::new(),
             round16: round16(p),
             mode16: Some(0),
         }
@@ -1467,10 +1466,28 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
-        if let Some(why) = self.halves_refused {
-            return Err(unsupported(0, why));
-        }
         self.find_sections();
+        // One console wave run as two host waves: its halves meet at a
+        // barrier between LDS phases (`lds::barriers`).
+        let mut meet = Set::default();
+        if self.halves
+            && !self.one_host_wave()
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() <= 64)
+            && self.s.lds_dwords > 0
+        {
+            let sections = &self.sections;
+            let inside = |b: usize, i: usize| {
+                sections
+                    .get(&b)
+                    .is_some_and(|s| s.iter().any(|(&start, sec)| start < i && i < sec.end))
+            };
+            let plan = lds::barriers(p, &self.x.st.exits, inside).map_err(|w| unsupported(0, w))?;
+            meet.extend(plan.at);
+            self.drains = plan.drains;
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -1506,6 +1523,9 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
+                if meet.contains(&(b, i)) {
+                    self.lds_barrier();
+                }
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
@@ -1530,6 +1550,9 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if meet.contains(&(b, p.blocks[b].insts.len())) {
+                self.lds_barrier();
             }
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
                 self.group_barrier();
@@ -1601,7 +1624,7 @@ impl<'a> Lower<'a> {
                 ],
             },
             #[cfg(test)]
-            split_barriers: self.split_barriers.len(),
+            split_barriers: self.split_barriers.len() + meet.len(),
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -10963,7 +10986,7 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let abort = self.lds_abort(b);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
