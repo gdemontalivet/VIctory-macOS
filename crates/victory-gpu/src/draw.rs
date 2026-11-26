@@ -2386,6 +2386,215 @@ void main() {
         crate::shadow::unregister(buf as usize, p as u64);
     }
 
+    /// Live GPU regression test covering write-watched (`MEM_WRITE_WATCH`)
+    /// pages (unarmed marked UAV + declared UAV) AND a mixed tracked +
+    /// untracked (`PAGE_READWRITE`) shadow: when a compute shader writes
+    /// `[0..4)` and the CPU writes `[16..20)` right before copy-back, the
+    /// CPU's bytes must never be clobbered and untracked plain memory must
+    /// stay `PAGE_READWRITE`.
+    #[test]
+    fn writewatch_and_untracked_uav_copy_back_preserve_cpu_writes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Single-thread marked UAV shader using SM 5.0 `RWByteAddressBuffer::Store`
+        // so Wine's `vkd3d-shader` compiles and runs it live on D3DMetal.
+        const LIVE_MARKED_WRITE: &str = r#"
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer writes : register(u1);
+cbuffer c : register(b0) { uint byte_offset; uint value; uint mark_word_bytes; uint mark_mask; }
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(byte_offset, value);
+    if (mark_mask != 0) {
+        writes.Store(mark_word_bytes, mark_mask);
+    }
+}
+"#;
+        const LIVE_PARAMS: &[Param] = &[
+            Param::Table(&[uav(0, 1)]),
+            Param::Uav { register: 1 },
+            Param::Constants { register: 0, count: 4 },
+        ];
+        let (root, pso) = compile_cs(LIVE_MARKED_WRITE, LIVE_PARAMS);
+        let dispatch = |list: &HostList,
+                        heap_host: &crate::descriptor::host::HostHeap,
+                        table_slot: u32,
+                        byte_offset: u32,
+                        value: u32,
+                        mark_bit: Option<u32>| {
+            let writes = crate::shadow::view_writes(false).expect("view_writes bitmap");
+            let (mark_word_bytes, mark_mask) = match mark_bit {
+                Some(bit) => ((bit >> 5) * 4, 1u32 << (bit & 31)),
+                None => (0, 0),
+            };
+            let constants = [byte_offset, value, mark_word_bytes, mark_mask];
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(table_slot));
+                list.list.SetComputeRootUnorderedAccessView(1, writes);
+                list.list.SetComputeRoot32BitConstants(2, 4, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        let (_, title_heap, heap_host) = view_heap(8);
+        let _ = host.log_messages();
+
+        // Case 1: Write-watched pool page + unarmed marked UAV (bindless/heap
+        // path where `gpu_writes` was NOT declared): CPU write to `[16..20)`
+        // before copy-back must NOT be clobbered by `copy_back_marks`.
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let buf_pool = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+        let shadow_pool = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("pool shadow");
+        let pool_mark = shadow_pool.mark_entry(p as u64).map(|(bit, _)| bit);
+        assert!(pool_mark.is_some(), "write-watched pool shadow must be marked");
+        let uav_at_0: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let slot0 = title_heap.start;
+        crate::descriptor::create_uav(std::ptr::null(), buf_pool, std::ptr::null(), &uav_at_0, slot0);
+        let view0 = crate::descriptor::view(slot0).expect("pool uav view");
+        let _ = heap_host.mirror(0, slot0, true);
+
+        let cpu_val = 0xCAFE_BABEu32.to_le_bytes();
+        let list = host.new_list().unwrap();
+        // Refresh as read-only (no `gpu_writes` arming), then title writes
+        // `[16..20)` before the GPU shader writes `[0..4)` and marks the page.
+        readable(&list, &used(ResourceType::Srv), &view0, false);
+        list.defer_copy((p + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list, heap_host, 0, 0, 0xDEAD_BEEF, pool_mark);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        let cpu_after = unsafe { ((p + 16) as *const u32).read_volatile() };
+        assert_eq!(
+            cpu_after,
+            0xCAFE_BABE,
+            "unarmed marked copy-back must keep CPU write on write-watched page"
+        );
+
+        // Case 2: Write-watched pool page + armed marked UAV: 3-way merge
+        // preserves BOTH GPU `[0..4)` and CPU `[16..20)`.
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let list_armed = host.new_list().unwrap();
+        readable(&list_armed, &used(ResourceType::Uav), &view0, true);
+        list_armed.defer_copy((p + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list_armed, heap_host, 0, 0, 0xDEAD_BEEF, pool_mark);
+        list_armed.close();
+        host.execute(&[&list_armed]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        unsafe {
+            assert_eq!((p as *const u32).read_volatile(), 0xDEAD_BEEF, "armed GPU write copied back");
+            assert_eq!(((p + 16) as *const u32).read_volatile(), 0xCAFE_BABE, "armed copy-back preserved CPU write");
+        }
+
+        // Case 3: Write-watched pool page + declared `gpu_writes(..., false)`
+        // (snapshot 3-way merge): both GPU `[0..4)` and CPU `[16..20)` survive.
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let list2 = host.new_list().unwrap();
+        shadow_pool.refresh(&list2, p as u64, crate::watch::PAGE as u64);
+        shadow_pool.gpu_writes(&list2, p as u64, crate::watch::PAGE as u64, false);
+        list2.defer_copy((p + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list2, heap_host, 0, 0, 0xDEAD_BEEF, None);
+        list2.close();
+        host.execute(&[&list2]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        unsafe {
+            assert_eq!((p as *const u32).read_volatile(), 0xDEAD_BEEF, "declared GPU write copied back");
+            assert_eq!(((p + 16) as *const u32).read_volatile(), 0xCAFE_BABE, "declared copy-back preserved CPU write");
+        }
+        crate::shadow::unregister(buf_pool as usize, p as u64);
+
+        // Case 4: Mixed tracked (`MEM_WRITE_WATCH`) + untracked plain
+        // (`PAGE_READWRITE`) shadow: UAV targets the untracked plain page,
+        // GPU writes `[0..4)`, CPU writes `[16..20)` right before copy-back.
+        let page = crate::watch::PAGE;
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: fresh reservation released immediately, then two adjacent pages.
+                unsafe {
+                    let base = VirtualAlloc(std::ptr::null(), 2 * page, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(base as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(q as *const _, page, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                    };
+                    let (a, b) = (at(base, crate::watch::tests::MEM_WRITE_WATCH), at(base + page, 0));
+                    if base != 0 && a == base && b == base + page {
+                        return Some((a, b));
+                    }
+                    [a, b].into_iter().filter(|&q| q != 0).for_each(crate::watch::tests::free);
+                    None
+                }
+            })
+            .expect("two adjacent pages");
+        // SAFETY: bytes inside our plain page.
+        unsafe {
+            (plain as *mut u32).write_volatile(0x1111_1111);
+            ((plain + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let buf_mixed = buffer_at_address(pool as u64, (2 * page) as u64);
+        let shadow_mixed = crate::shadow::find(pool as u64, (2 * page) as u64).expect("mixed shadow");
+        let plain_mark = shadow_mixed.mark_entry(plain as u64).map(|(bit, _)| bit);
+        // Raw UAV starting at `plain` (offset `page` = 16384 dwords).
+        let uav_plain: [u32; 10] = [39, 1, (page / 4) as u32, 0, 64, 0, 0, 0, 1, 0];
+        let slot1 = title_heap.start + 32;
+        crate::descriptor::create_uav(std::ptr::null(), buf_mixed, std::ptr::null(), &uav_plain, slot1);
+        let view1 = crate::descriptor::view(slot1).expect("mixed plain uav view");
+        let _ = heap_host.mirror(1, slot1, true);
+
+        let list3 = host.new_list().unwrap();
+        readable(&list3, &used(ResourceType::Uav), &view1, true);
+        list3.defer_copy((plain + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list3, heap_host, 1, 0, 0xDEAD_BEEF, plain_mark);
+        list3.close();
+        host.execute(&[&list3]);
+        assert_eq!(host.log_messages(), None);
+
+        // SAFETY: bytes inside our plain page.
+        unsafe {
+            assert_eq!(
+                (plain as *const u32).read_volatile(),
+                0xDEAD_BEEF,
+                "GPU write on untracked page of mixed shadow must copy back"
+            );
+            assert_eq!(
+                ((plain + 16) as *const u32).read_volatile(),
+                0xCAFE_BABE,
+                "CPU write on untracked page of mixed shadow must not be clobbered"
+            );
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        unsafe { VirtualQuery(plain as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(
+            info.Protect, PAGE_READWRITE,
+            "untracked plain page must remain PAGE_READWRITE after copy-back"
+        );
+        crate::shadow::unregister(buf_mixed as usize, pool as u64);
+    }
+
     /// Unaligned and `< 64 KiB` / cross-page `Shadow`s clamp `page_range`
     /// cleanly and copy back marked sub-range UAV writes across the page
     /// boundary without disturbing surrounding title memory.
