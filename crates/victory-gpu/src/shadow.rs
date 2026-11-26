@@ -1026,6 +1026,11 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// (the longest entry's length) below `end`. Big buffers hold many smaller
 /// ones (a heap's placed buffers), so the one holding an address past
 /// those can be any number of entries back.
+///
+/// The cost is the entries starting within `span` below `end`, which a
+/// single very long buffer makes many: the lookup walks back until one
+/// reaches `end`, where the old search stopped after 64 entries. It runs
+/// under the buffers' lock on every lookup.
 fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
     let lowest = end.saturating_sub(span);
     if lowest > address {
@@ -1919,9 +1924,13 @@ pub(crate) mod tests {
     #[test]
     fn overlapping_windows_agree_through_title_memory() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        if host().is_none() {
+        let Some(h) = host() else {
             return;
-        }
+        };
+        // Held as a submission holds it (as in the mark tests above): writing
+        // and copy_back share the bitmaps and the snapshots with every other
+        // test's submission, which would otherwise interleave with them.
+        let _quiet = h.quiet();
         let w = loose_window_bytes() as usize;
         // SAFETY: a fresh allocation, released below.
         let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
