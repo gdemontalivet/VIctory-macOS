@@ -49,6 +49,80 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
+    left_out: Option<&'static str>,
+}
+
+/// Compute shaders whose work depends on populated BVHs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WithoutBvh {
+    /// Shades ray-tracing hits (`CS_RaytracingResolve_*`).
+    RaytracingResolve,
+    /// Activates probe rays (`CS_ScreenProbes_ActivateRays_*`).
+    ActivateRays,
+}
+
+/// Classifies a compute shader container by its debug name.
+pub(crate) fn without_bvh(container: &[u8]) -> Option<WithoutBvh> {
+    let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+    if has(b"CS_RaytracingResolve") {
+        Some(WithoutBvh::RaytracingResolve)
+    } else if has(b"CS_ScreenProbes_ActivateRays") {
+        Some(WithoutBvh::ActivateRays)
+    } else {
+        None
+    }
+}
+
+fn left_out_with(
+    kind: WithoutBvh,
+    builder_runs: bool,
+    skip_master: bool,
+    rt_resolve: Option<&str>,
+    activate_rays: Option<&str>,
+) -> Option<&'static str> {
+    if !skip_master {
+        return None;
+    }
+    match kind {
+        WithoutBvh::RaytracingResolve => {
+            if builder_runs || matches!(rt_resolve, Some("1" | "true" | "on")) {
+                None
+            } else {
+                Some("shades ray-tracing hits without BVH, left out")
+            }
+        }
+        WithoutBvh::ActivateRays => match activate_rays {
+            Some("0" | "false" | "off") => Some("ray activation shader without BVH, left out"),
+            Some("1" | "true" | "on") => None,
+            _ if builder_runs => None,
+            _ => Some("ray activation shader without BVH, left out"),
+        },
+    }
+}
+
+fn left_out_for(shaders: &[Arc<Shader>], builder_runs: bool) -> Option<&'static str> {
+    let kind = shaders.iter().find_map(|s| s.without_bvh)?;
+    static FLAGS: OnceLock<(bool, Option<String>, Option<String>)> = OnceLock::new();
+    let (skip_master, rt_resolve, activate_rays) = FLAGS.get_or_init(|| {
+        let master = std::env::var("VICTORY_SKIP_RT_RESOLVE")
+            .ok()
+            .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "off"));
+        let rt = std::env::var("VICTORY_RT_RESOLVE")
+            .ok()
+            .map(|v| v.trim().to_owned());
+        let act = std::env::var("VICTORY_ACTIVATE_RAYS")
+            .ok()
+            .map(|v| v.trim().to_owned());
+        (master, rt, act)
+    });
+    left_out_with(
+        kind,
+        builder_runs,
+        *skip_master,
+        rt_resolve.as_deref(),
+        activate_rays.as_deref(),
+    )
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -71,8 +145,12 @@ impl Pending {
         });
         #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
+        let left_out = left_out_for(&shaders, !super::builder::disabled());
         let made = OnceLock::new();
         // Publish the completed result before the pipeline can be queued.
+        if left_out.is_some() {
+            let _ = made.set(None);
+        }
         #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
             let _ = made.set(None);
@@ -80,6 +158,7 @@ impl Pending {
         Pending {
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
+            left_out,
             key,
             shaders,
             graphics,
@@ -140,6 +219,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            if let Some(why) = p.left_out {
+                return Some(why.into());
+            }
             let failed: Vec<String> = p
                 .shaders
                 .iter()
@@ -211,6 +293,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() || left_out_for(&p.shaders, super::builder::runs()).is_some() {
+        return None;
+    }
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
     if !p.used.swap(true, Ordering::Relaxed) {
@@ -281,7 +366,7 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
 
 /// Starts making `p` now, without waiting for it.
 pub(crate) fn begin(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() {
+    if p.left_out.is_none() && !p.shaders.is_empty() {
         start(p, false);
     }
 }
@@ -526,6 +611,44 @@ mod tests {
         assert!(!p.queued.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn rt_resolve_and_activate_rays_are_left_out_without_bvh() {
+        assert_eq!(
+            without_bvh(b"..CS_RaytracingResolve_1234.."),
+            Some(WithoutBvh::RaytracingResolve)
+        );
+        assert_eq!(
+            without_bvh(b"..CS_ScreenProbes_ActivateRays_5678.."),
+            Some(WithoutBvh::ActivateRays)
+        );
+        assert_eq!(without_bvh(b"..CS_ScreenProbes_TemporalResolve.."), None);
+
+        assert_eq!(
+            left_out_with(WithoutBvh::RaytracingResolve, false, true, None, None),
+            Some("shades ray-tracing hits without BVH, left out")
+        );
+        assert_eq!(
+            left_out_with(WithoutBvh::ActivateRays, false, true, None, None),
+            Some("ray activation shader without BVH, left out")
+        );
+        assert_eq!(
+            left_out_with(WithoutBvh::RaytracingResolve, true, true, None, None),
+            None
+        );
+        assert_eq!(
+            left_out_with(WithoutBvh::RaytracingResolve, false, false, None, None),
+            None
+        );
+        assert_eq!(
+            left_out_with(WithoutBvh::RaytracingResolve, false, true, Some("1"), None),
+            None
+        );
+        assert_eq!(
+            left_out_with(WithoutBvh::ActivateRays, true, true, None, Some("0")),
+            Some("ray activation shader without BVH, left out")
+        );
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
@@ -537,6 +660,7 @@ mod tests {
             size: 0,
             container: std::sync::Mutex::new(Vec::new()),
             ambient: None,
+            without_bvh: None,
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
         });

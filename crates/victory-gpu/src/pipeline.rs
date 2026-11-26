@@ -77,6 +77,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light (`crate::ambient`).
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Ray-tracing pass skipped when the BVH builder does not run (`make`).
+    #[cfg(windows)]
+    pub(crate) without_bvh: Option<make::WithoutBvh>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -181,6 +184,10 @@ impl Shader {
             #[cfg(windows)]
             ambient: (stage == "compute")
                 .then(|| crate::ambient::role(bytes))
+                .flatten(),
+            #[cfg(windows)]
+            without_bvh: (stage == "compute")
+                .then(|| make::without_bvh(bytes))
                 .flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
@@ -390,6 +397,7 @@ impl Shader {
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
             ambient: self.ambient,
+            without_bvh: self.without_bvh,
             translated: cell,
         })
     }
