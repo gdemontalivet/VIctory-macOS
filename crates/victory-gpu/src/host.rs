@@ -1205,8 +1205,11 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
-    /// execution in turn; replaced by a bigger one when too small.
+    /// inline execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Indirect clamps hoisted into `prelude`, their bump-allocated argument
+    /// buffers, and the list's GPU-write hazard tracker.
+    clamps: Mutex<HoistedClamps>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1344,6 +1347,129 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+const ARGUMENT_CHUNK_FIRST: u64 = 64 << 10;
+const ARGUMENT_CHUNK_MAX: u64 = 4 << 20;
+const MAX_HAZARD_RANGES: usize = 256;
+
+struct ArgumentChunk {
+    buffer: ID3D12Resource,
+    gpu: u64,
+    capacity: u64,
+}
+
+/// Tracks title-address ranges written on the GPU earlier in a host list so
+/// indirect argument clamps only hoist into the list's prelude when neither
+/// their argument range nor their count word could have been written earlier
+/// in the same list, and preserves sequential budget order once any inline
+/// clamp has run.
+#[derive(Default)]
+pub(crate) struct WriteHazard {
+    /// Sorted, disjoint, non-empty half-open title address ranges `[start, end)`.
+    ranges: Vec<(u64, u64)>,
+    /// Set when an earlier command can write arbitrary buffer memory (e.g.
+    /// bindless heap UAV writes or page-table memory writes).
+    unknown: bool,
+    /// Set once an inline clamp has been recorded in this list so subsequent
+    /// clamps stay inline and charge the shared budget in recorded order.
+    inline_used: bool,
+}
+
+impl WriteHazard {
+    pub(crate) fn note_write(&mut self, start: u64, len: u64) {
+        if self.unknown || len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        if end <= start {
+            return;
+        }
+        if self.ranges.last() == Some(&(start, end)) {
+            return;
+        }
+        let pos = self.ranges.partition_point(|&(s, _)| s < start);
+        let mut lo = pos;
+        let mut new_start = start;
+        let mut new_end = end;
+        if lo > 0 && self.ranges[lo - 1].1 >= new_start {
+            lo -= 1;
+            new_start = self.ranges[lo].0;
+            new_end = new_end.max(self.ranges[lo].1);
+        }
+        let mut hi = pos;
+        while hi < self.ranges.len() && self.ranges[hi].0 <= new_end {
+            new_end = new_end.max(self.ranges[hi].1);
+            hi += 1;
+        }
+        self.ranges.splice(lo..hi, std::iter::once((new_start, new_end)));
+        if self.ranges.len() > MAX_HAZARD_RANGES {
+            self.unknown = true;
+            self.ranges.clear();
+        }
+    }
+
+    pub(crate) fn note_unknown(&mut self) {
+        self.unknown = true;
+        self.ranges.clear();
+    }
+
+    pub(crate) fn note_inline(&mut self) {
+        self.inline_used = true;
+    }
+
+    pub(crate) fn overlaps(&self, start: u64, len: u64) -> bool {
+        if self.unknown {
+            return true;
+        }
+        if len == 0 {
+            return false;
+        }
+        let end = start.saturating_add(len);
+        let pos = self.ranges.partition_point(|&(_, e)| e <= start);
+        pos < self.ranges.len() && self.ranges[pos].0 < end
+    }
+
+    pub(crate) fn can_hoist(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        if self.inline_used || self.unknown {
+            return false;
+        }
+        if self.overlaps(arguments, len) {
+            return false;
+        }
+        if let Some(at) = count
+            && self.overlaps(at, 4)
+        {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ranges.clear();
+        self.unknown = false;
+        self.inline_used = false;
+    }
+}
+
+#[derive(Default)]
+struct HoistedClamps {
+    chunks: Vec<ArgumentChunk>,
+    current: usize,
+    used: u64,
+    touched: usize,
+    oversized: Vec<ID3D12Resource>,
+    pending: Vec<crate::indirect::PendingClamp>,
+    budget_gpu: u64,
+    hazard: WriteHazard,
+}
+
+impl HoistedClamps {
+    fn touched_buffers(&self) -> Vec<ID3D12Resource> {
+        let mut out = Vec::with_capacity(self.touched + self.oversized.len());
+        out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
+        out.extend(self.oversized.iter().cloned());
+        out
+    }
+}
 
 struct ScratchChunk {
     buffer: ID3D12Resource,
@@ -1583,6 +1709,7 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                clamps: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2586,6 +2713,7 @@ impl HostList {
             }
         }
         self.widen_close();
+        self.hoisted_clamps_close();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -2611,6 +2739,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
+        self.reset_hoisted_clamps();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2925,7 +3054,18 @@ impl HostList {
                 copy.state.store(*last, Ordering::Relaxed);
             }
         };
-        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+        let (clamp_budget, clamp_buffers, pending_clamps) = {
+            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            if clamps.pending.is_empty() {
+                (0, Vec::new(), Vec::new())
+            } else {
+                (clamps.budget_gpu, clamps.touched_buffers(), clamps.pending.clone())
+            }
+        };
+        if copies.is_empty()
+            && pending_clamps.is_empty()
+            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
+        {
             left();
             return None;
         }
@@ -2959,6 +3099,14 @@ impl HostList {
                 let barriers = moves();
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if !pending_clamps.is_empty() {
+                    crate::indirect::record_batch(
+                        list,
+                        clamp_budget,
+                        &clamp_buffers,
+                        &pending_clamps,
+                    );
                 }
                 list.Close()
             })
@@ -3135,6 +3283,151 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .note_write(address as u64, len as u64);
+    }
+
+    /// Notes that an earlier command in this list may write arbitrary title
+    /// buffers on the GPU (bindless heap UAVs or page-table memory writes).
+    pub(crate) fn note_unknown_gpu_write(&self) {
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .note_unknown();
+    }
+
+    /// Notes that an inline indirect clamp was recorded in this list so later
+    /// clamps stay inline and charge the list budget in recorded order.
+    pub(crate) fn note_inline_clamp(&self) {
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .note_inline();
+    }
+
+    /// Whether an indirect execution reading `[arguments, arguments + len)`
+    /// (and optional 4-byte `count`) has no earlier conflicting GPU write or
+    /// inline clamp in this list and may be clamped in `prelude`.
+    pub(crate) fn can_hoist_clamp(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .can_hoist(arguments, len, count)
+    }
+
+    /// Allocates a 16-byte-aligned slice of `bytes` in this list's hoisted
+    /// indirect argument arena and records its prelude clamp.
+    pub(crate) fn enqueue_hoisted_clamp(
+        &self,
+        bytes: u64,
+        make: impl FnOnce(u64) -> crate::indirect::PendingClamp,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let budget_gpu = self.budget()?;
+        let size = bytes.max(16).checked_next_multiple_of(16)?;
+        let host = host()?;
+        let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, offset, dst_gpu) = if size > ARGUMENT_CHUNK_MAX {
+            let (buffer, _) = host.shared_buffer(size)?;
+            name(&buffer, || format!("hoisted indirect arguments {size:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            clamps.oversized.push(buffer.clone());
+            (buffer, 0, gpu)
+        } else {
+            while let Some(chunk) = clamps.chunks.get(clamps.current) {
+                if size <= chunk.capacity - clamps.used {
+                    break;
+                }
+                clamps.current += 1;
+                clamps.used = 0;
+            }
+            if clamps.current == clamps.chunks.len() {
+                let next = clamps
+                    .chunks
+                    .last()
+                    .map_or(ARGUMENT_CHUNK_FIRST, |c| (2 * c.capacity).min(ARGUMENT_CHUNK_MAX));
+                let capacity = size
+                    .next_multiple_of(ARGUMENT_CHUNK_FIRST)
+                    .max(next)
+                    .min(ARGUMENT_CHUNK_MAX);
+                let (buffer, _) = host.shared_buffer(capacity)?;
+                name(&buffer, || format!("hoisted indirect arguments {capacity:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                clamps.chunks.push(ArgumentChunk { buffer, gpu, capacity });
+                clamps.used = 0;
+            }
+            let current = clamps.current;
+            let at = clamps.used;
+            let chunk = &clamps.chunks[current];
+            let result = (chunk.buffer.clone(), at, chunk.gpu + at);
+            clamps.used = at + size;
+            clamps.touched = clamps.touched.max(current + 1);
+            result
+        };
+        clamps.budget_gpu = budget_gpu;
+        clamps.pending.push(make(dst_gpu));
+        Some((buffer, offset))
+    }
+
+    /// Transitions hoisted indirect argument buffers back to `COMMON` at the
+    /// end of `list.list` so the list can be re-submitted or reset cleanly.
+    fn hoisted_clamps_close(&self) {
+        let buffers = {
+            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            if clamps.pending.is_empty() {
+                return;
+            }
+            clamps.touched_buffers()
+        };
+        if buffers.is_empty() {
+            return;
+        }
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = buffers
+            .iter()
+            .map(|b| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )
+            })
+            .collect();
+        // SAFETY: an open list and live argument buffers left in
+        // `INDIRECT_ARGUMENT` by `prelude`.
+        unsafe {
+            self.list.ResourceBarrier(&barriers);
+        }
+    }
+
+    /// Resets hoisted clamp tracking after the list finishes running, keeping
+    /// the chunks needed by the last cycle (plus one) for zero-allocation reuse.
+    fn reset_hoisted_clamps(&self) {
+        let (spent_chunks, spent_oversized) = {
+            let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            clamps.pending.clear();
+            clamps.budget_gpu = 0;
+            clamps.hazard.clear();
+            let kept = (clamps.touched + 1).min(clamps.chunks.len());
+            let spent_chunks = clamps.chunks.split_off(kept);
+            let spent_oversized = std::mem::take(&mut clamps.oversized);
+            clamps.current = 0;
+            clamps.used = 0;
+            clamps.touched = 0;
+            (spent_chunks, spent_oversized)
+        };
+        if !spent_chunks.is_empty() {
+            release_later(Box::new(spent_chunks));
+        }
+        if !spent_oversized.is_empty() {
+            release_later(Box::new(spent_oversized));
+        }
     }
 
     /// Shaders of the list take views from the heap itself
@@ -3193,6 +3486,7 @@ impl HostList {
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.clamps.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty()
     }
 
     /// `size` bytes of mapped upload memory for a texture to copy from,
@@ -4278,13 +4572,16 @@ impl Meter {
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             let [records, counted] =
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
+            let [hoisted, inline] =
+                crate::indirect::take_clamps().map(|n| n as f64 / report_frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
-                 max records {records:.0}/frame ({counted:.0} under a count)",
+                 max records {records:.0}/frame ({counted:.0} under a count; clamps \
+                 {hoisted:.0} hoisted, {inline:.0} inline)",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
