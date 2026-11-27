@@ -8,13 +8,16 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, over_limit_mesh_output_bytes,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Interface, PCSTR};
 
 use super::{Shader, Translated};
+use crate::backend::HostGpu;
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -91,6 +94,44 @@ impl Default for GraphicsState {
     }
 }
 
+#[cfg(test)]
+impl GraphicsState {
+    /// A state that declares one render target, of format `format` (tests).
+    pub(crate) fn declaring(format: i32) -> Self {
+        let mut g = Self::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT(format);
+        g
+    }
+}
+
+/// The formats of what a draw draws into, as the host has them: the eight
+/// render targets (0 where there is none), then depth (0 for none).
+pub(crate) type TargetFormats = [u32; 9];
+
+/// Whether a draw into views of the formats `bound` cannot go to the host
+/// with a pipeline that declares `declared`: a render target slot for which
+/// the pipeline declares a format has a view of another format bound to it.
+pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
+    declared[..8]
+        .iter()
+        .zip(&bound[..8])
+        .any(|(&d, &b)| d != 0 && b != 0 && b != d)
+}
+
+/// The formats a pipeline for a draw into `bound` declares
+/// ([`formats_differ`]): the title's own, except declared render target slots
+/// with a bound view take the bound view's format.
+pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
+    let mut formats = *declared;
+    for i in 0..8 {
+        if declared[i] != 0 && bound[i] != 0 {
+            formats[i] = bound[i];
+        }
+    }
+    formats
+}
+
 /// Integer render target formats: D3D12 cannot blend into them.
 fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(
@@ -151,6 +192,53 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// The formats the state declares ([`TargetFormats`]): nothing past its
+    /// count of render targets.
+    pub(crate) fn formats(&self) -> TargetFormats {
+        let mut formats = [0; 9];
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        for (to, from) in formats.iter_mut().zip(&self.targets.RTFormats[..n]) {
+            *to = from.0 as u32;
+        }
+        formats[8] = self.depth_format.0 as u32;
+        formats
+    }
+
+    /// The same state for a draw into views of the formats `bound`
+    /// ([`formats_differ`]): the render target formats come from `bound`,
+    /// everything else stays the title's.
+    pub(crate) fn with_formats(&self, bound: &TargetFormats) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs: Vec<D3D12_INPUT_ELEMENT_DESC> = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        let mut targets = self.targets;
+        let n = (targets.NumRenderTargets as usize).min(8);
+        for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
+            *to = DXGI_FORMAT(from as i32);
+        }
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -219,7 +307,7 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                        f.0 = crate::resource::target_format(f.0 as u32) as i32;
                     }
                 }
                 16 => {
@@ -389,21 +477,25 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
-    }
-    None
-}
-
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        record_refusal: impl Fn(&'static str, Option<i32>),
+    ) -> Option<HostPipeline> {
+        let refuse = |reason: &'static str| {
+            // Record every affected pipeline, including those after the first warning.
+            record_refusal(reason, None);
+            static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&reason) {
+                seen.push(reason);
+                tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+            }
+            None
+        };
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -414,10 +506,7 @@ impl HostPipeline {
                 .iter()
                 .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
         {
-            return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
-                shaders,
-            );
+            return refuse("only vertex, mesh, pixel and compute stages are translated");
         }
         let mesh = find("mesh");
         let stages = if let Some(cs) = compute {
@@ -426,29 +515,24 @@ impl HostPipeline {
             let first = match (mesh, find("vertex")) {
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
+                (None, None) => return refuse("no vertex or mesh shader"),
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_support().supported() {
-            return refuse(
-                "the host GPU has no mesh shaders (or no shader model 6.6)",
-                shaders,
-            );
+            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)");
         }
         for (s, _) in &stages {
             s.translated()?;
         }
-        // Mesh shaders whose standalone output footprint exceeds Metal's 32 KiB
-        // limit are re-translated together with their paired pixel shader,
-        // pruning outputs the pixel shader never reads.
+        // Mesh shaders whose standalone output footprint (packed or Metal-
+        // aligned) exceeds Metal's 32 KiB limit are re-translated together with
+        // their paired pixel shader, pruning unread outputs and repacking
+        // attribute order to eliminate alignment padding holes.
         let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
-            let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
-            if bytes <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES {
-                return None;
-            }
+            over_limit_mesh_output_bytes(&ms.translated()?.host.dxil)?;
             super::translate_linked(ms, find("pixel").map(Arc::as_ref))
         });
         let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
@@ -462,15 +546,11 @@ impl HostPipeline {
             None => stages,
         };
         if super::refuse_over_limit_mesh()
-            && let Some((ms, _)) = stages.iter().find(|(_, v)| *v == D3D12_SHADER_VISIBILITY_MESH)
+            && let Some((ms, _)) = stages
+                .iter()
+                .find(|(_, v)| *v == D3D12_SHADER_VISIBILITY_MESH)
             && let Some(t) = ms.translated()
-            // The larger of the packed count and the aligned layout: shaders
-            // the packed count puts under the limit (34,816 bytes aligned,
-            // #172) still hang the queue.
-            && let Some(bytes) = victory_shader::emit::mesh_outputs(&t.host.dxil)
-                .map(|o| o.bytes())
-                .max(metal_mesh_bytes(&t.host.dxil))
-            && bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+            && let Some(bytes) = over_limit_mesh_output_bytes(&t.host.dxil)
         {
             tracing::warn!(
                 ?shaders,
@@ -478,10 +558,7 @@ impl HostPipeline {
                 "mesh outputs over Metal's 32 KiB after linking: pipeline refused \
                  (VICTORY_MESH_OVER_LIMIT=1 makes it)"
             );
-            return refuse(
-                "the mesh shader's outputs take more than the host GPU allows",
-                shaders,
-            );
+            return refuse("the mesh shader's outputs take more than the host GPU allows");
         }
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
@@ -501,10 +578,7 @@ impl HostPipeline {
                 .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
         });
         if atomics64 && !host.heap_atomics64() {
-            return refuse(
-                "the host GPU has no 64-bit atomics on typed heap resources",
-                shaders,
-            );
+            return refuse("the host GPU has no 64-bit atomics on typed heap resources");
         }
 
         let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
@@ -638,6 +712,7 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
+                record_refusal("root signature refused", Some(e.code().0));
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
@@ -669,6 +744,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    record_refusal("compute pipeline refused", Some(e.code().0));
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -690,7 +766,7 @@ impl HostPipeline {
             });
         }
         let Some(g) = g else {
-            return refuse("graphics state not kept (plain description)", shaders);
+            return refuse("graphics state not kept (plain description)");
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
@@ -699,7 +775,7 @@ impl HostPipeline {
         let ps = stages.get(1).and_then(|(s, _)| s.translated());
         let deltas = ps.is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
         if mesh.is_some() && deltas {
-            return refuse("non-provoking vertex values in a mesh pipeline", shaders);
+            return refuse("non-provoking vertex values in a mesh pipeline");
         }
         if mesh.is_some() {
             let name = super::library::name(
@@ -724,6 +800,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    record_refusal("mesh pipeline refused", Some(e.code().0));
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
@@ -752,15 +829,16 @@ impl HostPipeline {
         let vs = stages.first().and_then(|(s, _)| s.translated());
         let gs = match (g.topology.0, vs, ps) {
             (RECTANGLES, ..) if deltas => {
-                return refuse("non-provoking vertex values in a rectangle list", shaders);
+                return refuse("non-provoking vertex values in a rectangle list");
             }
             (_, Some(vs), Some(ps)) if deltas => {
                 if host_topology(g) != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE {
-                    return refuse("non-provoking vertex values of points or lines", shaders);
+                    return refuse("non-provoking vertex values of points or lines");
                 }
                 match victory_shader::emit::vertex_delta_gs(&vs.host.dxil, &ps.host.dxil) {
                     Ok(gs) => gs,
                     Err(e) => {
+                        record_refusal("no vertex value geometry shader", None);
                         tracing::warn!(error = %e, ?shaders, "no vertex value geometry shader");
                         return None;
                     }
@@ -835,6 +913,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                record_refusal("graphics pipeline refused", Some(e.code().0));
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
@@ -1007,63 +1086,6 @@ fn root_signature(
     }
 }
 
-/// Output bytes as Apple's Metal counts them for a translated mesh shader
-/// (measured on D3DMetal): per vertex, clip/cull distances, position, then
-/// remaining outputs in signature order, aligned to own size; same for
-/// primitives; multiplied by declared max counts.
-pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
-    let u32_at = |b: &[u8], at: usize| {
-        b.get(at..at + 4)
-            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
-    };
-    let part = |name: &[u8; 4]| {
-        (0..u32_at(dxil, 28)?).find_map(|i| {
-            let at = u32_at(dxil, 32 + 4 * i)?;
-            (dxil.get(at..at + 4)? == name)
-                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
-                .flatten()
-        })
-    };
-    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u32)>> {
-        let Some(data) = part(name) else {
-            return Some(Vec::new());
-        };
-        (0..u32_at(data, 0)?)
-            .map(|i| {
-                let at = 8 + 32 * i;
-                let mask = *data.get(at + 24)?;
-                Some((u32_at(data, at + 12)?, mask.count_ones()))
-            })
-            .collect()
-    };
-    const POSITION: usize = 1;
-    const DISTANCES: [usize; 2] = [2, 3];
-    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
-        sizes
-            .filter(|&size| size > 0)
-            .fold(0, |end: u32, size| end.next_multiple_of(size) + size)
-    };
-    let vertex = elements(b"OSG1")?;
-    let distances = vertex
-        .iter()
-        .filter(|(kind, _)| DISTANCES.contains(kind))
-        .map(|&(_, n)| n)
-        .sum::<u32>();
-    let vertex_bytes = layout(
-        &mut std::iter::repeat_n(4, distances as usize)
-            .chain([16])
-            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
-    );
-    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
-    let info = part(b"PSV0")?.get(4..)?;
-    let maximum = |at: usize| {
-        Some(u32::from(u16::from_le_bytes(
-            info.get(at..at + 2)?.try_into().ok()?,
-        )))
-    };
-    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,5 +1202,82 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn bound_formats_are_compared_slot_by_slot() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        let declared = g.formats();
+        assert_eq!(declared, [24, 28, 0, 0, 0, 0, 0, 0, 40]);
+        assert!(!formats_differ(&declared, &declared));
+        assert!(!formats_differ(&declared, &[24, 0, 0, 0, 0, 0, 0, 0, 40]));
+        assert!(!formats_differ(&declared, &[24, 28, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!formats_differ(&declared, &[0; 9]));
+        assert!(formats_differ(&declared, &[26, 28, 0, 0, 0, 0, 0, 0, 40]));
+        assert!(!formats_differ(&declared, &[24, 28, 28, 0, 0, 0, 0, 0, 40]));
+        assert!(!formats_differ(&declared, &[24, 28, 0, 0, 0, 0, 0, 0, 45]));
+        assert!(!formats_differ(
+            &[24, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[24, 0, 0, 0, 0, 0, 0, 0, 40]
+        ));
+        assert_eq!(
+            formats_for(&declared, &[26, 28, 28, 0, 0, 0, 0, 0, 45]),
+            [26, 28, 0, 0, 0, 0, 0, 0, 40]
+        );
+        assert_eq!(
+            formats_for(&declared, &[26, 0, 0, 0, 0, 0, 0, 0, 0]),
+            [26, 28, 0, 0, 0, 0, 0, 0, 40]
+        );
+        assert_eq!(formats_for(&declared, &declared), declared);
+    }
+
+    #[test]
+    fn a_state_for_the_bound_formats() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        g.sample_mask = 0x55;
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        g.names = vec![c"POSITION".to_owned()];
+        g.inputs = vec![D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(g.names[0].as_ptr().cast()),
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            ..Default::default()
+        }];
+
+        let g_blend = host_blend(&g.blend, &g.targets);
+        assert!(!g_blend.RenderTarget[1].BlendEnable.as_bool());
+
+        let bound = formats_for(&g.formats(), &[26, 26, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(bound, [26, 26, 0, 0, 0, 0, 0, 0, 40]);
+        let v = g.with_formats(&bound);
+        assert_eq!(v.formats(), bound);
+        assert_eq!(v.targets.NumRenderTargets, 2);
+        assert_eq!(v.depth_format, DXGI_FORMAT_D32_FLOAT);
+        let v_blend = host_blend(&v.blend, &v.targets);
+        assert!(v_blend.RenderTarget[0].BlendEnable.as_bool());
+        assert_ne!(v.describe(), g.describe());
+        assert_eq!(
+            (v.sample_mask, v.rasterizer.CullMode),
+            (0x55, D3D12_CULL_MODE_NONE)
+        );
+        assert_eq!(v.inputs.len(), 1);
+        assert_eq!(v.inputs[0].SemanticName.0, v.names[0].as_ptr().cast::<u8>());
+        assert_ne!(v.inputs[0].SemanticName.0, g.inputs[0].SemanticName.0);
+
+        let bound_int = [36, 24, 0, 0, 0, 0, 0, 0, 40];
+        let v_int = g.with_formats(&bound_int);
+        let v_int_blend = host_blend(&v_int.blend, &v_int.targets);
+        assert!(!v_int_blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(v_int_blend.RenderTarget[1].BlendEnable.as_bool());
     }
 }

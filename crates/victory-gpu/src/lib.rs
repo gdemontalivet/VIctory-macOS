@@ -18,6 +18,19 @@
 
 #[cfg(windows)]
 mod alias;
+pub mod bench;
+#[cfg(windows)]
+mod backend;
+#[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod ambient_estimate;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_estimate_set;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_set;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -40,6 +53,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod hdr_probe;
 mod hold;
 #[cfg(windows)]
 mod host;
@@ -63,6 +78,8 @@ pub mod queue;
 mod ranges;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
+mod ray_skip;
+#[cfg(any(windows, test))]
 mod recent;
 pub mod resource;
 pub mod root;
@@ -76,6 +93,8 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+#[cfg(any(windows, test))]
+mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -99,7 +118,7 @@ pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_remapped, writing as kernel_will_write,
+    title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,
 };
 
 /// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
