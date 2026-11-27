@@ -73,7 +73,7 @@ fn build() -> &'static [u8; 32] {
 /// (made here if it is not yet: the cache belongs to the GPU it was filled
 /// on, as the pipeline library does); none without one.
 fn host_wave32() -> bool {
-    crate::host::host().is_some_and(crate::host::Host::wave32)
+    crate::host::host().is_some_and(crate::backend::HostGpu::wave32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -102,13 +102,33 @@ fn atomic_locks() -> bool {
 
 /// Whether the lanes of a wave first try their 64-bit atomics' locks in
 /// rounds before the lanes still not done take turns (`emit`, "Atomic
-/// locks"; #240): opt-in while it is measured, `VICTORY_ATOMIC_LOCK_ROUNDS=1`.
-/// Only with [`atomic_locks`].
+/// locks"; #240): wherever [`atomic_locks`] are on. In the game the rounds
+/// took a world frame from 7.9 to 2.5 s on an M2 Max, from 5.29 to 0.71 s
+/// on an M4 Pro and from 2.9 to 0.88 s on an M4, and left no GPU resets.
+/// `VICTORY_ATOMIC_LOCK_ROUNDS=0` goes back to the turns alone.
 fn atomic_lock_rounds() -> bool {
     static ROUNDS: OnceLock<bool> = OnceLock::new();
     *ROUNDS.get_or_init(|| {
-        atomic_locks() && std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").as_deref() == Ok("1")
+        let var = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
+        rounds_on(atomic_locks(), var.as_deref())
     })
+}
+
+/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
+/// a wave to their maximum key, one representative locking (`emit`,
+/// "Atomic locks"; #240): opt-in while it is measured,
+/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
+fn atomic_umax() -> bool {
+    static UMAX: OnceLock<bool> = OnceLock::new();
+    *UMAX.get_or_init(|| {
+        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
+    })
+}
+
+/// The rounds, given whether the locks are on and
+/// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
+fn rounds_on(locks: bool, var: Option<&str>) -> bool {
+    locks && var != Some("0")
 }
 
 /// Whether compute shaders' biased samples run as scaled gradient samples:
@@ -135,6 +155,64 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether a size query on a writable image asks for level 0 in every
+/// program (`Options::uav_size_level0`): only with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC
+/// writes with a size of 0, so a program that computes with that size
+/// goes wrong: the title's shadow min/max program (`07f451a14b13fecb`)
+/// writes one flat value and sun shadows get 16x16-tile edges. Level 0
+/// in every program also changed the TAA disocclusion mask (speckles on
+/// skin), so a list of shader hashes instead of `1` turns it on for those
+/// programs only ([`uav_size_level0_for`]).
+fn uav_size_level0() -> bool {
+    uav_size_rule().0
+}
+
+/// Whether the program in `container` gets the level-0 size query: with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`, or when the variable lists its hash (16
+/// digits, as the log prints shader hashes; several with commas).
+fn uav_size_level0_for(container: &[u8]) -> bool {
+    let (all, only) = uav_size_rule();
+    *all || (!only.is_empty() && only.contains(&blake3::hash(container).to_hex()[..16].to_owned()))
+}
+
+fn uav_size_rule() -> &'static (bool, Vec<String>) {
+    static RULE: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = uav_size(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref());
+        if rule.0 {
+            tracing::info!("VICTORY_UAV_SIZE_LEVEL0=1: size queries on writable images ask for level 0");
+        } else if !rule.1.is_empty() {
+            tracing::info!(
+                programs = ?rule.1,
+                "VICTORY_UAV_SIZE_LEVEL0: size queries on writable images ask for level 0 in these programs only"
+            );
+        }
+        rule
+    })
+}
+
+/// `VICTORY_UAV_SIZE_LEVEL0`'s rule: `1` is every program; a list of
+/// 16-digit shader hashes is those programs; anything else is off.
+fn uav_size(value: Option<&str>) -> (bool, Vec<String>) {
+    let value = value.unwrap_or_default().trim();
+    if value == "1" {
+        return (true, Vec::new());
+    }
+    let hashes: Vec<String> = value
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
+    if hashes
+        .iter()
+        .all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        (false, hashes)
+    } else {
+        (false, Vec::new())
+    }
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -154,22 +232,27 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with host workarounds (atomic locks and
-/// their rounds, bias as gradients, narrow waves): their own cache entries,
-/// one per combination.
+/// [`build`] for translations with host workarounds (atomic locks, their
+/// rounds and umax reduction, bias as gradients, narrow waves, level-0
+/// size queries on writable images): their own cache entries, one per
+/// combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
-    if !locks && !bias && !narrow {
+    let umax = rounds && options.atomic_umax;
+    let uav_level0 = options.uav_size_level0;
+    if !locks && !bias && !narrow && !uav_level0 {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
-        | usize::from(rounds) << 3;
+        | usize::from(rounds) << 3
+        | usize::from(umax) << 4
+        | usize::from(uav_level0) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -179,11 +262,17 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if rounds {
             h.update(b"atomic lock rounds");
         }
+        if umax {
+            h.update(b"atomic umax");
+        }
         if bias {
             h.update(b"bias as gradients");
         }
         if narrow {
             h.update(b"narrow waves");
+        }
+        if uav_level0 {
+            h.update(b"uav size level 0");
         }
         *h.finalize().as_bytes()
     })
@@ -199,16 +288,20 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
         atomic_lock_rounds: atomic_lock_rounds(),
+        atomic_umax: atomic_umax(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        uav_size_level0: uav_size_level0(),
     }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let options = runtime_options();
+    let mut options = runtime_options();
+    // One program at a time, if the switch lists hashes.
+    options.uav_size_level0 = uav_size_level0_for(container);
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let build = translation_build(options);
@@ -300,7 +393,7 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -363,6 +456,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        half_views,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -419,6 +513,11 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, half_views.len() as u32);
+    for &(slot, dword) in half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -485,6 +584,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -501,12 +605,53 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        half_views,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rounds are on wherever the locks are, `VICTORY_ATOMIC_LOCK_ROUNDS=0`
+    /// turns them off, and without the locks there are none (#240).
+    #[test]
+    fn lock_rounds_are_on_with_the_locks_unless_turned_off() {
+        assert!(rounds_on(true, None), "on by default with the locks");
+        assert!(rounds_on(true, Some("1")), "the old opt-in still works");
+        assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
+        assert!(!rounds_on(false, None), "no rounds without the locks");
+        assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
+
+    #[test]
+    fn the_size_query_switch_is_all_programs_or_a_list_of_hashes() {
+        assert_eq!(uav_size(None), (false, vec![]));
+        assert_eq!(uav_size(Some("")), (false, vec![]));
+        assert_eq!(uav_size(Some("0")), (false, vec![]));
+        assert_eq!(uav_size(Some("1")), (true, vec![]));
+        assert_eq!(uav_size(Some("yes")), (false, vec![]));
+        let two = vec!["07f451a14b13fecb".to_owned(), "11eeb27c2d15980d".to_owned()];
+        assert_eq!(
+            uav_size(Some("07F451A14B13FECB, 11eeb27c2d15980d")),
+            (false, two)
+        );
+        // A list with a wrong entry is no list: nothing is turned on.
+        assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
+
+    /// Translations with the level-0 size query have cache entries of
+    /// their own.
+    #[test]
+    fn the_size_query_switch_keys_the_cache() {
+        let plain = victory_shader::emit::Options::default();
+        let level0 = victory_shader::emit::Options {
+            uav_size_level0: true,
+            ..plain
+        };
+        assert_eq!(translation_build(plain), build());
+        assert_ne!(translation_build(level0), build());
+    }
 
     fn shader() -> HostShader {
         HostShader {
@@ -535,6 +680,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
