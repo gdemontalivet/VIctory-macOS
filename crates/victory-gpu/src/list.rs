@@ -15,6 +15,8 @@ use std::mem::offset_of;
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
+#[cfg(windows)]
+use crate::backend::HostGpu;
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
@@ -207,10 +209,14 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
         if !current.is_empty() {
             let Some(next) = next_segment(this) else { return };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            current.close();
             // SAFETY: the title passes one of our lists.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            {
+                let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.flush_hdr_probe(current);
+                current.close();
+                state.cut(next);
+            }
             next.defer_wait(wait);
             return;
         }
@@ -239,38 +245,116 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
     Some(unsafe { &*next })
 }
 
+/// Restarts a title list's host slots: every slot a queue still holds
+/// (`Arc::strong_count > 1`) is replaced with a fresh list from `make`,
+/// the used slots that are kept are reset with `reset`, and the last old
+/// held list is returned, left to the queue that holds it (so what the
+/// title list owned can wait until it has run). Every replacement is
+/// made before any slot is touched: if one `make` fails, `hosts` is left
+/// exactly as it was and its error is returned, so a held segment keeps
+/// its list and nothing it may still read is dropped early.
+#[cfg(any(windows, test))]
+fn restart_hosts<T, E>(
+    hosts: &mut [std::sync::Arc<T>],
+    used: usize,
+    mut make: impl FnMut() -> Result<std::sync::Arc<T>, E>,
+    mut reset: impl FnMut(&T),
+) -> Result<Option<std::sync::Arc<T>>, E> {
+    // Prepare every replacement first: a failure here mutates nothing.
+    let mut held = Vec::new();
+    for (k, h) in hosts.iter().enumerate() {
+        if std::sync::Arc::strong_count(h) > 1 {
+            held.push((k, make()?));
+        }
+    }
+    // Commit: every replacement exists, so creating one cannot fail from
+    // here on (a native reset failure on an unheld slot still goes
+    // through `host::fail`).
+    let mut left = None;
+    let mut fresh = held.into_iter().peekable();
+    for (k, h) in hosts.iter_mut().enumerate() {
+        if let Some((hk, _)) = fresh.peek()
+            && *hk == k
+        {
+            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+            let (_, fresh) = fresh.next().unwrap_or_else(|| unreachable!("peeked above"));
+            left = Some(std::mem::replace(h, fresh));
+        } else if k <= used {
+            reset(h);
+        }
+    }
+    Ok(left)
+}
+
 /// After the title list's last submission: its host lists start again,
 /// and a host list a queue still holds (`crate::hold`) is left to the
 /// queue and replaced. The last one left so, which should keep what the
-/// title list owned.
+/// title list owned. The replacements are all prepared before the
+/// segment or any slot is touched: if one cannot be made, nothing
+/// changes and the error is returned.
 #[cfg(windows)]
-fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, HRESULT> {
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
-    let used = list.segment.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let used = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
-    let mut left = None;
-    for (k, h) in hosts.iter_mut().enumerate() {
-        if std::sync::Arc::strong_count(h) > 1 {
-            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+    let left = restart_hosts(
+        &mut hosts,
+        used,
+        || {
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
-                Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
-                _ => continue,
+            if let Some(fresh) = spare {
+                Ok(std::sync::Arc::new(fresh.list))
+            } else if let Some(host) = crate::host::host() {
+                host.new_list().map(std::sync::Arc::new).map_err(|e| {
+                    tracing::warn!(error = %e, "no replacement host command list");
+                    e.code().0
+                })
+            } else {
+                tracing::warn!("no host command list to replace a held segment");
+                Err(crate::object::E_OUTOFMEMORY)
             }
-        } else if k <= used {
-            h.reset();
-        }
-    }
-    left
+        },
+        crate::host::HostList::reset,
+    )?;
+    list.segment.store(0, std::sync::atomic::Ordering::Relaxed);
+    Ok(left)
 }
 
 /// Host lists [`restart`] left to a queue, back once they ran: the next
 /// ones it hands out (a host list and its allocators are not free to make;
 /// Grand Theft Auto VI resets up to 21 lists a frame while they are held).
+/// Oldest first: the newest is the one [`restart`] takes.
 #[cfg(windows)]
-static SPARE: std::sync::Mutex<Vec<crate::host::HostList>> = std::sync::Mutex::new(Vec::new());
+static SPARE: std::sync::Mutex<Vec<Idle>> = std::sync::Mutex::new(Vec::new());
+
+/// A list in [`SPARE`], with when it went idle and the scratch it keeps.
+#[cfg(windows)]
+struct Idle {
+    list: crate::host::HostList,
+    at: std::time::Instant,
+    bytes: u64,
+}
+
+/// The scratch [`SPARE`] keeps in all, at most: the most the texture staging
+/// buffers keep (`texture::KEPT_BYTES_MAX`). A list keeps what its last
+/// cycle needed and nothing bounded that (64 lists of 12 MB held 764 MB), so
+/// the oldest entries give theirs up past this.
+#[cfg(windows)]
+const SPARE_BYTES: u64 = 256 << 20;
+
+/// Scratch [`shed`] gave up since the last frame-rate line, in bytes
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static SPARE_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The spare lists and the scratch they keep, in bytes (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn spare_scratch() -> (usize, u64) {
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    (spare.len(), spare.iter().map(|i| i.bytes).sum())
+}
 
 /// A host list a queue has run: one no title list holds any more is reset
 /// and kept for [`restart`].
@@ -279,9 +363,40 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
         list.reset();
+        let bytes = list.scratch_bytes();
+        let now = std::time::Instant::now();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
-            spare.push(list);
+            spare.push(Idle {
+                list,
+                at: now,
+                bytes,
+            });
+        }
+        shed(&mut spare, now);
+    }
+}
+
+/// At each submission: the scratch of spare lists idle past
+/// [`crate::recent::WINDOW`] is given up, and of the oldest while the rest
+/// keep more than [`SPARE_BYTES`]. A spare list is reset and no title list
+/// holds it, so nothing uses its scratch.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let now = std::time::Instant::now();
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    shed(&mut spare, now);
+}
+
+#[cfg(windows)]
+fn shed(spare: &mut [Idle], now: std::time::Instant) {
+    let n = crate::recent::idle_shed(spare.iter().map(|i| (i.at, i.bytes)), now, SPARE_BYTES);
+    for idle in &mut spare[..n] {
+        if idle.bytes > 0 {
+            idle.list.shed_scratch();
+            #[cfg(feature = "diagnostics")]
+            SPARE_SHED.fetch_add(idle.bytes, std::sync::atomic::Ordering::Relaxed);
+            idle.bytes = 0;
         }
     }
 }
@@ -450,6 +565,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        with_state(this, |list, state| state.flush_hdr_probe(list));
         host.close();
     }
     S_OK
@@ -458,13 +574,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // A queue may still hold what the list recorded (`restart`, `leave`).
-    // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     {
-        let held = restart(this);
+        // The replacements for the held segments are all made before
+        // anything is mutated: on failure the list keeps its slots, its
+        // segment and its upload memory, and the error goes back.
+        let held = match restart(this) {
+            Ok(left) => left,
+            Err(hr) => return hr,
+        };
+        // A queue may still hold what the list recorded (`restart`, `leave`).
+        // SAFETY: the title passes one of our lists.
+        let uploads = unsafe { &(*this.cast::<List>()).uploads };
+        let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
         // SAFETY: the title passes one of our lists.
         let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
@@ -473,10 +595,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         leave(held, uploads, old);
     }
     #[cfg(not(windows))]
-    drop(uploads);
+    {
+        // SAFETY: the title passes one of our lists.
+        let uploads = unsafe { &(*this.cast::<List>()).uploads };
+        let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(uploads);
+        let _ = this;
+    }
     crate::pipeline::bound(pipeline);
-    #[cfg(not(windows))]
-    let _ = this;
     S_OK
 }
 
@@ -553,6 +679,28 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// A transition barrier between two read-only states (diagnostics: such a
+/// barrier on a buffer orders nothing, but still becomes a global UAV
+/// barrier). A transition has the subresource and the state before packed
+/// in `second` (low, high 32 bits) and the state after in `last`. States
+/// are the PC bits (the console's compression hints are higher); common
+/// (none) is not counted, as it may stand for a write the title promoted
+/// from.
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+fn read_only_transition(b: &Barrier) -> bool {
+    // Vertex and constant buffer, index buffer, depth read, non-pixel and
+    // pixel shader resource, indirect argument, copy source, resolve
+    // source, ray tracing acceleration structure read, shading rate source.
+    const READ_ONLY: u32 =
+        0x1 | 0x2 | 0x20 | 0x40 | 0x80 | 0x200 | 0x800 | 0x2000 | 0x40_0000 | 0x100_0000;
+    const PC: u32 = 0x01ff_ffff;
+    let read_only = |state: u32| {
+        let state = state & PC;
+        state != 0 && state & !READ_ONLY == 0
+    };
+    b.kind == 0 && read_only((b.second >> 32) as u32) && read_only(b.last as u32)
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -569,12 +717,27 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        let buffer_barrier = barriers.iter().any(|b| {
+        let on_buffer = |b: &Barrier| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        });
+        };
+        let buffer_barrier = barriers.iter().any(on_buffer);
         let global_uav = barriers.iter().any(|b| b.kind == 2 && b.first.is_null());
         if buffer_barrier {
             host.push(UAV_BARRIER);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                let (buffers, read_only) = barriers
+                    .iter()
+                    .filter(|b| on_buffer(b))
+                    .fold((0, 0), |(n, r), b| {
+                        (n + 1, r + u64::from(read_only_transition(b)))
+                    });
+                add(C::BufferBarriers, buffers);
+                add(C::BufferReadOnly, read_only);
+                add(C::BufferUav, 1);
+                add(C::BufferUavSkippable, u64::from(buffers == read_only));
+            }
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -728,24 +891,24 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some((buffer, at, staging)) = list.upload(bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = at;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + at, bytes));
             }
             _upload = buffer;
         } else {
@@ -820,6 +983,13 @@ impl CopyLocation {
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
 pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Buffer footprint to texture copies since the last frame-rate line: how
+/// many, bytes, and how many of them were larger than a scratch chunk (a
+/// buffer of their own; the rest take the list's scratch) (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static FOOTPRINT_UPLOADS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1718,7 +1888,13 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
             let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
             list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
+            crate::copystat::add(
+                crate::copystat::C::GroupBarriers,
+                groups.iter().map(|g| u64::from(g[1])).sum(),
+            );
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GroupCalls, 1);
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
@@ -2082,5 +2258,137 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    /// Transitions between two read-only states are told from those that
+    /// write, from common, and from other barrier kinds.
+    #[test]
+    fn read_only_transitions_need_both_states_read_only() {
+        const COMMON: u32 = 0;
+        const INDEX: u32 = 0x2;
+        const UNORDERED: u32 = 0x8;
+        const NON_PIXEL: u32 = 0x40;
+        const PIXEL: u32 = 0x80;
+        const COPY_DEST: u32 = 0x400;
+        const GENERIC_READ: u32 = 0xac3;
+        // The console's compression hints live above the PC bits.
+        const HINT: u32 = 1 << 26;
+        let transition = |kind, before: u32, after: u32| Barrier {
+            kind,
+            flags: 0,
+            first: 8 as This,
+            second: 0xffff_ffff | (u64::from(before) << 32),
+            last: u64::from(after),
+        };
+        assert!(read_only_transition(&transition(0, NON_PIXEL, PIXEL)));
+        let both = |before, after| read_only_transition(&transition(0, before, after));
+        assert!(both(GENERIC_READ, INDEX | PIXEL));
+        assert!(both(NON_PIXEL | HINT, PIXEL));
+        assert!(!read_only_transition(&transition(0, UNORDERED, PIXEL)));
+        assert!(!read_only_transition(&transition(0, PIXEL, UNORDERED)));
+        assert!(!read_only_transition(&transition(0, NON_PIXEL, COPY_DEST)));
+        assert!(!read_only_transition(&transition(0, COMMON, PIXEL)));
+        assert!(!read_only_transition(&transition(0, NON_PIXEL, COMMON)));
+        assert!(!read_only_transition(&transition(2, NON_PIXEL, PIXEL)));
+        assert!(!read_only_transition(&UAV_BARRIER));
+    }
+
+    /// A stand-in host list for `restart_hosts` (tests).
+    struct FakeHost {
+        id: u32,
+        reset: std::sync::atomic::AtomicBool,
+    }
+
+    fn fake_host(id: u32) -> FakeHost {
+        FakeHost {
+            id,
+            reset: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Held slots are replaced with the fresh lists, the used kept slots
+    /// are reset, the rest are left alone, and the last held slot's old
+    /// list comes back for the queue that holds it.
+    #[test]
+    fn restart_replaces_held_slots_and_returns_the_last_held_one() {
+        let mut hosts: Vec<Arc<FakeHost>> = (0..4).map(|id| Arc::new(fake_host(id))).collect();
+        // A queue still holds slots 0 and 2.
+        let held0 = hosts[0].clone();
+        let held2 = hosts[2].clone();
+        let mut next = 100;
+        let left = restart_hosts(
+            &mut hosts,
+            1,
+            || -> Result<Arc<FakeHost>, ()> {
+                let id = next;
+                next += 1;
+                Ok(Arc::new(fake_host(id)))
+            },
+            |h| h.reset.store(true, Ordering::Relaxed),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&left, &held2));
+        assert_eq!(hosts[0].id, 100, "held slot 0 replaced");
+        assert!(hosts[1].reset.load(Ordering::Relaxed), "used, unheld slot 1 reset");
+        assert_eq!(hosts[2].id, 101, "held slot 2 replaced");
+        assert!(!hosts[3].reset.load(Ordering::Relaxed), "past `used`, unheld slot 3 untouched");
+        assert_eq!(hosts[3].id, 3);
+        // Slot 0's old list is gone (only the queue's clone remains); slot
+        // 2's is kept alive by the queue's clone and the returned `left`.
+        assert_eq!(Arc::strong_count(&held0), 1);
+        assert_eq!(Arc::strong_count(&held2), 2);
+    }
+
+    /// If any replacement cannot be made, nothing is mutated: every slot
+    /// keeps its list (a held segment keeps the one the queue will still
+    /// run), no kept slot is reset, and the error comes back — so the
+    /// caller drops no upload memory while a held segment can read it.
+    #[test]
+    fn restart_failure_leaves_every_slot_untouched() {
+        let mut hosts: Vec<Arc<FakeHost>> = (0..3).map(|id| Arc::new(fake_host(id))).collect();
+        // Slot identity, snapshotted without holding any of the lists.
+        let original: Vec<std::sync::Weak<FakeHost>> = hosts.iter().map(Arc::downgrade).collect();
+        // A queue still holds slots 0 and 2; slot 1 is unheld.
+        let held0 = hosts[0].clone();
+        let held2 = hosts[2].clone();
+        assert_eq!(
+            hosts.iter().map(Arc::strong_count).collect::<Vec<_>>(),
+            [2, 1, 2],
+            "slot 0 held, slot 1 unheld, slot 2 held"
+        );
+        let mut calls = 0;
+        let result = restart_hosts(
+            &mut hosts,
+            2,
+            || -> Result<Arc<FakeHost>, ()> {
+                calls += 1;
+                // The second held slot's (slot 2's) replacement fails.
+                if calls < 2 {
+                    Ok(Arc::new(fake_host(100 + calls)))
+                } else {
+                    Err(())
+                }
+            },
+            |h| h.reset.store(true, Ordering::Relaxed),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 2, "every held slot's replacement was attempted first");
+        assert!(
+            hosts
+                .iter()
+                .zip(&original)
+                .all(|(a, b)| b.upgrade().is_some_and(|o| Arc::ptr_eq(a, &o))),
+            "no slot was mutated, not even the one whose replacement was made"
+        );
+        assert!(
+            !hosts.iter().any(|h| h.reset.load(Ordering::Relaxed)),
+            "no kept slot was reset"
+        );
+        assert!(
+            !hosts[1].reset.load(Ordering::Relaxed),
+            "the unheld slot 1 is not reset on failure"
+        );
+        assert!(Arc::ptr_eq(&hosts[0], &held0) && Arc::ptr_eq(&hosts[2], &held2));
     }
 }

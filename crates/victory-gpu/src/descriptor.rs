@@ -7,6 +7,8 @@
 //! leaves room for whatever stride a title assumes.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use crate::backend::HostGpu;
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
@@ -239,6 +241,34 @@ pub(crate) fn sync_heaps() {
     // 650,000 slots checked a frame, 29 submissions). A heap is not dropped
     // while its page is made: `Heap::drop` takes the write lock to leave the
     // list, so a heap still listed under the lock is alive.
+    let sync_range = |host: &host::HostHeap,
+                      count: u32,
+                      start: u64,
+                      step: u64,
+                      range_from: usize,
+                      range_to: usize,
+                      bytes: &[u8]| {
+        let (first, last) = (
+            (range_from as u64 - start) / step,
+            (range_to as u64 - start).div_ceil(step),
+        );
+        let last = last.min(u64::from(count));
+        if first >= last {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
+        host.sync_slots_bytes(
+            first as u32,
+            last as u32,
+            start,
+            step,
+            range_from as u64,
+            bytes,
+        );
+    };
+
+    const SUB_PAGE: usize = 4 << 10;
     let page_size = crate::watch::PAGE;
     let mut page_buf = vec![0u8; page_size];
     for (start, at, ranges) in work {
@@ -255,30 +285,37 @@ pub(crate) fn sync_heaps() {
                     break;
                 };
                 let step = u64::from(step);
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                let len = end - page;
-                // By page: read the whole mapped range once; one with nothing
-                // mapped (the title unmaps heap pages too) holds no records.
-                if !crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
+                let heap_end = start.saturating_add(u64::from(heap.desc.count).saturating_mul(step));
+                let (page, end) = (
+                    page.max(from),
+                    (page + page_size).min(to).min(heap_end as usize),
+                );
+                if page >= end {
                     continue;
                 }
-                let (first, last) = (
-                    (page as u64 - start) / step,
-                    (end as u64 - start).div_ceil(step),
-                );
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots_bytes(
-                    first as u32,
-                    last.min(u64::from(heap.desc.count)) as u32,
-                    start,
-                    step,
-                    page as u64,
-                    &page_buf[..len],
-                );
+                let len = end - page;
+                // By page: read the whole mapped range once; if part of a 64 KiB
+                // page is unmapped, fall back to 4 KiB OS pages so mapped slots
+                // are never skipped.
+                if crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
+                    sync_range(host, heap.desc.count, start, step, page, end, &page_buf[..len]);
+                } else {
+                    for sub in (page & !(SUB_PAGE - 1)..end).step_by(SUB_PAGE) {
+                        let (sub_from, sub_to) = (sub.max(page), (sub + SUB_PAGE).min(end));
+                        let sub_len = sub_to - sub_from;
+                        if crate::host::read_into(sub_from as *const u8, &mut page_buf[..sub_len]) {
+                            sync_range(
+                                host,
+                                heap.desc.count,
+                                start,
+                                step,
+                                sub_from,
+                                sub_to,
+                                &page_buf[..sub_len],
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -380,15 +417,15 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, only if that heap still exists and its identity matches `id`.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -490,7 +527,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Render target and depth views: a packed 16-bit target may be
+        // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -1325,6 +1364,54 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_reads_partial_64k_pages_and_small_heaps() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // Reserve 64 KiB with write-watch, commit only the first 4 KiB so a full
+        // heap-range read_into fails and sync_heaps must fall back to 4 KiB pages.
+        // SAFETY: fresh reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                64 << 10,
+                MEM_RESERVE | crate::watch::tests::MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committing the first 4 KiB of our reservation.
+        let committed = unsafe { VirtualAlloc(base as *const _, 4 << 10, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 512, // 512 * 16 = 8 KiB: spans committed 4 KiB + uncommitted 4 KiB
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: base as u64,
+            size: 512 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            let slot1 = base as u64 + 16;
+            // SAFETY: 16 bytes inside the committed first 4 KiB.
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot1 as *mut u8, 16) };
+            assert!(!host.made(1));
+            sync_heaps();
+            assert!(host.made(1), "partial 64 KiB page / small heap must still sync");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// A placed heap reused at the same address replaces the stale range;
     /// descriptor writes go only to the new heap.
     #[cfg(windows)]
@@ -1441,5 +1528,73 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    /// A table made afresh for a draw holds the descriptors its shader
+    /// moves halves through (`HostShader::half_views`), also past the range
+    /// starts its used-resource entries give: with one entry for a range
+    /// from dword 0 and a 16-bit float buffer view at dword 8, the table
+    /// takes two dynamic slots, so the next allocation does not land on the
+    /// view's.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_table_holds_the_half_views_past_its_range_starts() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap");
+        let (first, second) = (title.start, title.start + 32);
+        // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
+        let memory = [0u64; 64];
+        let address = memory.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &words, second);
+        assert!(view(second).as_deref().and_then(host::half_view).is_some());
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(true, 1, first);
+        let range = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let made = state.tables(&list, &[range], &[(1, 8)], true);
+        let [(1, offset)] = made[..] else {
+            panic!("one fresh table for root parameter 1, not {made:?}");
+        };
+        assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
+        let next = host_heap.dynamic(1).expect("a dynamic slot");
+        host_heap.release(host_heap.id(), next, 1);
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        assert_eq!(
+            next,
+            offset / 32 + 2,
+            "the next allocation took the table's second slot"
+        );
     }
 }
