@@ -1483,14 +1483,16 @@ fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
 
 #[test]
 fn no_barrier_in_divergent_code() {
-    // Write and read both under the branch: no barrier can go there.
+    // Write and read both under a branch: without predication no barrier can
+    // go in divergent code, while lowering with `narrow_waves` predicates the
+    // acyclic diamond and places one uniform barrier between them.
     let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
     w.extend(DS_WRITE_V1_V0);
     w.extend(DS_READ_V2_V1_4);
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
     assert!(barriers_at(&wave64(&w)).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+    assert_eq!(split_barriers(&w, 64, true), 1);
 }
 
 const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
@@ -2585,10 +2587,11 @@ fn the_null_pair_is_read_once_in_the_entry_block() {
 
 /// A box32 node's last 48 bytes are read through its first 64 bytes'
 /// page-table lookup, and looked up again only in lanes whose node starts
-/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
-/// the null pair's view in the entry block, then the head's 16 dwords and
-/// the tail's 12 through that lookup, and the second lookup in a block of
-/// its own.
+/// in the last 64 bytes of a page (`raw_load_past`): the null pair's view
+/// in the entry block, the head's lookup in the `ty < 6` block (so sentinel
+/// `INVALID` and unhandled types 6/7 read nothing), then the head's 16
+/// dwords and the tail's 12 through that lookup, and the second lookup in a
+/// block of its own.
 #[test]
 fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     // The descriptor in s[12:15], based at the pointer.
@@ -2611,11 +2614,53 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
     assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
     assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
-    assert_eq!(table[..3], [0; 3], "{table:?}");
+    assert_eq!(table[0], 0, "{table:?}");
+    let head = table[1];
+    assert!(head > 0 && table[2] == head, "{table:?}");
     let again = table[3];
-    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
-    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
-    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+    assert!(again > head && table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    // Excluding the 2 page-table loads in `head`, the 4 head node loads and
+    // 3 non-crossing tail node loads all reuse `head`'s lookup.
+    let through_head = loads.iter().filter(|&&b| b >= head && b < again).count() - 2;
+    assert_eq!(through_head, 4 + 3, "{loads:?} {table:?}");
+}
+
+#[test]
+fn buffer_load_readfirstlane_loop_is_in_step() {
+    let w: Vec<u32> = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE030_1000,
+        0x800B_0403, // buffer_load_dword v4, v3, s[44:47], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2A_0504, // v_readfirstlane_b32 s21, v4
+        0xBE94_0380, // s_mov_b32 s20, 0
+        // loop body (block 1):
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_1514, // s_cmp_lt_u32 s20, s21
+        0xBF85_FFFD, // s_cbranch_scc1 -3
+        S_ENDPGM,
+    ];
+    let p = wave64(&w);
+    let st = structure::structure(&p).unwrap();
+    let step = super::in_step(&p, &st);
+    assert!(
+        step.iter().all(|&s| s),
+        "expected all blocks in_step, got {step:?}; exits={:?}; blocks={:?}",
+        st.exits,
+        p.blocks
+            .iter()
+            .map(|b| b
+                .insts
+                .iter()
+                .map(|i| (i.name(), i.reads.clone(), i.writes.clone()))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
 }
 
 /// SMEM `op` (`s_load_dword*` 0-4, `s_buffer_load_dword*` 8-12) of
@@ -2910,25 +2955,34 @@ fn lower_halves_io(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        atomic_lock_rounds: false,
-        atomic_umax: false,
-        bias_as_gradients: false,
-        host_wave32: true,
-        narrow_waves: false,
-        uav_size_level0: false,
-        view_marks: false,
-    })
+    // These tests probe the value analysis behind each refusal, which
+    // selective predication of a divergent branch would route around.
+    super::NO_PREDICATION.with(|c| c.set(true));
+    // The wave ticket's own barrier would count among the exchanges these
+    // tests look for, so they lower without it.
+    let lowered = crate::emit::with_thread_ticket(false, || {
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            host_wave32: true,
+            narrow_waves: false,
+            uav_size_level0: false,
+            view_marks: false,
+        })
+    });
+    super::NO_PREDICATION.with(|c| c.set(false));
+    lowered
 }
 
 /// A `v_writelane_b32` asks for the console's lane layout (so the program
