@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod atomics;
 mod barriers;
 mod bvh;
+mod f64;
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
 #[path = "half_views.rs"]
@@ -7198,6 +7199,10 @@ impl<'a> Lower<'a> {
                     r = self.s.m.select(c, nan, sat, r);
                 }
                 int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                let r = self.cvt_f32_f64(inst)?;
+                float(self, r)
             }
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
