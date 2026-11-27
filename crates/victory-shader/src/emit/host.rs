@@ -965,6 +965,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         heap_writes: lowered.heap_writes,
         heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     })
 }
 
@@ -1066,6 +1067,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         heap_writes: false,
         heap_index_sources: Vec::new(),
         view_marks: false,
+        half_views: Vec::new(),
     }
 }
 
@@ -1449,6 +1451,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -1475,6 +1478,9 @@ pub enum View<'a> {
     Uint4TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
+    /// program that moves halves is shown ([`super::HostShader::half_views`]).
+    HalfUintUav(u32),
     /// A typed buffer UAV in this format, of this many elements of this many
     /// bytes, zeroed.
     TypedUav(DXGI_FORMAT, u32, u32),
@@ -1521,6 +1527,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
             View::Buffer { stride: Stride::Structured(n), .. } => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
+            View::HalfUintUav(_) => 8 | super::VIEW_INTEGER,
             _ => 0,
         })
         .collect()
@@ -1839,12 +1846,18 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) | View::TypedUav(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::HalfUintUav(e) => (
+                                2 * e,
+                                DXGI_FORMAT_R16G16B16A16_UINT,
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),

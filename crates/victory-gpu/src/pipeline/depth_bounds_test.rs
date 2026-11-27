@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
 };
+use crate::backend::HostGpu;
 use windows::core::{GUID, Interface, PCSTR, s};
 
 #[repr(C, align(8))]
@@ -73,6 +74,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             heap_writes: false,
             heap_index_sources: Vec::new(),
             view_marks: false,
+            half_views: Vec::new(),
         },
         used: Vec::new(),
     }));

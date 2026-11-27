@@ -333,7 +333,7 @@ pub(super) fn prepare_bake_sources(state: &State, list: &HostList, p: &HostPipel
         if let View::Shader(r, _) = resolved {
             let resource = *r as This;
             if let Some(a) = crate::resource::alias_source(resource) {
-                crate::texture::alias_copy(list, a, resource);
+                crate::texture::alias_copy(list, a.get(), resource);
             }
             if let Some(copy) = crate::resource::host_copy(resource) {
                 copy.stamp();
@@ -423,6 +423,8 @@ fn read_title_u32(addr: u64) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
     use super::*;
     use std::collections::HashMap;
 
@@ -680,6 +682,7 @@ mod tests {
                     heap_writes: false,
                     heap_index_sources: Vec::new(),
                     view_marks: false,
+                    half_views: Vec::new(),
                 },
                 used: Vec::new(),
             },
@@ -805,7 +808,7 @@ mod tests {
         gfx.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         gfx.targets.NumRenderTargets = 1;
         gfx.targets.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        let pipeline = HostPipeline::new(&[vs, ps], Some(&gfx)).expect("host bake pipeline");
+        let pipeline = HostPipeline::new(&[vs, ps], Some(&gfx), |_, _| {}).expect("host bake pipeline");
 
         // 3. Create shader-visible title descriptor heap with 16 slots.
         let desc = [0u32, 16, 1, 0];

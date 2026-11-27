@@ -125,6 +125,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         heap_writes: lowered.heap_writes,
         heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     })
 }
 
@@ -965,6 +966,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap_writes: l.heap_writes,
             heap_index_sources: Vec::new(),
             view_marks: false,
+            half_views: l.half_views,
         }
     };
 

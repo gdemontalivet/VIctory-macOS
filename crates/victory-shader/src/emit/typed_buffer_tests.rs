@@ -145,6 +145,7 @@ fn shader() -> HostShader {
         heap_writes: lowered.heap_writes,
         heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     }
 }
 
