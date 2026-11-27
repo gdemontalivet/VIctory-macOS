@@ -395,6 +395,7 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::backend::{HostGpu, HostMemory};
 
     struct KindGuard {
