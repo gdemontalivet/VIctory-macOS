@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::HostGpu;
+use crate::census_fast::{Snapshot, SnapshotCache, UnorderedIndex};
 use crate::descriptor::View;
 use crate::host::HostList;
 use crate::object::This;
@@ -38,9 +39,27 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 
 /// A heap's slots that view title memory, and the distinct buffer ranges
 /// and textures among them (with how many slots view each).
-#[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    /// Generation-cached widening snapshot when `VICTORY_CENSUS_FAST=1`.
+    fast: Option<SnapshotCache<Shadow>>,
+}
+
+impl Default for Viewed {
+    fn default() -> Self {
+        Self::new(crate::census_fast::on())
+    }
+}
+
+impl Viewed {
+    /// Creates a bindless registry, optionally enabling the fast UAV range
+    /// index and snapshot cache (`VICTORY_CENSUS_FAST=1`).
+    pub(crate) fn new(fast: bool) -> Self {
+        Viewed {
+            inner: Mutex::new(Inner::new(fast)),
+            fast: fast.then(SnapshotCache::default),
+        }
+    }
 }
 
 type Range = (usize, u64, u64, bool);
@@ -49,7 +68,6 @@ type Range = (usize, u64, u64, bool);
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
-#[derive(Default)]
 struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
@@ -67,6 +85,27 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+    /// Secondary index of active UAV ranges only (`VICTORY_CENSUS_FAST=1`).
+    unordered: Option<UnorderedIndex<Shadow>>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl Inner {
+    fn new(fast: bool) -> Self {
+        Inner {
+            slots: HashMap::new(),
+            ranges: BTreeMap::new(),
+            textures: BTreeMap::new(),
+            hulls: HashMap::new(),
+            ends: HashMap::new(),
+            unordered: fast.then(UnorderedIndex::new),
+        }
+    }
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -82,8 +121,11 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
-    fn count(&mut self, index: u32, seen: &Seen, add: bool) {
+    /// Updates range, hull, texture, and (when enabled) UAV-index counts for
+    /// one slot transition. Returns whether the active UAV range set changed.
+    fn count(&mut self, index: u32, seen: &Seen, add: bool) -> bool {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
+        let mut unordered_changed = false;
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
@@ -93,6 +135,17 @@ impl Inner {
                 let now = e.0;
                 if now == 0 {
                     self.ranges.remove(&key);
+                }
+                if (was == 0) != (now == 0)
+                    && key.3
+                    && let Some(unordered) = &mut self.unordered
+                {
+                    if now > 0 {
+                        unordered.insert(key, shadow);
+                    } else {
+                        unordered.remove(&key);
+                    }
+                    unordered_changed = true;
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
@@ -130,6 +183,7 @@ impl Inner {
             }
             Seen::Left(_) => {}
         }
+        unordered_changed
     }
 
     /// The title released the texture `resource`: the slots viewing it go.
@@ -153,12 +207,18 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut unordered_changed = false;
         if let Some(old) = inner.slots.remove(&index) {
-            inner.count(index, &old, false);
+            unordered_changed |= inner.count(index, &old, false);
         }
         if let Some(seen) = seen {
-            inner.count(index, &seen, true);
+            unordered_changed |= inner.count(index, &seen, true);
             inner.slots.insert(index, seen);
+        }
+        if unordered_changed
+            && let Some(fast) = &self.fast
+        {
+            fast.invalidate();
         }
     }
 
@@ -192,14 +252,20 @@ impl Viewed {
             entries.push((index, entry));
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut unordered_changed = false;
         for (index, entry) in entries {
             if let Some(old) = inner.slots.remove(&index) {
-                inner.count(index, &old, false);
+                unordered_changed |= inner.count(index, &old, false);
             }
             if let Some(entry) = entry {
-                inner.count(index, &entry, true);
+                unordered_changed |= inner.count(index, &entry, true);
                 inner.slots.insert(index, entry);
             }
+        }
+        if unordered_changed
+            && let Some(fast) = &self.fast
+        {
+            fast.invalidate();
         }
     }
 
@@ -565,6 +631,24 @@ pub(crate) fn widened_writes_into(viewed: &Viewed, out: &mut Vec<(Arc<Shadow>, u
     );
 }
 
+/// Cached UAV buffer ranges for widening (`VICTORY_CENSUS_FAST=1`). Returns
+/// `None` when the fast cache is disabled on `viewed`, letting callers fall
+/// back to [`widened_writes`].
+pub(crate) fn unordered_writes(viewed: &Viewed) -> Option<Snapshot<Shadow>> {
+    let fast = viewed.fast.as_ref()?;
+    if !crate::under_wine() {
+        return Some(Arc::from([]));
+    }
+    if let Some(cached) = fast.get_cached() {
+        return Some(cached);
+    }
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner
+        .unordered
+        .as_ref()
+        .map(|unordered| fast.get_or_build(unordered))
+}
+
 /// Draws and dispatches run with heap-indexing shaders, those of them
 /// writing through the heap, textures uploaded for heaps, released textures
 /// a heap viewed and the slots taken with them (diagnostics).
@@ -829,6 +913,192 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), [0x20]);
         inner.forget(0x30);
         assert_eq!(inner.slots.len(), 2);
+    }
+
+    /// With `VICTORY_CENSUS_FAST=1`, `unordered_writes` matches the standard
+    /// `widened_writes` full-map scan across added, replaced, cleared,
+    /// unmade, batched (`set_batch`), and high/out-of-bounds slot indices,
+    /// while hitting the lock-free snapshot cache when UAV ranges are unchanged.
+    #[test]
+    fn fast_census_matches_standard_across_added_replaced_cleared_and_batched_slots() {
+        let Some(_host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let bufs = [
+            resource(1, 0x1000, 1, 0, 1),
+            resource(1, 0x1000, 1, 0, 1),
+            resource(1, 0x1000, 1, 0, 1),
+        ];
+        // Ensure each buffer has a registered shadow copy.
+        for &buf in &bufs {
+            let (ptr, size) = crate::resource::buffer_bytes(buf).unwrap();
+            assert!(crate::shadow::find(ptr as u64, size).is_some());
+        }
+        let uav_view = |buf: This, first_dw: u32, count_dw: u32| {
+            View::Unordered(
+                buf as usize,
+                0,
+                Some([39, 1, first_dw, 0, count_dw, 0, 0, 0, 1, 0]),
+            )
+        };
+        let srv_view = |buf: This, first_dw: u32, count_dw: u32| {
+            View::Shader(
+                buf as usize,
+                Some([39, 1, 0x1688, first_dw, 0, 0, count_dw, 0, 1, 0]),
+            )
+        };
+        let normalize_writes = |writes: &[(Arc<Shadow>, usize, usize)]| {
+            let mut out: Vec<_> = writes
+                .iter()
+                .map(|(s, a, l)| (Arc::as_ptr(s) as usize, *a, *l))
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let normalize_hulls = |viewed: &Viewed| {
+            let mut out: Vec<_> = viewed
+                .ranges()
+                .iter()
+                .map(|h| (Arc::as_ptr(&h.0) as usize, h.1, h.2, h.3))
+                .collect();
+            out.sort_unstable();
+            out
+        };
+
+        let standard = Viewed::new(false);
+        let fast = Viewed::new(true);
+        assert!(unordered_writes(&standard).is_none());
+
+        let check_eq = |label: &str| {
+            let got = unordered_writes(&fast).expect("fast cache enabled");
+            let mut want = Vec::new();
+            widened_writes_into(&standard, &mut want);
+            assert_eq!(
+                normalize_writes(&got),
+                normalize_writes(&want),
+                "{label}: widened writes mismatch"
+            );
+            assert_eq!(
+                normalize_hulls(&fast),
+                normalize_hulls(&standard),
+                "{label}: hulls mismatch"
+            );
+            got
+        };
+
+        let u0 = uav_view(bufs[0], 0, 64);
+        let u1 = uav_view(bufs[1], 16, 32);
+        let u2 = uav_view(bufs[2], 32, 48);
+        let s0 = srv_view(bufs[0], 0, 64);
+        let s1 = srv_view(bufs[1], 0, 64);
+
+        // 1. Added slots (UAV + SRV + high/out-of-bounds slot index).
+        for viewed in [&standard, &fast] {
+            viewed.set(0, Some(&u0), true);
+            viewed.set(1, Some(&s0), true);
+            viewed.set(u32::MAX, Some(&u1), true);
+        }
+        let first = check_eq("after adds");
+        // Adding a non-UAV SRV must keep the cached snapshot intact under Wine.
+        for viewed in [&standard, &fast] {
+            viewed.set(2, Some(&s1), true);
+        }
+        if crate::under_wine() {
+            assert!(
+                fast.fast.as_ref().unwrap().get_cached().is_some(),
+                "non-UAV SRV write must not invalidate UAV snapshot cache"
+            );
+            let cached = check_eq("after SRV-only add");
+            assert!(Arc::ptr_eq(&first, &cached));
+        }
+
+        // 2. Replaced slots: UAV -> UAV, UAV -> SRV, SRV -> UAV, made=false.
+        for viewed in [&standard, &fast] {
+            viewed.set(0, Some(&u2), true);
+            viewed.set(u32::MAX, Some(&s1), true);
+            viewed.set(1, Some(&u0), true);
+            viewed.set(3, Some(&u1), false); // unmade: Left, not a live UAV
+        }
+        check_eq("after replacements");
+
+        // 3. Batched updates (`set_batch`) mixing adds, duplicates, replacements,
+        //    clears, unmade views, and high slot indices.
+        let batch: &[(u32, Option<&View>, bool)] = &[
+            (10, Some(&u0), true),
+            (11, Some(&u1), true),
+            (12, Some(&u1), true), // duplicate UAV range
+            (13, Some(&s0), true),
+            (14, Some(&u2), false),
+            (0, None, false), // clear existing UAV
+            (2_000_000, Some(&u2), true),
+            (2_000_001, None, false), // clear nonexistent high slot
+        ];
+        standard.set_batch(batch);
+        fast.set_batch(batch);
+        check_eq("after set_batch");
+
+        // 4. Clearing one duplicate keeps range; clearing the second drops it.
+        for viewed in [&standard, &fast] {
+            viewed.set(11, None, false);
+        }
+        check_eq("after clearing first duplicate");
+        for viewed in [&standard, &fast] {
+            viewed.set(12, None, false);
+        }
+        check_eq("after clearing second duplicate");
+
+        // 5. Randomized mix of single `set` and `set_batch` calls.
+        let pool_views = [u0, u1, u2, s0, s1];
+        let mut rng = 0x517C_C1B7_2722_0A95u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut cache_hits = 0usize;
+        for step in 0..500usize {
+            if step.is_multiple_of(4) {
+                let mut ops: Vec<(u32, Option<usize>, bool)> = Vec::new();
+                for _ in 0..8 {
+                    let slot = if next().is_multiple_of(11) {
+                        1_500_000 + (next() % 8) as u32
+                    } else {
+                        (next() % 64) as u32
+                    };
+                    let view_idx = (!next().is_multiple_of(5)).then(|| (next() % 5) as usize);
+                    let made = !next().is_multiple_of(6);
+                    ops.push((slot, view_idx, made));
+                }
+                let refs: Vec<(u32, Option<&View>, bool)> = ops
+                    .iter()
+                    .map(|&(s, vi, m)| (s, vi.map(|i| &pool_views[i]), m))
+                    .collect();
+                standard.set_batch(&refs);
+                fast.set_batch(&refs);
+            } else {
+                let slot = (next() % 64) as u32;
+                let view = (!next().is_multiple_of(5)).then(|| &pool_views[(next() % 5) as usize]);
+                let made = !next().is_multiple_of(6);
+                standard.set(slot, view, made);
+                fast.set(slot, view, made);
+            }
+            if step.is_multiple_of(2) {
+                if fast.fast.as_ref().unwrap().get_cached().is_some() {
+                    cache_hits += 1;
+                }
+                check_eq("randomized step");
+            }
+        }
+        assert!(
+            !crate::under_wine() || cache_hits > 20,
+            "expected fast cache hits under Wine, saw {cache_hits}"
+        );
+
+        drop((standard, fast));
+        for buf in bufs {
+            crate::object::release_ref(buf);
+        }
     }
 
     /// The title writes a buffer and a texture, and views of them and of an

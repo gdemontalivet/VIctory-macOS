@@ -37,6 +37,9 @@ mod bindless;
 mod capture;
 #[cfg(any(windows, test))]
 mod caption;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod census_fast;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]

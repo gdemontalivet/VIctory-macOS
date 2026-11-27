@@ -4036,6 +4036,17 @@ void main() { dst.Store4(0, asuint(src[1])); }
     /// after that barrier must see the heap's then-current UAV range.
     #[test]
     fn a_late_widened_view_follows_a_bindless_write() {
+        late_widened_view(false, 1);
+    }
+
+    /// Same end-to-end widening path with `VICTORY_CENSUS_FAST=1`'s cached UAV
+    /// snapshot and multiple heap-writing draws before the barrier.
+    #[test]
+    fn a_late_widened_view_follows_a_bindless_write_with_fast_census() {
+        late_widened_view(true, 3);
+    }
+
+    fn late_widened_view(fast_census: bool, marks: usize) {
         if !crate::under_wine() {
             return;
         }
@@ -4064,7 +4075,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
         crate::descriptor::create_uav(null, src, null, &old_raw, title_heap.start);
         crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 64);
         let heap_host = title_heap.host().expect("a host view heap");
-        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::new(fast_census));
         viewed.set(0, Some(&old), true);
         crate::shadow::find(src_bytes as u64, 48).expect("the source copy").update(src_bytes as usize, 48);
 
@@ -4099,6 +4110,9 @@ void main() { dst.Store4(0, asuint(src[1])); }
         // descriptor and the range sampled for widening must name the new view.
         crate::descriptor::create_uav(null, src, null, &new_raw, title_heap.start);
         viewed.set(0, Some(&new), true);
+        for _ in 1..marks {
+            list.mark_widened_heap(&viewed);
+        }
         // SAFETY: an open list.
         unsafe {
             list.list.ResourceBarrier(&[crate::host::uav_barrier()]);

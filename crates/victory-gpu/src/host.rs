@@ -3551,7 +3551,11 @@ impl HostList {
                 WidenedEvent::Write(write) => writes.push(write),
                 WidenedEvent::Heap(heap) => {
                     if last.get(&(std::sync::Arc::as_ptr(&heap) as usize)) == Some(&i) {
-                        crate::bindless::widened_writes_into(&heap, writes);
+                        if let Some(cached) = crate::bindless::unordered_writes(&heap) {
+                            writes.extend(cached.iter().cloned());
+                        } else {
+                            crate::bindless::widened_writes_into(&heap, writes);
+                        }
                     }
                 }
             }
