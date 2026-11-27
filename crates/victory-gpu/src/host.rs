@@ -98,6 +98,7 @@ pub(crate) struct Host {
     /// ([`Host::lost`]).
     queue: Mutex<ID3D12CommandQueue>,
     pub(crate) depth_bounds_supported: bool,
+    enhanced_barriers_supported: bool,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -403,6 +404,19 @@ fn create() -> windows::core::Result<Host> {
             // none): bounds that should reject a draw leave it whole, as when
             // the host has no test, and the plain pipeline states are safer.
             && !crate::under_wine();
+        let mut options12 = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        let enhanced_barriers_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options12).cast(),
+                size_of_val(&options12) as u32,
+            )
+            .is_ok()
+            && options12.EnhancedBarriersSupported.as_bool();
+        tracing::info!(
+            enhanced_barriers = enhanced_barriers_supported,
+            "host enhanced barriers"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -453,6 +467,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue: Mutex::new(queue),
             depth_bounds_supported,
+            enhanced_barriers_supported,
             fence,
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
@@ -1491,6 +1506,13 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
+    /// Cached `ID3D12GraphicsCommandList7` for `list` when the host supports
+    /// Enhanced Barriers (`D3D12_FEATURE_D3D12_OPTIONS12`), avoiding per-draw
+    /// `QueryInterface`.
+    pub(crate) list7: Option<ID3D12GraphicsCommandList7>,
+    /// Cached `ID3D12GraphicsCommandList7` for `prelude.1` when Enhanced
+    /// Barriers are supported.
+    pub(crate) prelude7: Option<ID3D12GraphicsCommandList7>,
     /// Monotonic epoch bumped whenever texture state, twin state, deferred
     /// dedup sets, or the list itself resets ([`HostList::changed_something`]).
     epoch: std::sync::atomic::AtomicU64,
@@ -1548,8 +1570,13 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
-    /// inline execution in turn; replaced by a bigger one when too small.
+    /// inline execution in turn in legacy sync mode; replaced by a bigger one
+    /// when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Bump-allocated disjoint 16-byte-aligned inline argument slices used in
+    /// narrow clamp sync mode (`VICTORY_CLAMP_SYNC=1`) so consecutive inline
+    /// clamps have zero WAR hazard against earlier `ExecuteIndirect` calls.
+    inline_arguments: Mutex<ArgumentArena>,
     /// Indirect clamps hoisted into `prelude`, their bump-allocated argument
     /// buffers, and the list's GPU-write hazard tracker.
     clamps: Mutex<HoistedClamps>,
@@ -1832,12 +1859,87 @@ impl WriteHazard {
 }
 
 #[derive(Default)]
-struct HoistedClamps {
+struct ArgumentArena {
     chunks: Vec<ArgumentChunk>,
     current: usize,
     used: u64,
     touched: usize,
     oversized: Vec<ID3D12Resource>,
+}
+
+impl ArgumentArena {
+    fn alloc(
+        &mut self,
+        host: &Host,
+        bytes: u64,
+        label: &str,
+    ) -> Option<(ID3D12Resource, u64, u64)> {
+        let size = bytes.max(16).checked_next_multiple_of(16)?;
+        if size > ARGUMENT_CHUNK_MAX {
+            let (buffer, _) = host.shared_buffer(size)?;
+            name(&buffer, || format!("{label} {size:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.oversized.push(buffer.clone());
+            return Some((buffer, 0, gpu));
+        }
+        while let Some(chunk) = self.chunks.get(self.current) {
+            if size <= chunk.capacity - self.used {
+                break;
+            }
+            self.current += 1;
+            self.used = 0;
+        }
+        if self.current == self.chunks.len() {
+            let next = self
+                .chunks
+                .last()
+                .map_or(ARGUMENT_CHUNK_FIRST, |c| (2 * c.capacity).min(ARGUMENT_CHUNK_MAX));
+            let capacity = size
+                .next_multiple_of(ARGUMENT_CHUNK_FIRST)
+                .max(next)
+                .min(ARGUMENT_CHUNK_MAX);
+            let (buffer, _) = host.shared_buffer(capacity)?;
+            name(&buffer, || format!("{label} {capacity:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.chunks.push(ArgumentChunk {
+                buffer,
+                gpu,
+                capacity,
+            });
+            self.used = 0;
+        }
+        let current = self.current;
+        let at = self.used;
+        let chunk = &self.chunks[current];
+        let result = (chunk.buffer.clone(), at, chunk.gpu + at);
+        self.used = at + size;
+        self.touched = self.touched.max(current + 1);
+        Some(result)
+    }
+
+    fn touched_buffers(&self) -> Vec<ID3D12Resource> {
+        let mut out = Vec::with_capacity(self.touched + self.oversized.len());
+        out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
+        out.extend(self.oversized.iter().cloned());
+        out
+    }
+
+    fn reset(&mut self) -> (Vec<ArgumentChunk>, Vec<ID3D12Resource>) {
+        let kept = (self.touched + 1).min(self.chunks.len());
+        let spent_chunks = self.chunks.split_off(kept);
+        let spent_oversized = std::mem::take(&mut self.oversized);
+        self.current = 0;
+        self.used = 0;
+        self.touched = 0;
+        (spent_chunks, spent_oversized)
+    }
+}
+
+#[derive(Default)]
+struct HoistedClamps {
+    arena: ArgumentArena,
     pending: Vec<crate::indirect::PendingClamp>,
     budget_gpu: u64,
     hazard: WriteHazard,
@@ -1848,10 +1950,7 @@ struct HoistedClamps {
 
 impl HoistedClamps {
     fn touched_buffers(&self) -> Vec<ID3D12Resource> {
-        let mut out = Vec::with_capacity(self.touched + self.oversized.len());
-        out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
-        out.extend(self.oversized.iter().cloned());
-        out
+        self.arena.touched_buffers()
     }
 }
 
@@ -2092,9 +2191,19 @@ impl HostGpu for Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
+            let list7 = self
+                .enhanced_barriers()
+                .then(|| list.cast::<ID3D12GraphicsCommandList7>().ok())
+                .flatten();
+            let prelude7 = self
+                .enhanced_barriers()
+                .then(|| prelude.cast::<ID3D12GraphicsCommandList7>().ok())
+                .flatten();
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
+                list7,
+                prelude7,
                 list,
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 deferred_epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
@@ -2115,6 +2224,7 @@ impl HostGpu for Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                inline_arguments: Mutex::default(),
                 clamps: Mutex::default(),
                 marked: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
@@ -2157,6 +2267,12 @@ impl HostGpu for Host {
 }
 
 impl Host {
+    /// Whether the host device reports D3D12 Enhanced Barriers support
+    /// (`D3D12_FEATURE_D3D12_OPTIONS12::EnhancedBarriersSupported`).
+    pub(crate) fn enhanced_barriers(&self) -> bool {
+        self.enhanced_barriers_supported
+    }
+
     /// Runs closed lists and waits for them, inserting a global UAV barrier
     /// command list before each `runs[i]` where `barrier_before.get(i) == Some(&true)`.
     /// Drains any queued async-submit work and any active Flight-1 submission
@@ -3337,6 +3453,7 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
         self.reset_hoisted_clamps();
+        self.reset_inline_arguments();
         self.marked.store(false, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -3852,6 +3969,7 @@ impl HostList {
                 if !pending_clamps.is_empty() {
                     crate::indirect::record_batch(
                         list,
+                        self.narrow_clamp_sync_prelude(),
                         clamp_budget,
                         &clamp_buffers,
                         &pending_clamps,
@@ -4139,56 +4257,56 @@ impl HostList {
         make: impl FnOnce(u64) -> crate::indirect::PendingClamp,
     ) -> Option<(ID3D12Resource, u64)> {
         let budget_gpu = self.budget()?;
-        let size = bytes.max(16).checked_next_multiple_of(16)?;
         let host = host()?;
         let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, offset, dst_gpu) = if size > ARGUMENT_CHUNK_MAX {
-            let (buffer, _) = host.shared_buffer(size)?;
-            name(&buffer, || format!("hoisted indirect arguments {size:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            clamps.oversized.push(buffer.clone());
-            (buffer, 0, gpu)
-        } else {
-            while let Some(chunk) = clamps.chunks.get(clamps.current) {
-                if size <= chunk.capacity - clamps.used {
-                    break;
-                }
-                clamps.current += 1;
-                clamps.used = 0;
-            }
-            if clamps.current == clamps.chunks.len() {
-                let next = clamps
-                    .chunks
-                    .last()
-                    .map_or(ARGUMENT_CHUNK_FIRST, |c| (2 * c.capacity).min(ARGUMENT_CHUNK_MAX));
-                let capacity = size
-                    .next_multiple_of(ARGUMENT_CHUNK_FIRST)
-                    .max(next)
-                    .min(ARGUMENT_CHUNK_MAX);
-                let (buffer, _) = host.shared_buffer(capacity)?;
-                name(&buffer, || format!("hoisted indirect arguments {capacity:#x}"));
-                // SAFETY: a live buffer.
-                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-                clamps.chunks.push(ArgumentChunk { buffer, gpu, capacity });
-                clamps.used = 0;
-            }
-            let current = clamps.current;
-            let at = clamps.used;
-            let chunk = &clamps.chunks[current];
-            let result = (chunk.buffer.clone(), at, chunk.gpu + at);
-            clamps.used = at + size;
-            clamps.touched = clamps.touched.max(current + 1);
-            result
-        };
+        let (buffer, offset, dst_gpu) =
+            clamps.arena.alloc(host, bytes, "hoisted indirect arguments")?;
         clamps.budget_gpu = budget_gpu;
         clamps.pending.push(make(dst_gpu));
         Some((buffer, offset))
     }
 
+    /// Whether scoped Enhanced Barriers (`VICTORY_CLAMP_SYNC=1`) are active
+    /// for indirect clamps on this list.
+    pub(crate) fn narrow_clamp_sync(&self) -> bool {
+        crate::indirect::clamp_sync_enabled() && self.list7.is_some() && self.prelude7.is_some()
+    }
+
+    /// Cached `ID3D12GraphicsCommandList7` for `self.list` when narrow clamp
+    /// sync is active.
+    pub(crate) fn narrow_clamp_sync_list(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        self.narrow_clamp_sync()
+            .then_some(self.list7.as_ref())
+            .flatten()
+    }
+
+    /// Cached `ID3D12GraphicsCommandList7` for `self.prelude.1` when narrow
+    /// clamp sync is active.
+    pub(crate) fn narrow_clamp_sync_prelude(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        self.narrow_clamp_sync()
+            .then_some(self.prelude7.as_ref())
+            .flatten()
+    }
+
+    /// Bump-allocates a disjoint 16-byte-aligned inline argument slice from
+    /// this list's inline scratch arena (zero WAR hazard across consecutive
+    /// inline clamps in narrow sync mode).
+    pub(crate) fn inline_argument_slice(&self, bytes: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let host = host()?;
+        let mut arena = self
+            .inline_arguments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        arena.alloc(host, bytes, "inline indirect arguments")
+    }
+
     /// Transitions hoisted indirect argument buffers back to `COMMON` at the
     /// end of `list.list` so the list can be re-submitted or reset cleanly.
+    /// No-op when narrow clamp sync is active (buffers stay in `COMMON`).
     fn hoisted_clamps_close(&self) {
+        if self.narrow_clamp_sync() {
+            return;
+        }
         let buffers = {
             let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
             if clamps.pending.is_empty() {
@@ -4225,14 +4343,24 @@ impl HostList {
             clamps.budget_gpu = 0;
             clamps.hazard.clear();
             clamps.cut = false;
-            let kept = (clamps.touched + 1).min(clamps.chunks.len());
-            let spent_chunks = clamps.chunks.split_off(kept);
-            let spent_oversized = std::mem::take(&mut clamps.oversized);
-            clamps.current = 0;
-            clamps.used = 0;
-            clamps.touched = 0;
-            (spent_chunks, spent_oversized)
+            clamps.arena.reset()
         };
+        if !spent_chunks.is_empty() {
+            release_later(Box::new(spent_chunks));
+        }
+        if !spent_oversized.is_empty() {
+            release_later(Box::new(spent_oversized));
+        }
+    }
+
+    /// Resets the inline indirect argument scratch arena after the list
+    /// finishes running, keeping recently used chunks for zero-allocation reuse.
+    fn reset_inline_arguments(&self) {
+        let (spent_chunks, spent_oversized) = self
+            .inline_arguments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset();
         if !spent_chunks.is_empty() {
             release_later(Box::new(spent_chunks));
         }
@@ -4486,6 +4614,14 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The indirect-work budget word consumed by the list's last execution.
+    #[cfg(test)]
+    pub(crate) fn budget_used(&self) -> Option<u32> {
+        let (_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: the list's own mapped budget word, read after execution finishes.
+        Some(unsafe { (*data as *const u32).read_volatile() })
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
@@ -6689,6 +6825,40 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
             }),
         },
+    }
+}
+
+/// Records a single Enhanced `D3D12_GLOBAL_BARRIER` on `cmd7`.
+///
+/// D3DMetal `MPL` does not track buffers bound via root descriptors
+/// (`SetComputeRootShaderResourceView`/`SetComputeRootUnorderedAccessView`) or
+/// bindless heaps in per-`MTLBuffer` barrier maps; a global barrier routes
+/// straight to `MPLCommandList::GlobalBarrierImpl(beforeStage, afterStage)` and
+/// honors exact `MPLStage` masks.
+pub(crate) unsafe fn global_barrier(
+    cmd7: &ID3D12GraphicsCommandList7,
+    sync_before: D3D12_BARRIER_SYNC,
+    sync_after: D3D12_BARRIER_SYNC,
+    access_before: D3D12_BARRIER_ACCESS,
+    access_after: D3D12_BARRIER_ACCESS,
+) {
+    let barrier = D3D12_GLOBAL_BARRIER {
+        SyncBefore: sync_before,
+        SyncAfter: sync_after,
+        AccessBefore: access_before,
+        AccessAfter: access_after,
+    };
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_GLOBAL,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 {
+            pGlobalBarriers: &barrier,
+        },
+    };
+    // SAFETY: caller guarantees `cmd7` is an open command list; `barrier` lives
+    // across the synchronous `Barrier` call.
+    unsafe {
+        cmd7.Barrier(&[group]);
     }
 }
 

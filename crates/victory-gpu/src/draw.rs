@@ -2772,7 +2772,7 @@ impl State {
         } else {
             // Bounded first: the inline clamp binds a compute pipeline of its
             // own. It reads the count, so that it stops where execution does.
-            let Some(clamped) =
+            let Some((clamped, dst_offset)) =
                 crate::indirect::bound(list, args_gpu, (kind, stride, max), counted)
             else {
                 why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -2782,7 +2782,7 @@ impl State {
             crate::indirect::note_inline(blocker);
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
-            Some(clamped)
+            Some((clamped, dst_offset))
         };
         let ran = match kind {
             DRAW | INDEXED => {
@@ -2799,7 +2799,7 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            if let Some(clamped) = &inline_clamped {
+            if let Some((clamped, _)) = &inline_clamped {
                 crate::indirect::done(list, clamped);
             }
             #[cfg(feature = "diagnostics")]
@@ -2818,7 +2818,7 @@ impl State {
             return Some(false);
         }
         let (clamped, dst_offset, needs_done) = match inline_clamped {
-            Some(clamped) => (clamped, 0, true),
+            Some((clamped, dst_offset)) => (clamped, dst_offset, true),
             None => {
                 let Some((clamped, dst_offset)) =
                     crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
