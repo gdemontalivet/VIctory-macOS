@@ -14,11 +14,22 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::paged::Paged;
 use super::{VIEW_TAG, View, ViewPin, view_at, views_current_into, views_forgot};
+use crate::backend::{HostGpu, HostMemory};
 use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+fn sync_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FAST").as_deref() != Some(std::ffi::OsStr::new("0")))
+}
+
+/// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
+/// targeting a released heap's recycled address never free a newer heap's slots.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -54,8 +65,8 @@ pub(crate) struct HostHeap {
     /// [`HostHeap::remake_unordered`] once shaders write through heaps.
     nulled_unordered: Mutex<Vec<u32>>,
     /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// (by lists not yet reset), a bit for each.
+    next: Mutex<(u32, Vec<u64>)>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -226,6 +237,7 @@ impl HostHeap {
             sampler,
         ));
         let mut h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -242,7 +254,7 @@ impl HostHeap {
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             nulled_unordered: Mutex::new(Vec::new()),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![0; (extra as usize).div_ceil(64)])),
             pairs: Mutex::new((count + extra, Vec::new())),
             null_root_srv: None,
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -373,6 +385,70 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// The first of `n` clear bits in a row within `[from, to)` of `taken`
+/// (a set of slots, a bit each), if there are any. A word's bits are
+/// looked at together.
+fn free_run(taken: &[u64], from: usize, to: usize, n: usize) -> Option<usize> {
+    let (mut at, mut run) = (from, 0);
+    while at < to {
+        let room = (64 - at % 64).min(to - at);
+        let window = u64::MAX >> (64 - room);
+        // Bit p: slot `at + p` is clear.
+        let free = !(taken[at / 64] >> (at % 64)) & window;
+        // The clear slots from `at` on, which go on a run begun before `at`.
+        let lead = ((!free).trailing_zeros() as usize).min(room);
+        if run + lead >= n {
+            return Some(at - run);
+        }
+        if n <= 64 {
+            let fits = starts(free, n);
+            if fits != 0 {
+                return Some(at + fits.trailing_zeros() as usize);
+            }
+        }
+        if lead == room {
+            run += room;
+        } else {
+            run = (free << (64 - room)).leading_ones() as usize;
+        }
+        at += room;
+    }
+    None
+}
+
+/// Bit p set when bits p to p + n - 1 of `free` are all set (n <= 64):
+/// runs of 1, 2, 4... bits are joined until they make n.
+fn starts(free: u64, n: usize) -> u64 {
+    let (mut acc, mut len, mut cur, mut pow, mut rem) = (u64::MAX, 0usize, free, 1usize, n);
+    while rem > 0 {
+        if rem & 1 == 1 {
+            acc = if len == 0 { cur } else { acc & (cur >> len) };
+            len += pow;
+        }
+        rem >>= 1;
+        if rem > 0 {
+            cur &= cur >> pow;
+            pow *= 2;
+        }
+    }
+    acc
+}
+
+/// Sets (`on`) or clears the bits of `taken` from `from` to `to`.
+fn set_taken(taken: &mut [u64], from: usize, to: usize, on: bool) {
+    let mut at = from;
+    while at < to {
+        let (bit, room) = (at % 64, (64 - at % 64).min(to - at));
+        let mask = (u64::MAX >> (64 - room)) << bit;
+        if on {
+            taken[at / 64] |= mask;
+        } else {
+            taken[at / 64] &= !mask;
+        }
+        at += room;
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -388,30 +464,16 @@ impl HostHeap {
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) =
+            free_run(taken, cursor, end, n).or_else(|| free_run(taken, 0, second_end, n))
+        else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
             });
             return None;
         };
-        taken[first..first + n].fill(true);
+        set_taken(taken, first, first + n, true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -442,7 +504,7 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
         } else {
-            self.release(index, 2);
+            self.release(self.id, index, 2);
         }
     }
 
@@ -452,24 +514,37 @@ impl HostHeap {
         self.count
     }
 
+    /// This heap's unique identity ([`NEXT_ID`]): dynamic slots are returned
+    /// only when the caller's identity matches this heap.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), only if `id` matches this heap's [`Self::id`].
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        set_taken(&mut guard.1, at as usize, end, false);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        let view_is_sampler = is_sampler(view);
+        if view_is_sampler != self.sampler {
+            warn_heap_mismatch(index, self.sampler, view_is_sampler);
+            self.make_null(index);
+            return;
+        }
         let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -828,12 +903,14 @@ impl HostHeap {
         if first >= last {
             return;
         }
+        let fast = sync_fast_enabled();
         let at = |i: u32| start + u64::from(i) * step;
         let forgot = views_forgot();
         let b_first = first / SYNC_BLOCK_SLOTS;
         let b_last = (last - 1) / SYNC_BLOCK_SLOTS;
-        let blocks_verified = (b_first..=b_last)
-            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
+        let blocks_verified = fast
+            && (b_first..=b_last)
+                .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let buf_end = buf_start.saturating_add(buf.len() as u64);
         let mut stale: Vec<u32> = Vec::new();
@@ -845,13 +922,23 @@ impl HostHeap {
                 let off = (addr - buf_start) as usize;
                 // SAFETY: `off + 12 <= buf.len()`, unaligned copy of 12 bytes.
                 unsafe { buf.as_ptr().add(off).cast::<[u32; 3]>().read_unaligned() }
+            } else if !buf.is_empty() {
+                let mut raw = [0u8; 12];
+                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                    continue;
+                }
+                [
+                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+                    u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+                ]
             } else {
-                // SAFETY: record in title heap memory the caller found mapped.
+                // SAFETY: direct test path (`sync_slots`) in committed memory.
                 unsafe { (addr as *const [u32; 3]).read_unaligned() }
             };
             let [tag, view, generation] = record;
             if tag != VIEW_TAG {
-                if self.made_is_nonzero(i) {
+                if !fast || self.made_is_nonzero(i) {
                     stale.push(i);
                 }
                 continue;
@@ -884,11 +971,13 @@ impl HostHeap {
             self.mirror(i, at(i), false);
         }
 
-        for b in b_first..=b_last {
-            let b_start = b * SYNC_BLOCK_SLOTS;
-            let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
-            if first <= b_start && last >= b_end {
-                self.block_forgot[b as usize].store(forgot, Ordering::Release);
+        if fast {
+            for b in b_first..=b_last {
+                let b_start = b * SYNC_BLOCK_SLOTS;
+                let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
+                if first <= b_start && last >= b_end {
+                    self.block_forgot[b as usize].store(forgot, Ordering::Release);
+                }
             }
         }
     }
@@ -959,6 +1048,7 @@ impl HostHeap {
         if tag == VIEW_TAG
             && self.ready[index as usize].load(Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
+            && is_sampler(&view) == self.sampler
             && !self.needs_remake(index, &view, for_draw)
         {
             return Some(view);
@@ -981,6 +1071,18 @@ impl HostHeap {
             }
             return None;
         };
+        let view_is_sampler = is_sampler(&view);
+        if view_is_sampler != self.sampler {
+            warn_heap_mismatch(index, self.sampler, view_is_sampler);
+            if made[index as usize] != 0 {
+                self.ready[index as usize].store(0, Ordering::Relaxed);
+                made[index as usize] = 0;
+                self.set_made_nonzero(index, false);
+                self.make_null(index);
+                self.note_address(index, None);
+            }
+            return None;
+        }
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
         // (heap syncs revisit it at every submission). Also re-mirror if a
@@ -1198,6 +1300,75 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// The unsigned integer format with the layout of a 16-bit float or
+/// signed integer format (one, two or four channels), if `format` is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// `view` as a shader is shown it where it moves a buffer's 16-bit
+/// channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`): a buffer view in a
+/// 16-bit float or signed format, in the unsigned format of the same
+/// layout, through which every 16-bit pattern is read and stored as it
+/// is. `None` for every other view: the title's own serves (an unsigned
+/// one already carries the bits; a texture can only be viewed in the
+/// formats it was made for).
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// The format of `view`, a buffer view through which a shader moves
+/// 16-bit channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`), if those integers
+/// are not what the console gives: a format of wider channels, a
+/// normalised one or a signed 8-bit one, whose values the console converts
+/// to and from halves. `None` for the formats the integers serve exactly
+/// (16 bits a channel of any kind, through [`half_view`] where needed, and
+/// unsigned channels of fewer bits) and for any other view.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then
+    // R10G10B10A2, R8G8B8A8, R8G8 and R8 unsigned.
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => {
+            desc[0]
+        }
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
 }
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1570,6 +1741,30 @@ fn buffer_srv(
             Some(HeldSource::Widened(widened, shadow.clone())),
         )));
     }
+    let stride = u64::from(buffer.StructureByteStride);
+    if stride > 0 && raw_structured() {
+        // Scalar and offset-only buffer reads emit `rawBufferLoad` on a raw
+        // handle (`victory_shader::emit`), which D3D12 leaves undefined on a
+        // structured SRV (NVIDIA treats the byte offset as an element index,
+        // hanging `WindNew` loops). NVIDIA, WARP and D3DMetal all read both
+        // raw handles and structured handles accurately from a raw view of the
+        // same bytes; under Wine/D3DMetal any dword-aligned start (`+8B` or
+        // `+680B`) works too, while native D3D12 requires 16-byte alignment.
+        let (byte, dwords) = (first * stride, u64::from(count) * stride / 4);
+        let align = if crate::shader_cache::under_wine() { 4 } else { 16 };
+        match u32::try_from(dwords) {
+            Ok(dwords) if byte.is_multiple_of(align) && stride.is_multiple_of(4) => {
+                desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    FirstElement: byte / 4,
+                    NumElements: dwords,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                };
+            }
+            _ => once!(byte, stride, "structured buffer view not made raw: unaligned"),
+        }
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -1579,6 +1774,23 @@ fn buffer_srv(
         shadow.buffer.clone(),
         own.then(|| HeldSource::Shadow(shadow)),
     )))
+}
+
+/// Whether structured buffer views are made raw ([`buffer_srv`]): under Wine
+/// (D3DMetal) and on NVIDIA hosts, both of which serve structured-handle and
+/// raw-handle `rawBufferLoad`s from a raw view of the same bytes.
+/// `VICTORY_RAW_STRUCTURED=0` or `=1` overrides.
+fn raw_structured() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_RAW_STRUCTURED").as_deref() {
+            Ok("0" | "false" | "off") => false,
+            Ok("1" | "true" | "on") => true,
+            _ => crate::shader_cache::under_wine() || crate::host::host_vendor() == 0x10DE,
+        };
+        tracing::info!(on, "structured buffer views made raw");
+        on
+    })
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1739,6 +1951,14 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     if view == 0 {
         return !typeless && (!unordered || typed_store(own));
+    }
+    // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
+    // (`resource::target_format`): views name the format it has.
+    if view != own && crate::resource::target_format(view) == own {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
     }
     if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
         once!(unordered, view, own, "view the host does not allow");
@@ -1963,6 +2183,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+/// Whether `view` is a sampler descriptor (must only be created on a sampler
+/// heap, never on a CBV/SRV/UAV heap).
+fn is_sampler(view: &View) -> bool {
+    matches!(view, View::Sampler(_) | View::ConsoleSampler(_))
+}
+
+fn warn_heap_mismatch(index: u32, sampler_heap: bool, sampler_view: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            index,
+            sampler_heap,
+            sampler_view,
+            "descriptor record kind mismatches host heap type; clearing slot"
+        );
     }
 }
 
@@ -2738,7 +2976,7 @@ mod tests {
         assert_eq!(heap.address_at(end - 1), Some(address));
         // A slot given back keeps its entry until it is made again; made
         // null, it has its entry cleared.
-        heap.release(first, 2);
+        heap.release(heap.id(), first, 2);
         assert_eq!(
             heap.address_at(first),
             Some(address),
@@ -2846,9 +3084,50 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn free_runs_are_found_across_words() {
+        // Slots 0-69, 100-109 and 201-255 taken: free runs 70-99, 110-200
+        // and 256-300 (the last one past a word's end, `to` at 301).
+        let mut taken = vec![0u64; 5];
+        set_taken(&mut taken, 0, 70, true);
+        set_taken(&mut taken, 100, 110, true);
+        set_taken(&mut taken, 201, 256, true);
+        assert_eq!(free_run(&taken, 0, 301, 30), Some(70));
+        assert_eq!(free_run(&taken, 0, 301, 31), Some(110));
+        assert_eq!(free_run(&taken, 0, 301, 91), Some(110));
+        assert_eq!(free_run(&taken, 0, 301, 92), None);
+        assert_eq!(free_run(&taken, 0, 200, 91), None, "a run ends before `to`");
+        assert_eq!(free_run(&taken, 0, 201, 91), Some(110));
+        assert_eq!(free_run(&taken, 120, 301, 81), Some(120));
+        assert_eq!(free_run(&taken, 120, 301, 82), None);
+        // Every other slot taken: no two clear in a row.
+        let alternate = [0x5555_5555_5555_5555u64; 2];
+        assert_eq!(free_run(&alternate, 0, 128, 2), None);
+        assert_eq!(free_run(&alternate, 0, 128, 1), Some(1));
+        assert_eq!(free_run(&alternate, 3, 128, 1), Some(3));
+        // A word's last (or first) slot taken ends the run there.
+        assert_eq!(free_run(&[1 << 63, 0], 0, 128, 63), Some(0));
+        assert_eq!(free_run(&[1 << 63, 0], 0, 128, 64), Some(64));
+        assert_eq!(free_run(&[0, 1], 0, 128, 64), Some(0));
+        assert_eq!(free_run(&[0, 1], 0, 128, 65), None);
+        // Runs longer than a word, from a clear word on.
+        assert_eq!(free_run(&[0u64; 2], 10, 128, 118), Some(10));
+        assert_eq!(free_run(&[0u64; 2], 10, 128, 119), None);
+        assert_eq!(free_run(&[0u64; 2], 10, 128, 100), Some(10));
+        // 128-191 is a whole free word between taken ones.
+        set_taken(&mut taken, 128, 192, true);
+        assert_eq!(free_run(&taken, 0, 301, 45), Some(256));
+        assert_eq!(free_run(&taken, 0, 301, 46), None);
+        assert_eq!(free_run(&taken, 100, 301, 20), Some(256));
+        set_taken(&mut taken, 128, 192, false);
+        assert_eq!(free_run(&taken, 128, 301, 64), Some(128));
+        set_taken(&mut taken, 128, 192, true);
+        assert_eq!(free_run(&taken, 128, 301, 1), Some(192));
     }
 
     #[test]
@@ -2864,18 +3143,43 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A range of dynamic slots is returned only to the heap that allocated it:
+    /// a stale release carrying another heap's identity must be a no-op.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let rest = a.dynamic(a.dynamic - 2).expect("remaining dynamic slots");
+        assert_eq!(rest, first + 2);
+        assert_eq!(a.dynamic(1), None, "heap is full");
+
+        // Releasing with another heap's identity must not free A's slots.
+        a.release(b.id(), first, 2);
+        assert_eq!(a.dynamic(1), None, "foreign heap id must not free A's slots");
+
+        // Releasing with A's own identity gives the range back.
+        a.release(a.id(), first, 2);
+        assert_eq!(a.dynamic(2), Some(first), "own heap id returns the range");
     }
 
     /// A texture view's size words are the console image descriptor's
@@ -2971,6 +3275,8 @@ mod tests {
             (93u32, 0u32, 4u32, bgrx_uav),  // B8G8R8X8_UNORM_SRGB + UNKNOWN -> linear 88
             (92u32, 88u32, 4u32, bgrx_uav), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
             (92u32, 93u32, 4u32, bgrx_uav), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM_SRGB
+            (86u32, 86u32, 4u32, true),     // B5G5R5A1_UNORM, widened if unsupported
+            (115u32, 115u32, 4u32, true),   // B4G4R4A4_UNORM, widened if unsupported
             (40u32, 40u32, 4u32, false),    // D32_FLOAT + UAV flag (no depth flag) -> null fallback
             (55u32, 55u32, 4u32, false),    // D16_UNORM + UAV flag (no depth flag) -> null fallback
             (39u32, 40u32, 4u32, false),    // R32_TYPELESS + D32_FLOAT view -> null fallback
@@ -3263,5 +3569,506 @@ mod tests {
 
         crate::object::release(resource);
         let _ = title_heap.as_mut_ptr();
+    }
+
+    /// Mismatched descriptor kinds (a sampler record in a CBV/SRV/UAV heap or
+    /// a CBV/SRV record in a sampler heap) must be cleared/skipped instead of
+    /// calling `CreateSampler` / `CreateShaderResourceView` on the wrong heap
+    /// handle type.
+    #[test]
+    fn mismatched_heap_kind_views_are_cleared_not_created() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(view_heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(sampler_heap) = HostHeap::new(true, 4) else {
+            return;
+        };
+        let null = std::ptr::null();
+        let sampler_desc: [u32; 13] = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut console_sampler = [0u32; 27];
+        console_sampler[6..9].copy_from_slice(&[3, 3, 3]);
+
+        // View heap: valid view in slot 0, then overwritten with sampler records.
+        let mut view_slots = [[0u32; 8]; 4];
+        let v0 = view_slots[0].as_mut_ptr() as u64;
+        let v1 = view_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], v0);
+        assert!(view_heap.mirror(0, v0, false).is_some());
+        assert!(view_heap.made(0));
+        assert!(view_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_sampler(null, &sampler_desc, v0);
+        assert!(view_heap.mirror(0, v0, false).is_none());
+        assert!(!view_heap.made(0));
+        assert!(!view_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_sampler_x(null, &console_sampler, v1);
+        assert!(view_heap.mirror(1, v1, true).is_none());
+        assert!(!view_heap.made(1));
+
+        let dyn_slot = view_heap.dynamic(1).expect("a dynamic slot");
+        view_heap.make_at(dyn_slot, &View::Sampler(sampler_desc));
+        assert!(!view_heap.kept(dyn_slot));
+        view_heap.release(view_heap.id(), dyn_slot, 1);
+
+        // Sampler heap: valid sampler in slot 0, then overwritten with CBV/SRV records.
+        let mut sampler_slots = [[0u32; 4]; 4];
+        let s0 = sampler_slots[0].as_mut_ptr() as u64;
+        let s1 = sampler_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_sampler(null, &sampler_desc, s0);
+        assert!(sampler_heap.mirror(0, s0, false).is_some());
+        assert!(sampler_heap.made(0));
+        assert!(sampler_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], s0);
+        assert!(sampler_heap.mirror(0, s0, false).is_none());
+        assert!(!sampler_heap.made(0));
+        assert!(!sampler_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_srv(null, null, std::ptr::null(), s1);
+        assert!(sampler_heap.mirror(1, s1, true).is_none());
+        assert!(!sampler_heap.made(1));
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The unsigned twin of a 16-bit float or signed format has its layout,
+    /// and only buffer views in such a format are shown as another view.
+    #[test]
+    fn only_16_bit_float_and_signed_buffer_views_get_an_unsigned_twin() {
+        for (format, unsigned) in [(10, 12), (14, 12), (34, 36), (38, 36), (54, 57), (59, 57)] {
+            assert_eq!(half_format(format), Some(unsigned));
+            assert_eq!(
+                crate::resource::element(format),
+                crate::resource::element(unsigned),
+                "format {format}"
+            );
+        }
+        // The unsigned formats themselves, normalised 16-bit formats, and
+        // wider and narrower ones.
+        for other in [0, 12, 36, 57, 11, 13, 35, 37, 56, 58, 42, 17, 30, 61] {
+            assert_eq!(half_format(other), None, "format {other}");
+        }
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        // R16G16B16A16_FLOAT: a buffer of halves a program moves as they are.
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
+            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
+        );
+        assert_eq!(
+            half_view(&View::Shader(7, Some(words(54, BUFFER)))),
+            Some(View::Shader(7, Some(words(57, BUFFER))))
+        );
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&words(38, BUFFER));
+        placed[10] = 0x1234_0000;
+        let mut twin = placed;
+        twin[0] = 36;
+        let memory = [BUFFER, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        assert_eq!(
+            half_view(&View::Placed(true, memory, placed)),
+            Some(View::Placed(true, memory, twin))
+        );
+        // Unsigned 16-bit buffers, texture views (dimension 4: 2D), views
+        // without a description, and constant buffers keep their own view.
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(12, BUFFER)))),
+            None
+        );
+        assert_eq!(half_view(&View::Shader(7, Some(words(57, BUFFER)))), None);
+        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(10, 4)))), None);
+        assert_eq!(half_view(&View::Shader(7, None)), None);
+        assert_eq!(half_view(&View::Constant(0x1000, 256)), None);
+    }
+
+    /// Buffer views whose values the console would convert to and from halves
+    /// are reported by `half_inexact`; 16-bit formats and narrow unsigned
+    /// integer formats are not.
+    #[test]
+    fn views_whose_values_the_console_would_convert_are_named() {
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        for exact in [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62] {
+            let view = View::Unordered(7, 0, Some(words(exact, BUFFER)));
+            assert_eq!(half_inexact(&view), None, "format {exact}");
+        }
+        for inexact in [41, 42, 11, 28, 64, 0] {
+            let view = View::Shader(7, Some(words(inexact, BUFFER)));
+            assert_eq!(half_inexact(&view), Some(inexact));
+        }
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&words(41, BUFFER));
+        let memory = [BUFFER, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        assert_eq!(half_inexact(&View::Placed(true, memory, placed)), Some(41));
+        // Not a buffer view.
+        assert_eq!(half_inexact(&View::Shader(7, Some(words(41, 4)))), None);
+        assert_eq!(half_inexact(&View::Constant(0x1000, 256)), None);
+    }
+
+    /// Moving all 65,536 16-bit patterns through an `R16G16B16A16_UINT`
+    /// buffer view (the unsigned twin `half_view` gives a 16-bit float view)
+    /// preserves every pattern bit-exactly when accessed as unsigned integers.
+    #[test]
+    fn halves_cross_an_unsigned_buffer_view_unchanged() {
+        const MOVES: &str = r#"
+RWBuffer<uint4> from : register(u0);
+RWBuffer<uint4> to : register(u1);
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint4 h = from[id.x] & 0xffff;
+    uint low = h.x | h.y << 16;
+    uint high = h.z | h.w << 16;
+    to[id.x] = uint4(low & 0xffff, low >> 16, high & 0xffff, high >> 16);
+}
+"#;
+        const ELEMENTS: usize = 1 << 14;
+        const BYTES: u64 = ELEMENTS as u64 * 8;
+        const UNSIGNED: u32 = 12; // R16G16B16A16_UINT
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        assert_eq!(half_format(10), Some(UNSIGNED));
+        let uav_range = [crate::compute::uav(0, 2)];
+        let (root, pso) = crate::compute::pipeline(
+            MOVES,
+            windows::core::s!("half_views_test"),
+            0,
+            &[crate::compute::Param::Table(&uav_range)],
+        )
+        .expect("half-views compute pipeline");
+        let heap: ID3D12DescriptorHeap = {
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            };
+            // SAFETY: plain heap creation.
+            unsafe { host.device.CreateDescriptorHeap(&desc) }.expect("a view heap")
+        };
+        let (from, filled) = host.shared_buffer(BYTES).expect("a buffer");
+        let (to, result) = host.shared_buffer(BYTES).expect("a buffer");
+        // SAFETY: both mappings hold `BYTES` bytes; the views are of live
+        // buffers in slots of the heap made above; an open list.
+        let unsigned = unsafe {
+            let filled = std::slice::from_raw_parts_mut(filled.cast::<u16>(), ELEMENTS * 4);
+            for (pattern, half) in filled.iter_mut().enumerate() {
+                *half = pattern as u16;
+            }
+            std::ptr::write_bytes(result, 0xee, BYTES as usize);
+            let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT(UNSIGNED as i32),
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: ELEMENTS as u32,
+                        ..Default::default()
+                    },
+                },
+            };
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            host.device
+                .CreateUnorderedAccessView(&from, None::<&ID3D12Resource>, Some(&view), start);
+            let second = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + step,
+            };
+            host.device
+                .CreateUnorderedAccessView(&to, None::<&ID3D12Resource>, Some(&view), second);
+            let list = host.new_list().expect("a host list");
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.list.Dispatch(ELEMENTS as u32 / 64, 1, 1);
+            list.close();
+            host.execute(&[&list]);
+            assert!(
+                host.device.GetDeviceRemovedReason().is_ok(),
+                "the device, after views in format {UNSIGNED}"
+            );
+            let result = std::slice::from_raw_parts(result.cast::<u16>(), ELEMENTS * 4);
+            (0..=u16::MAX)
+                .filter(|&p| result[usize::from(p)] == p)
+                .count()
+        };
+        assert_eq!(
+            unsigned, 65_536,
+            "patterns unchanged, moved as unsigned integers"
+        );
+    }
+
+    /// End-to-end test of [`buffer_srv`] converting a structured buffer SRV
+    /// (`StructureByteStride = 680`, starting at `FirstElement = 1` = `+680`
+    /// bytes, `8 mod 16`) into a raw SRV and reading it through a translated
+    /// DXIL compute shader via MUBUF raw byte offset (`0xC4`), SMEM scalar
+    /// byte offset (`0xC4`), and MUBUF structured element+field (`[2] + 12`).
+    #[test]
+    fn structured_buffer_srv_made_raw_reads_byte_and_element_offsets() {
+        use crate::pipeline::{Shader, Translated, host::HostPipeline};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+            emit, io, ir, resource, structure,
+        };
+
+        let Some(host) = host() else {
+            return;
+        };
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: valid feature support query.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if ok.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return;
+        }
+
+        let code_words: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (SRV slot 0)
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0303,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0x0 (UAV slot 1)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0404,
+            0xFA00_00C4, // s_buffer_load_dword s16, s[8:11], 0xC4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_0210, // v_mov_b32 v4, s16
+            0xE030_00C4,
+            0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0 offset:196
+            0x7E04_0282, // v_mov_b32 v2, 2
+            0xE030_200C,
+            0x8002_0302, // buffer_load_dword v3, v2, s[8:11], 0 idxen offset:12
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0000,
+            0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:0
+            0xE070_0004,
+            0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0 offset:4
+            0xE070_0008,
+            0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0 offset:8
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: (0..2)
+                .map(|slot| RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: slot,
+                    slot,
+                })
+                .collect(),
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 680,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 1,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: code_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut container = vec![0; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[20..24].copy_from_slice(&1u32.to_le_bytes());
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let c = Container::parse(&container).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let hs = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let ud_spec = hs.user_data.clone();
+        let shader = Shader::for_test(
+            "compute",
+            Translated {
+                host: hs,
+                used: native.used,
+            },
+        );
+        let Some(hp) = HostPipeline::new(&[shader], None, |_, _| {}) else {
+            panic!("synthetic structured-SRV pipeline");
+        };
+
+        // Allocate 8 KiB of title memory (2048 dwords) filled with distinct words.
+        let bytes_len = 8192usize;
+        let mut backing: Vec<u32> = (0..(bytes_len / 4) as u32)
+            .map(|i| 0x2000_0000 + i)
+            .collect();
+        let mem = backing.as_mut_ptr();
+        crate::shadow::register(mem as usize, mem as u64, bytes_len as u64);
+
+        // SAFETY: shader-visible heap with 2 slots.
+        let d3d_heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        // SAFETY: live descriptor heap.
+        let cpu = unsafe { d3d_heap.GetCPUDescriptorHandleForHeapStart() };
+        // SAFETY: plain device query.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        } as usize;
+
+        // Structured SRV: stride = 680, FirstElement = 1 (+680B = +170 dwords), NumElements = 4.
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 1,
+                    NumElements: 4,
+                    StructureByteStride: 680,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        let _kept = buffer_srv(mem as u64, bytes_len as u64, srv_desc, cpu)
+            .expect("buffer_srv succeeds")
+            .expect("holds shadow buffer");
+
+        let list = host.new_list().unwrap();
+        let shadow = crate::shadow::find(mem as u64, bytes_len as u64).expect("registered shadow");
+        shadow.refresh(&list, mem as u64, bytes_len as u64);
+
+        let mut uav_buf: Option<ID3D12Resource> = None;
+        // SAFETY: valid default UAV buffer description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut uav_buf,
+                )
+                .unwrap();
+        }
+        let uav_buf = uav_buf.unwrap();
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 8,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: valid UAV slot 1.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &uav_buf,
+                None,
+                Some(&uav_desc),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu.ptr + step,
+                },
+            );
+        }
+
+        let mut ud = vec![0u32; hp.stages[0].user_data.map_or(1, |(_, n)| n as usize)];
+        for u in &ud_spec {
+            ud[u.index as usize] = 32 * u32::from(u.slot);
+        }
+        let (readback, rb_ptr) = list.readback(host, 256).unwrap();
+        // SAFETY: open list with heap, root signature, constants, and PSO bound.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(d3d_heap.clone())]);
+            list.list.SetComputeRootSignature(&hp.root);
+            list.list
+                .SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&hp.pso);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &uav_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyResource(&readback, &uav_buf);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU execution finished; read 3 dwords from mapped readback.
+        let got = unsafe { *rb_ptr.cast::<[u32; 3]>() };
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        crate::shadow::unregister(mem as usize, mem as u64);
+        drop(backing);
+
+        let expected = [
+            0x2000_0000 + 170 + 49,  // MUBUF raw @ 0xC4
+            0x2000_0000 + 170 + 49,  // SMEM scalar raw @ 0xC4
+            0x2000_0000 + 170 + 343, // MUBUF structured [2] + 12
+        ];
+        assert_eq!(got, expected);
     }
 }
