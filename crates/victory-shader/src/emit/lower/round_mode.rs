@@ -6,7 +6,7 @@ use crate::ir::Inst;
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
 /// after `inst`, from `mode` before it (`None`: not known).
-pub(super) fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+pub(in crate::emit) fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
     match (inst.name(), &inst.fields) {
         ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
         (

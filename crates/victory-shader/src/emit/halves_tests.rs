@@ -3362,6 +3362,90 @@ fn readfirstlane_in_branch(mask_words: &[u32], with_mbcnt: bool, with_branch: bo
     w
 }
 
+/// Whole-wave `v_add_f64` active-lane count (`mask ? 1.0_f64 : 0.0_f64`)
+/// followed by `v_cvt_f32_f64`: counts lanes in `[lo, hi)` within each 64-lane
+/// console wave, setting `HW_REG_MODE` bits 3:2 to `round_mode` inside the
+/// section, and writes `[f64_lo, f64_hi, f32_bits, 0]` per lane.
+#[cfg(windows)]
+fn f64_count_reduction(lo: u32, hi: u32, round_mode: u32) -> Vec<u32> {
+    assert!(lo <= 64 && hi <= 64);
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0 (byte offset = lane * 32)
+        0x3612_00BF, // v_and_b32 v9, 63, v0
+        0xD4C6_000A,
+        ((128 + lo) << 9) | 265, // v_cmp_ge_u32 s[10:11], v9, lo
+        0xD4C1_000C,
+        ((128 + hi) << 9) | 265, // v_cmp_lt_u32 s[12:13], v9, hi
+        0x878A_0C0A,             // s_and_b64 s[10:11], s[10:11], s[12:13]
+        0x7E26_0280,             // v_mov_b32 v19, 0
+        0x7E28_02FF,
+        0x3FF0_0000, // v_mov_b32 v20, lit(0x3ff00000) -> 1.0_f64
+        0xBE86_25C1, // s_or_saveexec_b64 s[6:7], -1
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x8788_060A, // s_and_b64 s[8:9], s[10:11], s[6:7]
+        0xD501_0002,
+        0x0022_2702, // v_cndmask_b32 v2, v2, v19, s[8:9]
+        0xD501_0003,
+        0x0022_2903, // v_cndmask_b32 v3, v3, v20, s[8:9]
+        0x7E08_02E9,
+        0xDE54_C102, // v_mov_b32 v4, v2 dpp8:[1,0,3,2,5,4,7,6]
+        0x7E0A_02E9,
+        0xDE54_C103, // v_mov_b32 v5, v3 dpp8:[1,0,3,2,5,4,7,6]
+        0xBA80_0881,
+        round_mode, // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), round_mode
+        0xD564_0002,
+        0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0x7E08_02E9,
+        0x9360_1202, // v_mov_b32 v4, v2 dpp8:[2,2,0,0,6,6,4,4]
+        0x7E0A_02E9,
+        0x9360_1203, // v_mov_b32 v5, v3 dpp8:[2,2,0,0,6,6,4,4]
+        0xD564_0002,
+        0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0x7E08_02E9,
+        0x0009_2402, // v_mov_b32 v4, v2 dpp8:[4,4,4,4,0,0,0,0]
+        0x7E0A_02E9,
+        0x0009_2403, // v_mov_b32 v5, v3 dpp8:[4,4,4,4,0,0,0,0]
+        0xD564_0002,
+        0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0x7E08_02FA,
+        0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+        0x7E0A_02FA,
+        0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+        0xD564_0002,
+        0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0xD778_0004,
+        0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005,
+        0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+        0xD564_0002,
+        0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0xD760_0008,
+        0x0001_4102, // v_readlane_b32 s8, v2, 32
+        0xD760_0009,
+        0x0001_4103, // v_readlane_b32 s9, v3, 32
+        0xD564_0002,
+        0x0002_0408, // v_add_f64 v[2:3], s[8:9], v[2:3]
+        0xD760_0008,
+        0x0001_0102, // v_readlane_b32 s8, v2, 0
+        0xD760_0009,
+        0x0001_0103, // v_readlane_b32 s9, v3, 0
+        0xBE8C_0308, // s_mov_b32 s12, s8
+        0xBE8D_0309, // s_mov_b32 s13, s9
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0x7E0C_020C, // v_mov_b32 v6, s12
+        0x7E0E_020D, // v_mov_b32 v7, s13
+        0x7E10_1E0C, // v_cvt_f32_f64 v8, s[12:13]
+        0x7E12_0280, // v_mov_b32 v9, 0
+    ]);
+    for (vdata, slot) in [(6, 0), (7, 1), (8, 2), (9, 3)] {
+        w.extend(store(vdata, 4 * slot));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
 /// Active-lane predicates for [`readfirstlane_in_branch`]:
 /// - lower half only: `(v0 >> 1) == 4` -> lanes 8, 9 (first = 8)
 /// - upper half only: `(v0 >> 1) == 20` -> lanes 40, 41 (first = 40)
@@ -3552,6 +3636,51 @@ fn readfirstlane_in_branch_matches_the_console_on_every_gpu() {
     let empty_lit = readfirstlane_offset_in_branch(&MASK_EMPTY, true, false);
     for msg in differences_in(true, &empty_lit, 64, 1, &[7; 64], 0, true, true) {
         failed.push(format!("literal_empty: {msg}"));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Whole-wave `v_add_f64` active-lane count + `v_cvt_f32_f64` matches exact
+/// IEEE-754 `f64` `(lo, hi)` and `f32` results across empty, lower-half-only,
+/// upper-half-only, boundary-straddling, and full-wave masks (including a
+/// 96-thread group whose second console wave has no upper half), and refuses
+/// non-nearest rounding modes inside the whole-wave section.
+#[test]
+#[cfg(windows)]
+fn v_add_f64_count_reduction_and_cvt_f32_f64_match_console_on_every_gpu() {
+    // Non-nearest rounding mode (RTZ = 3) inside the whole-wave section must be refused.
+    assert_ne!(
+        refusal(&f64_count_reduction(0, 64, 3), 64, 0),
+        "translated",
+        "non-nearest rounding mode in v_add_f64 whole-wave section must be refused"
+    );
+
+    let cases: &[(u32, u32, u32)] = &[
+        (0, 0, 64),   // empty mask (0.0)
+        (0, 13, 64),  // lower-half-only (13.0)
+        (41, 64, 64), // upper-half-only (23.0)
+        (25, 40, 64), // straddling 32-lane boundary (15.0)
+        (0, 47, 64),  // straddling boundary (47.0)
+        (0, 64, 64),  // full wave (64.0)
+        (10, 50, 96), // wave 0: 40.0, wave 1 (32 threads, no upper half): 22.0
+    ];
+    let mut failed = Vec::new();
+    for &(lo, hi, threads) in cases {
+        let words = f64_count_reduction(lo, hi, 0);
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| {
+                let wave_base = l & !63;
+                let wave_lanes = (threads - wave_base).min(64);
+                let count = hi.min(wave_lanes).saturating_sub(lo.min(wave_lanes));
+                let bits = f64::from(count).to_bits();
+                [bits as u32, (bits >> 32) as u32, (count as f32).to_bits(), 0]
+            })
+            .collect();
+        failed.extend(differences(&words, threads, 4, &want));
+        if threads == 64 {
+            // Also verify under literal wave64 halves (`self.x.st.literal == true`).
+            failed.extend(differences_in(true, &words, threads, 4, &want, 0, false, true));
+        }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

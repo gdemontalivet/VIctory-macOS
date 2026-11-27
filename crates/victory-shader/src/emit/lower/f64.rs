@@ -166,4 +166,75 @@ impl<'a> Lower<'a> {
         let r = self.s.m.select(c, is_sub, sub_res, r);
         self.s.m.select(c, is_under, under_res, r)
     }
+
+    /// Lowers `Shape::CountF64Hi(mask)`: the high 32 bits of the IEEE-754
+    /// binary64 active-lane count `(double)popcount(mask)` across the whole
+    /// wave (counts `0..=64`; the low 32 bits are always zero).
+    pub(super) fn count_f64_hi(&mut self, mask: Value) -> Result<V, Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        let across = self.halves && !self.one_host_wave();
+        if across && !self.across_here() {
+            return Err(halves::REDUCTION_ACROSS);
+        }
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let mut on = self.boolean(m, c)?;
+        if let Some(active) = self.pred_active(self.cur_ir) {
+            on = self.s.m.bin(c, Bin::And, on, active);
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        let n = if across {
+            let (lo, hi) = self.ballot_across_halves(on, c)?;
+            let c_lo = self.unary_bits(c, 31, lo);
+            let c_hi = self.unary_bits(c, 31, hi);
+            self.s.m.bin(c, Bin::Add, c_lo, c_hi)
+        } else {
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let b = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let lo = self.s.m.extract(c, b, 0);
+            let c_lo = self.unary_bits(c, 31, lo);
+            if self.x.p.wave64 && !self.halves {
+                let hi = self.s.m.extract(c, b, 1);
+                let c_hi = self.unary_bits(c, 31, hi);
+                self.s.m.bin(c, Bin::Add, c_lo, c_hi)
+            } else {
+                c_lo
+            }
+        };
+        Ok(self.u32_small_to_f64_hi(c, n))
+    }
+
+    /// High 32 bits of IEEE-754 binary64 for a small unsigned integer `n`
+    /// (`0 <= n <= 64`, where the low 32 bits are always zero).
+    fn u32_small_to_f64_hi(&mut self, c: usize, n: V) -> V {
+        let k0 = self.s.m.i32(0);
+        let k1 = self.s.m.i32(1);
+        let k20 = self.s.m.i32(20);
+        let k31 = self.s.m.i32(31);
+        let bias = self.s.m.i32(1023);
+        let is_zero = self.s.m.cmp(c, pred::EQ, n, k0);
+        // DXIL FirstbitHi (33) returns leading zeros (31 - floor(log2(n))) for n > 0.
+        let clz = self.unary_bits(c, 33, n);
+        let raw_k = self.s.m.bin(c, Bin::Sub, k31, clz);
+        // Clamp k to 0 when n == 0 so shifts never see an out-of-range amount.
+        let k = self.s.m.select(c, is_zero, k0, raw_k);
+        let exp = self.s.m.bin(c, Bin::Add, bias, k);
+        let exp_sh = self.s.m.bin(c, Bin::Shl, exp, k20);
+        let lead = self.s.m.bin(c, Bin::Shl, k1, k);
+        let frac = self.s.m.bin(c, Bin::Xor, n, lead);
+        let shift = self.s.m.bin(c, Bin::Sub, k20, k);
+        let mant = self.s.m.bin(c, Bin::Shl, frac, shift);
+        let nz = self.s.m.bin(c, Bin::Or, exp_sh, mant);
+        self.s.m.select(c, is_zero, k0, nz)
+    }
 }
