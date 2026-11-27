@@ -71,6 +71,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
         atomic_locks: false,
         atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -96,6 +97,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
