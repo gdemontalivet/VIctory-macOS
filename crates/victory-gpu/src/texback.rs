@@ -395,6 +395,7 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{HostGpu, HostMemory};
 
     struct KindGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
