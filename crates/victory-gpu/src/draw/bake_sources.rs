@@ -700,6 +700,8 @@ mod tests {
                     half_views: Vec::new(),
                 },
                 used: Vec::new(),
+                used_written: Vec::new(),
+                write_unknown: true,
             },
         );
 
@@ -817,6 +819,8 @@ mod tests {
             Translated {
                 host: ps_host,
                 used: ps_used,
+                used_written: Vec::new(),
+                write_unknown: true,
             },
         );
         let mut gfx = GraphicsState::default();
