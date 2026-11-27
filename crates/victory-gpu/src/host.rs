@@ -6967,7 +6967,10 @@ mod marks {
         host.execute(&[&list]);
         // Under the lock the last submission is the last one marked,
         // whatever other tests submitted meanwhile.
-        let submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // A flight another test left in the air has marked its number before
+        // it ran: land it first.
+        host.finish_flight_locked(&mut submitted, None, None);
         assert!(
             mark.saw(*submitted),
             "the mark shows submission {}",
