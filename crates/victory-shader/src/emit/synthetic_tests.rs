@@ -124,6 +124,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     })
 }
 
@@ -144,6 +145,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         mesh_stride: 0,
         atomic_locks: false,
         atomic_lock_rounds: false,
+            atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -933,6 +935,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             mesh_stride: 0,
             atomic_locks: false,
             atomic_lock_rounds: false,
+        atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             host_wave32: false,
@@ -961,6 +964,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap: l.heap,
             heap_writes: l.heap_writes,
             view_marks: false,
+            half_views: l.half_views,
         }
     };
 
