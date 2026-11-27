@@ -175,6 +175,9 @@ pub(crate) struct Parts<'a> {
     pub host_wave32: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
+    /// A size query on a writable image asks for level 0, not an undefined
+    /// level ([`Options::uav_size_level0`](super::Options)).
+    pub uav_size_level0: bool,
 }
 
 enum Stop {
@@ -183,17 +186,19 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_pruned(parts, None)
+    lower_pruned(parts, None, false)
 }
 
 pub(crate) fn lower_pruned(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
+    per_vertex_center: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, keep).run() {
+        match Lower::new(parts, &bad, keep, per_vertex_center).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -368,6 +373,9 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// Lower non-provoking per-vertex pixel reads (P10/P20) to zero and
+    /// hardware-interpolate float P0 at pixel center (`Options::per_vertex_center`).
+    per_vertex_center: bool,
     /// In halves: per IR block, whether every lane of the group runs it
     /// together ([`step_and_cap`]), where values can pass between the halves.
     step: Vec<bool>,
@@ -710,7 +718,12 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        keep: Option<&KeptOutputs>,
+        per_vertex_center: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -722,6 +735,7 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         if let Some(keep) = keep {
+            s.repack_signatures = true;
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {
@@ -825,6 +839,9 @@ impl<'a> Lower<'a> {
                 max_vertices = max_vertices.min(ms.threads);
                 max_primitives = max_primitives.min(ms.threads);
             }
+            if max_vertices == 0 {
+                max_primitives = 0;
+            }
             s.mesh = Some(super::shader::Mesh {
                 max_vertices,
                 max_primitives,
@@ -919,6 +936,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
+            per_vertex_center,
             step: if halves { step } else { Vec::new() },
             cap_escaped,
             half_words: None,
@@ -4863,7 +4881,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        let mip = if image.is_some() && (!uav || self.x.uav_size_level0) {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -8840,6 +8858,7 @@ impl<'a> Lower<'a> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
+        let mut from_vertex_p0 = false;
         let (attribute, mode) = match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
                 return Err("an interpolation with computed barycentrics");
@@ -8860,11 +8879,35 @@ impl<'a> Lower<'a> {
                     Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
                 },
             ),
-            // P0, the provoking vertex: a flat (nointerpolation) input.
+            // P0, the provoking vertex: a flat (nointerpolation) input, or
+            // perspective-center interpolated for float inputs under
+            // `per_vertex_center` (where P10 and P20 collapse to 0).
             Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } => (attribute, 1),
+            } => {
+                from_vertex_p0 = true;
+                (attribute, 1)
+            }
+            Interp::Vertex {
+                attribute: _,
+                vertex: 0 | 1,
+            } if self.per_vertex_center => {
+                let z = self.s.m.i32(0);
+                if inst.name().ends_with("_f16") {
+                    return self.write_half(inst, z, None);
+                }
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => *dst,
+                    Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+                    _ => unreachable!(),
+                };
+                let Operand::Vector { reg, .. } = dst else {
+                    return Err("an interpolation");
+                };
+                self.write(inst, Reg::V(reg), z, None);
+                return Ok(());
+            }
             Interp::Vertex {
                 attribute,
                 vertex: vertex @ (0 | 1),
@@ -8885,10 +8928,28 @@ impl<'a> Lower<'a> {
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
             let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
+            let want = if from_vertex_p0 && l.per_vertex_center {
+                if e.comp == 9 {
+                    if e.usage != 0 && e.interp != 0 {
+                        e.interp
+                    } else {
+                        2
+                    }
+                } else {
+                    1
+                }
+            } else {
+                mode
+            };
+            if e.interp != want && e.usage != 0 {
+                if l.per_vertex_center && e.comp == 9 && e.interp == 2 && want != 1 {
+                    e.interp = want;
+                } else {
+                    return Err("one input interpolated two ways");
+                }
+            } else {
+                e.interp = want;
             }
-            e.interp = mode;
             match l.load_any_input(id, col) {
                 Val::I32(x) => Ok(x),
                 _ => Err("an input"),
@@ -8930,8 +8991,9 @@ impl<'a> Lower<'a> {
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
                     return self.write_half(inst, lo, None);
-                } else if mode == 1 {
-                    // The whole dword of a flat input: both halves.
+                } else if mode == 1 || (self.per_vertex_center && from_vertex_p0) {
+                    // The whole dword of a flat (or center-approximated P0)
+                    // 16-bit input: both halves.
                     let z = self.s.m.i32(0);
                     let lo = half(self, h)?.unwrap_or(z);
                     let hi = half(self, h + 1)?.unwrap_or(z);
@@ -9575,7 +9637,9 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav && self.x.uav_size_level0 {
+                self.s.m.i32(0)
+            } else if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -10981,32 +11045,6 @@ impl<'a> Lower<'a> {
                 &args,
             );
         }
-        self.end_guarded(at, &[]);
-        Ok(())
-    }
-
-    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
-    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
-    /// and 29), which only the console's edge-flag rasterisation reads and
-    /// which is no part of the index. Bit 31 culls it (all indices 0: no
-    /// area).
-    fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
-        let v = e.values[0].ok_or("a primitive export without its indices")?;
-        let x = self.i32_of(v)?;
-        let at = self.begin_guarded(guard);
-        let c = self.cur;
-        let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
-            let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
-        }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }
