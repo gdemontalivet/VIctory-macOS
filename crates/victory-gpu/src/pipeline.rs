@@ -530,6 +530,23 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).
