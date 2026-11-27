@@ -2525,6 +2525,83 @@ fn pixel_shader_skips_early_depth_stencil_with_discard_depth_or_uav() {
     assert!(!uav.early_depth_stencil);
 }
 
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`: the console tests depth before
+/// the pixel shader, so a pixel behind closer geometry never makes the
+/// shader's writes. The host shader then tests depth first too, title UAV
+/// writes and discards notwithstanding; a depth export still keeps it late.
+#[test]
+fn console_depth_before_shader_keeps_early_depth_stencil_with_uav_writes() {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    let uav_store = [
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 64
+        0xFA00_0040,
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE070_0000, // buffer_store_dword v2, off, s[8:11], 0
+        0x8002_0000,
+    ];
+    let color = [0xF800_180F, 0x0504_0302]; // exp mrt0 v2, v3, v4, v5 done vm
+    for view_marks in [false, true] {
+        let uav = lower_ps_for_early_z(
+            &uav_store,
+            color,
+            Vec::new(),
+            DEPTH_BEFORE_SHADER,
+            view_marks,
+        );
+        assert!(
+            uav.early_depth_stencil,
+            "title UAV store, view marks {view_marks}"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut uav.dxil.clone()).unwrap();
+        }
+    }
+
+    // Conditional discard (as in `pixel_shader_skips_..._or_uav`).
+    let discard = lower_ps_for_early_z(
+        &[
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7C22_0480, // v_cmpx_lt_f32 exec, 0, v2
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF84_0004, // s_cbranch_scc0 -> kill
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xF800_180F, // exp mrt0 v2, v3, v4, v5 done vm
+            0x0504_0302,
+            S_ENDPGM,
+        ],
+        [0xF800_1890, 0x0000_0000], // kill: exp null done vm
+        Vec::new(),
+        DEPTH_BEFORE_SHADER,
+        true,
+    );
+    assert!(discard.early_depth_stencil, "discard");
+
+    // Depth export (exp mrtz v2, off, off, off done vm).
+    let depth_out = vec![crate::emit::container::SigElement {
+        name: "SV_Depth".into(),
+        index: 0,
+        kind: 17,
+        comp: 9,
+        interp: 0,
+        row: None,
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    }];
+    let depth = lower_ps_for_early_z(
+        &[],
+        [0xF800_1881, 0x0000_0002],
+        depth_out,
+        DEPTH_BEFORE_SHADER,
+        true,
+    );
+    assert!(!depth.early_depth_stencil, "depth export");
+}
+
 /// GLOBAL `op` with address `s[saddr:saddr+1] + vaddr + offset`.
 const fn global(op: u32, vdst: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] {
     [
@@ -3474,6 +3551,79 @@ fn a_ds_read_u16_d16_into_a_lane_varying_destination_keeps_the_first_lane_refusa
     assert_eq!(
         l.shape.barriers, 0,
         "no cross-half exchange was emitted for the uniform-destination _d16 read"
+    );
+}
+
+/// A `ds_read_b32` at a uniform address stays lane-uniform even when the
+/// shader writes LDS, provided every LDS write before and after it is
+/// separated by an `s_barrier`. Without a barrier before (RAW) or after (WAR)
+/// the read, it stays lane-varying and the divergent `v_readfirstlane_b32`
+/// keeps the cross-half refusal.
+#[test]
+fn a_barrier_isolated_ds_read_stays_uniform_with_lds_writes_present() {
+    let lower = |words: &[u32]| {
+        lower_halves_io(
+            words,
+            vec![RootParam {
+                sgprs: 4,
+                ..root(RootType::Constants, 0, 0)
+            }],
+            vec![],
+            1 << 15 | 4 << 1,
+            [128, 1, 1],
+        )
+    };
+    const S_BARRIER: u32 = 0xBF8A_0000;
+    const DS_WRITE_B32_V2_V0: [u32; 2] = [0xD834_0000, 0x0000_0002];
+    const DS_READ_B32_V1_V2: [u32; 2] = [0xD8D8_0000, 0x0100_0002];
+    let preamble = [
+        0x7E04_02FF,
+        0x0000_0000, // v_mov_b32 v2, 0 (uniform LDS address)
+    ];
+    let first_across = super::halves::FIRST_ACROSS;
+
+    // 1. ds_write -> s_barrier -> ds_read (no write after): uniform.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.push(S_BARRIER);
+    w.extend(DS_READ_B32_V1_V2);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    let l = lower(&w).expect("barrier before ds_read makes uniform LDS read lower in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.shape.barriers, 1);
+
+    // 2. ds_write -> s_barrier -> ds_read -> s_barrier -> ds_write: uniform.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.push(S_BARRIER);
+    w.extend(DS_READ_B32_V1_V2);
+    w.push(S_BARRIER);
+    w.extend(DS_WRITE_B32_V2_V0);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006);
+    let l = lower(&w).expect("barriers on both sides make uniform LDS read lower in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.shape.barriers, 2);
+
+    // 3. ds_write -> ds_read (RAW hazard, no barrier): refused.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.extend(DS_READ_B32_V1_V2);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006);
+    assert!(
+        matches!(lower(&w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "RAW hazard without s_barrier keeps the cross-half refusal"
+    );
+
+    // 4. ds_write -> s_barrier -> ds_read -> ds_write (WAR hazard, no barrier after): refused.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.push(S_BARRIER);
+    w.extend(DS_READ_B32_V1_V2);
+    w.extend(DS_WRITE_B32_V2_V0);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006);
+    assert!(
+        matches!(lower(&w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "WAR hazard without s_barrier after ds_read keeps the cross-half refusal"
     );
 }
 
