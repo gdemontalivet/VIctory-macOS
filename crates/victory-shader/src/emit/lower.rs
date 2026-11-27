@@ -30,6 +30,7 @@ mod first_lane;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod marks;
 mod meet;
 mod packed;
 mod round_mode;
@@ -40,6 +41,8 @@ mod thread_limits;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
+#[cfg(test)]
+pub(crate) use marks::per_lane_marks;
 pub(crate) use mesh::{KeptOutputs, idle_clip, plan_layout};
 use mesh::prune_signature;
 pub(crate) use meet::MeetSite;
@@ -5265,75 +5268,6 @@ impl<'a> Lower<'a> {
         (self.as_int(a), self.as_int(b))
     }
 
-    /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
-    /// buffer view `h` touches, in the lanes `guard` lets through (module
-    /// notes, "Write marks"): the bits of its first and last byte, set only
-    /// where still clear (both read in one word when they share it, as they
-    /// nearly always do). Nothing for handles that are no heap view, or
-    /// without [`Parts::view_marks`].
-    fn mark_view_write(&mut self, h: V, x: V, bytes: V, guard: Option<V>) {
-        if !self.x.view_marks {
-            return;
-        }
-        let Some(&index) = self.s.view_index.get(&h) else {
-            return;
-        };
-        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let table = self.s.view_marks_handle();
-        let c = self.cur;
-        let eight = k(self, 8);
-        let at = self.s.m.bin(c, Bin::Mul, index, eight);
-        let (base, phase) = self.raw_pair(table, at);
-        let none = k(self, super::VIEW_MARK_NONE);
-        let valid = self.s.m.cmp(c, pred::NE, base, none);
-        let active = match guard {
-            Some(g) => self.s.m.bin(c, Bin::And, g, valid),
-            None => valid,
-        };
-        let first = self.s.m.bin(c, Bin::Add, phase, x);
-        let (zero, one) = (k(self, 0), k(self, 1));
-        let nonempty = self.s.m.cmp(c, pred::NE, bytes, zero);
-        let span = self.s.m.bin(c, Bin::Sub, bytes, one);
-        let span = self.s.m.select(c, nonempty, span, zero);
-        let last = self.s.m.bin(c, Bin::Add, first, span);
-        let (k16, cap) = (k(self, 16), k(self, super::VIEW_WRITE_BITS - 1));
-        let (k5, k2, k31) = (k(self, 5), k(self, 2), k(self, 31));
-        // Each byte's page bit, and its bitmap dword's byte offset and mask.
-        let mut bits = Vec::new();
-        for byte in [first, last] {
-            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
-            let n = self.s.m.bin(c, Bin::Add, base, page);
-            let over = self.s.m.cmp(c, pred::IUGT, n, cap);
-            let n = self.s.m.select(c, over, cap, n);
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            bits.push((word, self.s.m.bin(c, Bin::Shl, one, bit)));
-        }
-        let [(word, first_bit), (last_word, last_bit)] = [bits[0], bits[1]];
-        // In bounds for any lane (the bit is capped), so read before the
-        // guard; most writes find their pages marked: a load, not an atomic.
-        let bitmap = self.s.view_writes_handle();
-        let old = self.raw_dword(bitmap, word);
-        let together = self.s.m.cmp(c, pred::EQ, word, last_word);
-        let also = self.s.m.select(c, together, last_bit, zero);
-        let want = self.s.m.bin(c, Bin::Or, first_bit, also);
-        let set = self.s.m.bin(c, Bin::And, old, want);
-        let clear = self.s.m.cmp(c, pred::NE, set, want);
-        let apart = self.s.m.cmp(c, pred::NE, word, last_word);
-        let more = self.s.m.bin(c, Bin::Or, clear, apart);
-        let go = self.s.m.bin(c, Bin::And, active, more);
-        let outer = self.begin_guarded(Some(go));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Operation 2 is OR; setting a set bit again changes nothing.
-        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, want]);
-        // A write across two bitmap dwords: the last byte's is its own.
-        let inner = self.begin_guarded(Some(apart));
-        self.atomic_bin_op(self.cur, &[bitmap, k2, last_word, iu, iu, last_bit]);
-        self.end_guarded(inner, &[]);
-        self.end_guarded(outer, &[]);
-    }
-
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
     /// item). Every access to an address the program computes goes through
     /// here: scalar and global loads, stores and atomics, the BVH node
@@ -5425,27 +5359,6 @@ impl<'a> Lower<'a> {
         let (word, bit) = self.memory_bit(n);
         // Operation 2 is OR.
         self.atomic_bin_op(c, &[bitmap, k2, word, iu, iu, bit]);
-    }
-
-    /// Sets bit `n` in `bitmap` in the lanes `guard` lets through (`None`:
-    /// all), with an atomic only where a load finds it clear: most stores
-    /// find their page marked. A lane that reads a stale 0 only ORs again.
-    fn mark_memory_bit_if_clear(&mut self, bitmap: V, n: V, guard: Option<V>) {
-        let c = self.cur;
-        let (k2, zero) = (self.s.m.i32(2), self.s.m.i32(0));
-        let (word, bit) = self.memory_bit(n);
-        // Read in every lane: out of the bitmap reads 0, an index the
-        // atomic then drops.
-        let old = self.raw_dword(bitmap, word);
-        let set = self.s.m.bin(c, Bin::And, old, bit);
-        let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
-        if let Some(g) = guard {
-            clear = self.s.m.bin(c, Bin::And, clear, g);
-        }
-        let at = self.begin_guarded(Some(clear));
-        let iu = self.s.m.undef(self.s.t.i32);
-        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
-        self.end_guarded(at, &[]);
     }
 
     /// The byte offset of the bitmap dword holding bit `n`, and the bit's
@@ -9423,34 +9336,6 @@ impl<'a> Lower<'a> {
             }
         }
         lowered
-    }
-
-    /// Sets the read mark of resource-heap index `index` (module notes,
-    /// "Read marks") where it is still clear. Nothing without
-    /// [`Parts::view_marks`].
-    fn mark_view_read(&mut self, index: V) {
-        if !self.x.view_marks {
-            return;
-        }
-        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let bitmap = self.s.view_writes_handle();
-        let c = self.cur;
-        let (base, k5, k2, k31, one, zero) =
-            (k(self, super::VIEW_READS), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
-        let n = self.s.m.bin(c, Bin::Add, index, base);
-        let word = self.s.m.bin(c, Bin::LShr, n, k5);
-        let word = self.s.m.bin(c, Bin::Shl, word, k2);
-        let bit = self.s.m.bin(c, Bin::And, n, k31);
-        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        // Most reads find their slot marked: a load, not an atomic.
-        let old = self.raw_dword(bitmap, word);
-        let set = self.s.m.bin(c, Bin::And, old, bit);
-        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
-        let at = self.begin_guarded(Some(clear));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Operation 2 is OR.
-        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
-        self.end_guarded(at, &[]);
     }
 
     fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
