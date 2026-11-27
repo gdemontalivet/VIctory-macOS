@@ -284,24 +284,37 @@ pub(crate) fn uploads(
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None, false));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
-    // Nothing to bring up, and the list holds nothing of the last submission
-    // to let go of: it stays as it is.
-    if heaps.is_empty() && textures.is_empty() && !guard.1 && !crate::heap_worker::has_ready() {
-        return None;
-    }
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => {
-            let list = crate::host::host()?.new_list().ok()?;
-            list.set_ours();
-            guard.0 = Some(list);
+    let list = {
+        let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+        crate::texture::recycle();
+        // Nothing to bring up, and the list holds nothing of the last
+        // submission to let go of: it stays as it is.
+        if heaps.is_empty() && textures.is_empty() && !guard.1 && !crate::heap_worker::has_ready() {
+            return None;
         }
-    }
-    let list = guard.0.as_ref()?;
+        let list = match guard.0.take() {
+            // Closed by the last submission, which has run.
+            Some(list) => {
+                list.reset();
+                list
+            }
+            // Made open.
+            None => {
+                let list = crate::host::host()?.new_list().ok()?;
+                list.set_ours();
+                list
+            }
+        };
+        guard.1 = false;
+        list
+    };
+    let mut uploads = Uploads {
+        list: Some(list),
+        dirty: true,
+        pool: &LIST,
+        worker: Mutex::new(None),
+    };
+    let list = uploads.list();
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -425,36 +438,53 @@ pub(crate) fn uploads(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
-    guard.1 = recorded;
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads {
-        list: guard,
-        worker: Mutex::new(ready),
-    })
+    uploads.dirty = recorded;
+    *uploads.worker.get_mut().unwrap_or_else(|e| e.into_inner()) = ready;
+    // A list recording nothing is not run (dropping `uploads` returns it to
+    // `LIST` with `dirty = false` for the next submission).
+    recorded.then_some(uploads)
 }
 
-/// The upload list, used under its lock only, and whether it holds what it
+/// The upload list, reused across submissions, and whether it holds what it
 /// recorded (the staging it names) until the next reset.
 pub(crate) struct Holder(Option<HostList>, bool);
 // SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
+// submission at a time, checked out under `Host::submitted`.
 unsafe impl Send for Holder {}
 
-/// The upload list of a submission, ours until it has run.
+/// The upload list and worker staging drain of a submission, owned until the
+/// submission's GPU fence completes (so Flight-1 overlap can move it to the
+/// background finisher without holding a `MutexGuard` across threads or a GPU
+/// wait); dropping returns the upload list to its reuse slot.
 pub(crate) struct Uploads {
-    list: std::sync::MutexGuard<'static, Holder>,
+    list: Option<HostList>,
+    dirty: bool,
+    pool: &'static Mutex<Holder>,
     worker: Mutex<Option<crate::heap_worker::ReadyDrain>>,
 }
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.list.0.as_ref().expect("made before it is handed out")
+        self.list.as_ref().expect("made before it is handed out")
     }
 
     /// Returns worker-owned staging chunks immediately once the submission's
     /// GPU fence has completed.
     pub(crate) fn release_worker(&self) {
         drop(self.worker.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        self.release_worker();
+        if let Some(list) = self.list.take() {
+            let mut guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.0.is_none() {
+                guard.0 = Some(list);
+                guard.1 = self.dirty;
+            }
+        }
     }
 }
 
