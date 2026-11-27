@@ -631,6 +631,21 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: an output value of the size required for this feature query.
+        let shader_model = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if shader_model.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            eprintln!("skipped: the bindless bake shader needs SM 6.6");
+            return;
+        }
 
         // 1. Compile fullscreen VS via FXC (`vs_5_1`).
         let vs_src = b"float4 main(uint id : SV_VertexID) : SV_Position {
