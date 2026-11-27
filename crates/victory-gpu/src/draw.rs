@@ -6166,6 +6166,8 @@ void main() {
             crate::pipeline::Translated {
                 host: host_shader,
                 used: Vec::new(),
+                used_written: Vec::new(),
+                write_unknown: true,
             },
         );
         let hp = HostPipeline {
