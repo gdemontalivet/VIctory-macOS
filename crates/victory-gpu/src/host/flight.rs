@@ -905,7 +905,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
         assert!(!host.has_in_flight());
         assert!(heap_host.kept(1), "slot 1 published at flight submission");
-        assert!(!crate::heap_worker::has_ready(), "worker ready queue drained");
+        // Not asserted: `has_ready` is false only until the flight's kick of the
+        // heap worker finds more to stage, which depends on timing. The
+        // read-back below shows the staged upload ran.
         let out = crate::shadow::find(dst_bytes as u64, 256).unwrap();
         assert_eq!(out.read_host(dst_bytes as u64, 4), [0x44, 0x44, 0x44, 0x44]);
 
