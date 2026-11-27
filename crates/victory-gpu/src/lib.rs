@@ -95,6 +95,8 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+#[cfg(any(windows, test))]
+mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

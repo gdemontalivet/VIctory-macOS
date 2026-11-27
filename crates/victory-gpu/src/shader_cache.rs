@@ -65,7 +65,13 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, host_wave32())
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            host_wave32(),
+            victory_shader::emit::thread_ticket(),
+        )
     })
 }
 
@@ -79,12 +85,18 @@ fn host_wave32() -> bool {
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool) -> [u8; 32] {
+fn key(
+    translator: &str,
+    encoding: &[u8],
+    limit: u32,
+    wave32: bool,
+    thread_ticket: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32)]);
+    h.update(&[u8::from(wave32), u8::from(thread_ticket)]);
     *h.finalize().as_bytes()
 }
 
@@ -155,6 +167,64 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether a size query on a writable image asks for level 0 in every
+/// program (`Options::uav_size_level0`): only with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC
+/// writes with a size of 0, so a program that computes with that size
+/// goes wrong: the title's shadow min/max program (`07f451a14b13fecb`)
+/// writes one flat value and sun shadows get 16x16-tile edges. Level 0
+/// in every program also changed the TAA disocclusion mask (speckles on
+/// skin), so a list of shader hashes instead of `1` turns it on for those
+/// programs only ([`uav_size_level0_for`]).
+fn uav_size_level0() -> bool {
+    uav_size_rule().0
+}
+
+/// Whether the program in `container` gets the level-0 size query: with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`, or when the variable lists its hash (16
+/// digits, as the log prints shader hashes; several with commas).
+fn uav_size_level0_for(container: &[u8]) -> bool {
+    let (all, only) = uav_size_rule();
+    *all || (!only.is_empty() && only.contains(&blake3::hash(container).to_hex()[..16].to_owned()))
+}
+
+fn uav_size_rule() -> &'static (bool, Vec<String>) {
+    static RULE: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = uav_size(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref());
+        if rule.0 {
+            tracing::info!("VICTORY_UAV_SIZE_LEVEL0=1: size queries on writable images ask for level 0");
+        } else if !rule.1.is_empty() {
+            tracing::info!(
+                programs = ?rule.1,
+                "VICTORY_UAV_SIZE_LEVEL0: size queries on writable images ask for level 0 in these programs only"
+            );
+        }
+        rule
+    })
+}
+
+/// `VICTORY_UAV_SIZE_LEVEL0`'s rule: `1` is every program; a list of
+/// 16-digit shader hashes is those programs; anything else is off.
+fn uav_size(value: Option<&str>) -> (bool, Vec<String>) {
+    let value = value.unwrap_or_default().trim();
+    if value == "1" {
+        return (true, Vec::new());
+    }
+    let hashes: Vec<String> = value
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
+    if hashes
+        .iter()
+        .all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        (false, hashes)
+    } else {
+        (false, Vec::new())
+    }
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -175,23 +245,26 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, their
-/// rounds and umax reduction, bias as gradients, narrow waves): their own
-/// cache entries, one per combination.
+/// rounds and umax reduction, bias as gradients, narrow waves, level-0
+/// size queries on writable images): their own cache entries, one per
+/// combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
-    if !locks && !bias && !narrow {
+    let uav_level0 = options.uav_size_level0;
+    if !locks && !bias && !narrow && !uav_level0 {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
-        | usize::from(umax) << 4;
+        | usize::from(umax) << 4
+        | usize::from(uav_level0) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -209,6 +282,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if narrow {
             h.update(b"narrow waves");
+        }
+        if uav_level0 {
+            h.update(b"uav size level 0");
         }
         *h.finalize().as_bytes()
     })
@@ -228,13 +304,17 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        per_vertex_center: false,
+        uav_size_level0: uav_size_level0(),
     }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let options = runtime_options();
+    let mut options = runtime_options();
+    // One program at a time, if the switch lists hashes.
+    options.uav_size_level0 = uav_size_level0_for(container);
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let build = translation_build(options);
@@ -557,6 +637,35 @@ mod tests {
         assert!(!rounds_on(false, Some("1")), "nor when asked for");
     }
 
+    #[test]
+    fn the_size_query_switch_is_all_programs_or_a_list_of_hashes() {
+        assert_eq!(uav_size(None), (false, vec![]));
+        assert_eq!(uav_size(Some("")), (false, vec![]));
+        assert_eq!(uav_size(Some("0")), (false, vec![]));
+        assert_eq!(uav_size(Some("1")), (true, vec![]));
+        assert_eq!(uav_size(Some("yes")), (false, vec![]));
+        let two = vec!["07f451a14b13fecb".to_owned(), "11eeb27c2d15980d".to_owned()];
+        assert_eq!(
+            uav_size(Some("07F451A14B13FECB, 11eeb27c2d15980d")),
+            (false, two)
+        );
+        // A list with a wrong entry is no list: nothing is turned on.
+        assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
+
+    /// Translations with the level-0 size query have cache entries of
+    /// their own.
+    #[test]
+    fn the_size_query_switch_keys_the_cache() {
+        let plain = victory_shader::emit::Options::default();
+        let level0 = victory_shader::emit::Options {
+            uav_size_level0: true,
+            ..plain
+        };
+        assert_eq!(translation_build(plain), build());
+        assert_ne!(translation_build(level0), build());
+    }
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -669,19 +778,21 @@ mod tests {
     /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, true);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
                 victory_shader::emit::loop_limit(),
-                host_wave32()
+                host_wave32(),
+                victory_shader::emit::thread_ticket(),
             )
         );
         // The encoding part is this file as built.
