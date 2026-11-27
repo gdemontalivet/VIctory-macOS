@@ -2880,6 +2880,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
         half_views: lowered.half_views,
+        heap_index_sources: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut dxil = shader.dxil.clone();
@@ -3179,6 +3180,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             heap_writes: l.heap_writes,
             view_marks: l.view_marks,
             half_views: l.half_views,
+            heap_index_sources: Vec::new(),
         }
     };
     // v1 = first[v0] (one channel).

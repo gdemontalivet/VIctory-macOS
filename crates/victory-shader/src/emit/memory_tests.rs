@@ -542,6 +542,7 @@ fn runs_from_just_before_a_copy_read_its_first_dwords() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         half_views: l.half_views,
+        heap_index_sources: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
