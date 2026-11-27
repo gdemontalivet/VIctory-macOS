@@ -150,6 +150,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
 }
@@ -939,6 +940,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
         })
