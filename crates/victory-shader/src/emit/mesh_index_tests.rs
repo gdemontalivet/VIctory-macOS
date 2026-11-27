@@ -84,14 +84,17 @@ fn build_mesh(
         words.push(S_SENDMSG_GS_ALLOC_REQ);
     }
 
-    if emit_vertices > 0 || !prims.is_empty() {
+    // The position export is always present, because the DXIL validator
+    // wants every declared output written. With `emit_vertices` 0 it is
+    // guarded by a test no lane passes.
+    {
         words.extend([
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
         ]);
     }
 
-    if emit_vertices > 0 {
+    {
         words.extend([
             0x3604_0281, // v_and_b32 v2, 1, v1
             0x3606_0282, // v_and_b32 v3, 2, v1
