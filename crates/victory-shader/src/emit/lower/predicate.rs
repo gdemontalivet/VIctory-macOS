@@ -1015,7 +1015,7 @@ impl Lower<'_> {
         self.block_active[b] = active;
 
         if let Some(&d) = self.pred.skip_joins.get(&b) {
-            self.lower_skip_join_phis(b, d);
+            self.lower_skip_join_phis(b, d)?;
             return Ok(true);
         }
 
@@ -1026,6 +1026,9 @@ impl Lower<'_> {
         // 2. Lower IR phis in linearized merge block `b` directly as `select`
         // chains over `b`'s original IR predecessors.
         let preds = &self.x.p.blocks[b].preds;
+        let mut pred_order: Vec<(usize, usize)> = preds.iter().copied().enumerate().collect();
+        pred_order.sort_by_key(|&(_, q)| self.rpo[q]);
+        let mut wave_any_edge: Map<usize, V> = Map::default();
         for phi in &self.x.p.blocks[b].phis {
             if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
                 self.vals.insert(phi.value, Val::Missing("a lane mask"));
@@ -1036,9 +1039,10 @@ impl Lower<'_> {
                 continue;
             }
             let bit = phi.reg == Reg::Scc;
+            let scalar = matches!(phi.reg, Reg::S(_) | Reg::Scc);
             let mut acc: Option<V> = None;
             let mut missing: Option<Why> = None;
-            for (n, &q) in preds.iter().enumerate() {
+            for &(n, q) in &pred_order {
                 if self.pred.dead_blocks.contains(&q) || self.tail[q].is_none() {
                     continue;
                 }
@@ -1065,7 +1069,22 @@ impl Lower<'_> {
                 if let Some(x) = val {
                     acc = Some(match acc {
                         None => x,
-                        Some(prev) => self.s.m.select(self.cur, edge_act, x, prev),
+                        Some(prev) if prev == x => prev,
+                        Some(prev) => {
+                            let cond = if scalar {
+                                match wave_any_edge.get(&q).copied() {
+                                    Some(v) => v,
+                                    None => {
+                                        let v = self.pred_wave_any(b, edge_act)?;
+                                        wave_any_edge.insert(q, v);
+                                        v
+                                    }
+                                }
+                            } else {
+                                edge_act
+                            };
+                            self.s.m.select(self.cur, cond, x, prev)
+                        }
                     });
                 }
             }
@@ -1091,6 +1110,37 @@ impl Lower<'_> {
         Ok(true)
     }
 
+    /// Whether any lane in the console wave satisfies `act` at in-step block
+    /// `b`: used when merging wave-wide scalar registers (`Reg::S`, `Reg::Scc`)
+    /// at a predicated branch join so every lane sees the scalar value written
+    /// when any lane of the wave entered the branch.
+    fn pred_wave_any(&mut self, b: usize, act: V) -> Result<V, Stop> {
+        let offset = self.x.p.blocks[b].offset;
+        let cur = self.cur;
+        let zero = self.s.m.i32(0);
+        if self.halves && !self.one_host_wave() {
+            let (lo, hi) = self
+                .ballot_across_halves(act, cur)
+                .map_err(|w| unsupported(offset, w))?;
+            let both = self.s.m.bin(cur, Bin::Or, lo, hi);
+            return Ok(self.s.m.cmp(cur, pred::NE, both, zero));
+        }
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        self.s.flags |= flags::WAVE_OPS;
+        let r = self
+            .s
+            .op(cur, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+        let lo = self.s.m.extract(cur, r, 0);
+        let mask = if !self.halves {
+            let hi = self.s.m.extract(cur, r, 1);
+            self.s.m.bin(cur, Bin::Or, lo, hi)
+        } else {
+            lo
+        };
+        Ok(self.s.m.cmp(cur, pred::NE, mask, zero))
+    }
+
     fn pred_outer_active(&self, b: usize) -> Option<V> {
         let idom = self.pred.idom.get(b).copied().unwrap_or(b);
         if idom != b && idom != usize::MAX {
@@ -1101,13 +1151,16 @@ impl Lower<'_> {
     }
 
     /// Lowers phis at a `SkipGuard` join block `b` (where edge `d -> b` was
-    /// bypassed through `body`): selects `act_body ? v_body : v_d`, creating a
-    /// DXIL phi over the live body predecessors when there are two or more.
-    fn lower_skip_join_phis(&mut self, b: usize, d: usize) {
+    /// bypassed through `body`): selects `act_body ? v_body : v_d` for VGPRs
+    /// (and `wave_any(act_body) ? v_body : v_d` for wave-wide scalars),
+    /// creating a DXIL phi over the live body predecessors when there are two
+    /// or more.
+    fn lower_skip_join_phis(&mut self, b: usize, d: usize) -> Result<(), Stop> {
         let FlatExit::SkipGuard { body } = self.pred.exits[&d] else {
-            return;
+            return Ok(());
         };
         let act_body = self.pred_edge_active[&(d, body)];
+        let mut wave_any_body: Option<V> = None;
         let preds = &self.x.p.blocks[b].preds;
         let skip_idx = preds.iter().position(|&q| q == d);
         let body_preds: Vec<(usize, usize)> = preds
@@ -1132,6 +1185,7 @@ impl Lower<'_> {
                 continue;
             }
             let bit = phi.reg == Reg::Scc;
+            let scalar = matches!(phi.reg, Reg::S(_) | Reg::Scc);
             let zero = |l: &mut Self| {
                 if bit {
                     l.s.m.bool(false)
@@ -1175,7 +1229,23 @@ impl Lower<'_> {
             };
             let result = match (v_body, v_d) {
                 (Ok(vb), Ok(vd)) => {
-                    let sel = self.s.m.select(self.cur, act_body, vb, vd);
+                    let sel = if vb == vd {
+                        vb
+                    } else {
+                        let cond = if scalar {
+                            match wave_any_body {
+                                Some(v) => v,
+                                None => {
+                                    let v = self.pred_wave_any(b, act_body)?;
+                                    wave_any_body = Some(v);
+                                    v
+                                }
+                            }
+                        } else {
+                            act_body
+                        };
+                        self.s.m.select(self.cur, cond, vb, vd)
+                    };
                     if bit {
                         Val::Bit(sel)
                     } else {
@@ -1186,6 +1256,7 @@ impl Lower<'_> {
             };
             self.vals.insert(phi.value, result);
         }
+        Ok(())
     }
 
     /// Evaluates a mask phi (`Atom::Phi`) at a linearized merge or `SkipGuard`

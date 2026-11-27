@@ -793,6 +793,7 @@ impl<'a> Lower<'a> {
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
+        let mut alike_cache: Option<HashSet<Value>> = None;
         let mut split_barriers = Set::default();
         let mut pred = predicate::PredicatePlan::empty(Vec::new());
         if let StageIo::Cs(cs) = x.native.io {
@@ -835,7 +836,7 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            };
+            } || halves::needs_first_lane(x, &mut alike_cache);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -1026,7 +1027,7 @@ impl<'a> Lower<'a> {
             meet_epoch: Map::default(),
             level: 0,
             alike: if halves {
-                halves::lane_uniform(x)
+                alike_cache.unwrap_or_else(|| halves::lane_uniform(x))
             } else {
                 HashSet::new()
             },
@@ -7665,11 +7666,10 @@ impl<'a> Lower<'a> {
                 // In halves the host wave's first lane is the console's only
                 // for a value the same in both halves, or where the group is
                 // one host wave.
-                if self.halves
-                    && !self.one_host_wave()
-                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
-                {
+                let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
+                let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                if self.halves && !self.one_host_wave() && is_vec && !is_alike {
                     if !self.across_here() {
                         return Err(halves::FIRST_ACROSS);
                     }
@@ -7678,19 +7678,7 @@ impl<'a> Lower<'a> {
                     return self.write_i(inst, r, None);
                 }
                 let a = s(self, 0)?;
-                // shortcut: without console lanes, the first lane of the host
-                // wave (whose waves are the driver's choice): the console's
-                // where the value is the same in every lane, what the compiler
-                // reads first lanes for.
-                self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = self.first_lane_in_wave(a, (!is_alike).then_some(guard).flatten());
                 let r = self.helper_reads_own(a, r);
                 self.write_i(inst, r, None)
             }
