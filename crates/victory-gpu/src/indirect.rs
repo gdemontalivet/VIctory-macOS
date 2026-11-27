@@ -629,6 +629,7 @@ pub(crate) fn record_batch(
         ));
     }
     let widest = widest();
+    let rest = indirect_rest();
     // SAFETY: `cmd` is the host list's open prelude command list; our clamp
     // pipeline, budget buffer, hoisted argument buffers, and title shadow
     // copies are kept alive by the host list until reset.
@@ -654,7 +655,7 @@ pub(crate) fn record_batch(
                 clamp.kind,
                 clamp.stride,
                 clamp.records,
-                u32::from(clamp.count_gpu.is_some()),
+                u32::from(clamp.count_gpu.is_some()) | (u32::from(rest) << 1),
                 widest,
             ];
             cmd.SetComputeRoot32BitConstants(
@@ -1343,8 +1344,8 @@ void main(uint3 g : SV_GroupID) {
                 stride: 16,
                 records: 4,
                 words: vec![
-                    1 << 24, 4, 0, 0,
-                    1 << 24, 4, 0, 0,
+                    1 << 22, 16, 0, 0,
+                    1 << 22, 16, 0, 0,
                     3, 1, 0, 0,
                     3, 1, 0, 0,
                 ],
@@ -1717,7 +1718,7 @@ void main() {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
-        // Each record asks for 2^24 * 4 = 2^26 vertex instances (half the 2^27
+        // Each record asks for 2^22 * 16 = 2^26 vertex instances (half the 2^27
         // list budget). Two hoisted records exhaust the budget completely, so
         // an inline record after them in the same list must be zeroed.
         let (src, ptr) = host.shared_buffer(32).unwrap();
@@ -1726,8 +1727,8 @@ void main() {
         let (src_gpu, inline_gpu) = unsafe {
             let p = ptr.cast::<u32>();
             for i in 0..2 {
-                p.add(i * 4).write_volatile(1 << 24);
-                p.add(i * 4 + 1).write_volatile(4);
+                p.add(i * 4).write_volatile(1 << 22);
+                p.add(i * 4 + 1).write_volatile(16);
                 p.add(i * 4 + 2).write_volatile(0);
                 p.add(i * 4 + 3).write_volatile(0);
             }
@@ -1751,8 +1752,8 @@ void main() {
         unsafe {
             hoisted_buf.Map(0, None, Some(&mut p)).unwrap();
             let base = p.cast::<u8>().add(hoisted_off as usize).cast::<u32>();
-            assert_eq!(base.add(0).read_volatile(), 1 << 24, "hoisted record 0 fits");
-            assert_eq!(base.add(4).read_volatile(), 1 << 24, "hoisted record 1 fits");
+            assert_eq!(base.add(0).read_volatile(), 1 << 22, "hoisted record 0 fits");
+            assert_eq!(base.add(4).read_volatile(), 1 << 22, "hoisted record 1 fits");
             hoisted_buf.Unmap(0, None);
 
             inline_buf.Map(0, None, Some(&mut p)).unwrap();

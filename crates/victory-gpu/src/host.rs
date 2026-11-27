@@ -6582,6 +6582,10 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
         list.close();
         super::with_bury_lag(3, || {
             let _quiet = host.quiet();
+            // The submission count is global: tests that run at the same
+            // time add to it, so retention is checked against the count the
+            // retirement could not have been recorded after.
+            let before = super::submissions_done();
             super::retire(buf_lag.clone());
             assert!(references(&buf_lag) >= 2, "held by retirement ring");
             drop(_quiet);
@@ -6590,9 +6594,10 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
                 list.reset();
                 list.close();
                 host.execute(&[&list]);
+                let passed = super::submissions_done().saturating_sub(before);
                 assert!(
-                    references(&buf_lag) >= 2,
-                    "still retained after {step} of 3 lag submissions"
+                    passed >= 3 || references(&buf_lag) >= 2,
+                    "still retained after {step} of 3 lag submissions ({passed} passed)"
                 );
             }
             list.reset();
