@@ -2606,6 +2606,20 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
     (d.dimension != BUFFER).then(|| footprint(&d).map(|f| f.size)).flatten()
 }
 
+/// Whether a placed texture at `address` with resource description `desc`
+/// already has a live host texture, without creating one.
+#[cfg(windows)]
+pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> bool {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    let existing = PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, desc))
+        .copied();
+    existing.is_some_and(|r| current(r as This) && made_copy(r as This).is_some())
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

@@ -63,7 +63,7 @@ pub(crate) fn relook_frames(frame_ms: u64, relook_ms: u64) -> u64 {
 
 /// Classification of an unmade slot reported by GPU read-marks when the
 /// background heap worker is enabled.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnmadeRead {
     None,
     Background,
@@ -257,6 +257,82 @@ fn fast_heap_sync_value(value: Option<&std::ffi::OsStr>) -> bool {
 fn fast_heap_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| fast_heap_sync_value(std::env::var_os("VICTORY_FAST_HEAP_SYNC").as_deref()))
+}
+
+/// Policy for mirroring placed-texture slots during non-draw updates
+/// (`VICTORY_PLACED_AT_ONCE`, off by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacedAtOnce {
+    /// Unset, empty, or `0`: leave placed-texture slots null until a draw or
+    /// shader read triggers creation.
+    Off,
+    /// `1`: make the slot at once when the placed texture's host texture
+    /// already exists (creating no new host texture).
+    Made,
+    /// `keep`: like `1`, and when the new texture is not made yet, keep any
+    /// existing host view (and its write mark) in the slot instead of writing
+    /// a null view until a shader read or draw remakes it on demand.
+    Keep,
+    /// `all`: make every placed-texture slot at once.
+    All,
+}
+
+impl PlacedAtOnce {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1") => Self::Made,
+            Some("keep") => Self::Keep,
+            Some("all") => Self::All,
+            _ => Self::Off,
+        }
+    }
+
+    fn makes_existing(self) -> bool {
+        self != Self::Off
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PLACED_AT_ONCE: std::cell::Cell<Option<PlacedAtOnce>> = const { std::cell::Cell::new(None) };
+}
+
+fn placed_at_once() -> PlacedAtOnce {
+    #[cfg(test)]
+    if let Some(mode) = TEST_PLACED_AT_ONCE.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<PlacedAtOnce> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = PlacedAtOnce::parse(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
+        match mode {
+            PlacedAtOnce::Off => {}
+            PlacedAtOnce::Made => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=1: making rewritten placed-texture slots at once when their host texture already exists"
+            ),
+            PlacedAtOnce::Keep => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=keep: making existing placed textures at once and keeping prior host views until read"
+            ),
+            PlacedAtOnce::All => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=all: making every rewritten placed-texture slot at once"
+            ),
+        }
+        mode
+    })
+}
+
+fn made_at_once(view: &View, mode: PlacedAtOnce) -> bool {
+    if !mode.makes_existing() {
+        return false;
+    }
+    let View::Placed(_, resource, desc) = view else {
+        return false;
+    };
+    crate::resource::placed_made(u64::from(desc[10]) | u64::from(desc[11]) << 32, resource)
+}
+
+fn defer_placed(view: &View, mode: PlacedAtOnce) -> bool {
+    is_placed_texture(view) && mode != PlacedAtOnce::All && !made_at_once(view, mode)
 }
 
 /// CPU-only (`D3D12_DESCRIPTOR_HEAP_FLAG_NONE`) staging heap holding null
@@ -1628,21 +1704,22 @@ impl HostHeap {
             }
         }
 
+        let at_once = placed_at_once();
         let pins = views_at_batch(&unique_keys);
-        let mut is_placed: Vec<bool> = Vec::with_capacity(unique_keys.len());
+        let mut defer: Vec<bool> = Vec::with_capacity(unique_keys.len());
         let mut is_tex: Vec<bool> = Vec::with_capacity(unique_keys.len());
         let mut strides: Vec<u32> = Vec::with_capacity(unique_keys.len());
         for pin in &pins {
             if let Some(view) = pin.as_deref() {
-                let placed = is_placed_texture(view);
-                if !placed {
+                let later = defer_placed(view, at_once);
+                if !later {
                     prepare(view);
                 }
-                is_placed.push(placed);
+                defer.push(later);
                 is_tex.push(is_texture(view));
                 strides.push(view_stride(view) | view_kind(view));
             } else {
-                is_placed.push(false);
+                defer.push(false);
                 is_tex.push(false);
                 strides.push(0);
             }
@@ -1745,14 +1822,16 @@ impl HostHeap {
                 {
                     write_address(data, index as usize, Some(view));
                 }
-                let later = is_placed[kidx];
+                let later = defer[kidx];
+                let keep_old =
+                    later && at_once == PlacedAtOnce::Keep && self.kept(index);
                 if later {
                     forgot_reads.push(index);
                 }
                 made[index as usize] = key;
 
                 let (kept, mark) = if later {
-                    if !self.sampler {
+                    if !self.sampler && !keep_old {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
                             copy_dsts.push(self.cpu(index));
@@ -1809,7 +1888,9 @@ impl HostHeap {
                     (k, m)
                 };
 
-                self.set_mark(index, mark);
+                if !keep_old {
+                    self.set_mark(index, mark);
+                }
                 if !self.sampler {
                     viewed_updates.push((index, Some(view), kept.is_some()));
                 }
@@ -1819,7 +1900,9 @@ impl HostHeap {
                 } else {
                     key
                 };
-                kept_updates.push((index, kept));
+                if !keep_old {
+                    kept_updates.push((index, kept));
+                }
                 finalize.push((index, key, ready));
             }
 
@@ -1914,6 +1997,9 @@ impl HostHeap {
     fn needs_remake(&self, index: u32, view: &View, for_draw: bool) -> bool {
         if !for_draw || !(is_texture(view) || is_unordered_texture(view)) {
             return false;
+        }
+        if self.ready[index as usize].load(Ordering::Acquire) == 0 {
+            return true;
         }
         let held = self
             .kept
@@ -2038,7 +2124,8 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        let later = !for_draw && is_placed_texture(&view);
+        let at_once = placed_at_once();
+        let later = !for_draw && defer_placed(&view, at_once);
         if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
@@ -2059,6 +2146,7 @@ impl HostHeap {
             }
         }
         {
+            let keep_old = later && at_once == PlacedAtOnce::Keep && self.kept(index);
             self.ready[index as usize].store(0, Ordering::Relaxed);
             self.synced[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
@@ -2074,17 +2162,21 @@ impl HostHeap {
             } else {
                 make_marked(&view, self.cpu(index))
             };
-            self.set_mark(index, mark);
-            if kept.is_none() && !self.sampler {
+            if !keep_old {
+                self.set_mark(index, mark);
+            }
+            if kept.is_none() && !self.sampler && !keep_old {
                 null_for(&view, self.cpu(index));
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             let kept = kept.flatten();
-            // A texture's view left null is made again when a draw reads it.
+            // A texture's view left null (or keeping a prior view) is made again when a draw reads it.
             let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
-            self.keep(index, kept);
+            if !keep_old {
+                self.keep(index, kept);
+            }
             self.synced[index as usize].store(key, Ordering::Release);
             self.ready[index as usize].store(ready, Ordering::Release);
         }
@@ -2281,13 +2373,14 @@ impl HostHeap {
             .collect()
     }
 
-    /// The view of slot `index` if it is a placed texture's left without a
-    /// host view (made when read).
+    /// The view of slot `index` if it is a placed texture's left unmade (either
+    /// nulled or keeping a prior view under `VICTORY_PLACED_AT_ONCE=keep`).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+        let ready = self.ready[index as usize].load(Ordering::Acquire) == key;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
-        (is_placed_texture(&view) && !kept).then(|| (*view).clone())
+        (is_placed_texture(&view) && (!kept || !ready)).then(|| (*view).clone())
     }
 
     /// How `make_read` should handle an unmade slot when `heap_worker::on()`.
@@ -2304,13 +2397,14 @@ impl HostHeap {
         if key == 0 {
             return UnmadeRead::None;
         }
+        let ready = self.ready[index as usize].load(Ordering::Acquire) == key;
         let kept = self
             .kept
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(index as usize)
             .is_some();
-        if kept {
+        if kept && ready {
             return UnmadeRead::None;
         }
         let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
@@ -4797,6 +4891,150 @@ mod tests {
         assert!(fast_heap_sync_value(Some(OsStr::new("1"))));
         assert!(fast_heap_sync_value(Some(OsStr::new(""))));
         assert!(!fast_heap_sync_value(Some(OsStr::new("0"))));
+    }
+
+    struct PlacedAtOnceGuard(Option<PlacedAtOnce>);
+
+    impl PlacedAtOnceGuard {
+        fn set(mode: PlacedAtOnce) -> Self {
+            Self(TEST_PLACED_AT_ONCE.replace(Some(mode)))
+        }
+    }
+
+    impl Drop for PlacedAtOnceGuard {
+        fn drop(&mut self) {
+            TEST_PLACED_AT_ONCE.set(self.0);
+        }
+    }
+
+    #[test]
+    fn placed_at_once_env_parsing() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("true"), Some("2"), Some("Keep")] {
+            assert_eq!(PlacedAtOnce::parse(off), PlacedAtOnce::Off, "{off:?}");
+            assert!(!PlacedAtOnce::parse(off).makes_existing());
+        }
+        assert_eq!(PlacedAtOnce::parse(Some("1")), PlacedAtOnce::Made);
+        assert_eq!(PlacedAtOnce::parse(Some(" 1 ")), PlacedAtOnce::Made);
+        assert_eq!(PlacedAtOnce::parse(Some("keep")), PlacedAtOnce::Keep);
+        assert_eq!(PlacedAtOnce::parse(Some(" keep ")), PlacedAtOnce::Keep);
+        assert_eq!(PlacedAtOnce::parse(Some("all")), PlacedAtOnce::All);
+        assert!(
+            [PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All]
+                .iter()
+                .all(|m| m.makes_existing())
+        );
+        if std::env::var_os("VICTORY_PLACED_AT_ONCE").is_none() {
+            assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+        }
+    }
+
+    #[test]
+    fn placed_at_once_keep_preserves_prior_view_until_draw_or_read() {
+        let Some(host_gpu) = host() else {
+            return; // no host GPU here
+        };
+        let Some(heap) = HostHeap::new(false, 128) else {
+            return;
+        };
+        let _guard = PlacedAtOnceGuard::set(PlacedAtOnce::Keep);
+
+        // Four distinct linear RGBA8 4x1 placed textures in separate addresses.
+        let mem = vec![0u8; 4 << 16];
+        let base = mem.as_ptr() as u64;
+        let addr_a = base;
+        let addr_b = base + (1 << 16);
+        let addr_c = base + (2 << 16);
+        let addr_d = base + (3 << 16);
+        let tex_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let make_view = |addr: u64| {
+            let mut v = [0u32; 16];
+            v[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (v[10], v[11]) = (addr as u32, (addr >> 32) as u32);
+            v
+        };
+
+        let mut title_heap = vec![0u8; 128 * 32];
+        let start = title_heap.as_ptr() as u64;
+        let slot_addr = |i: u32| start + u64::from(i) * 32;
+        let write_placed = |i: u32, addr: u64| -> u64 {
+            let view = make_view(addr);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &tex_words, &view, slot_addr(i));
+            crate::descriptor::view_and_key(slot_addr(i)).unwrap().1
+        };
+
+        // Prime slots 0 and 1 with placed texture A (`for_draw = true` creates its host texture).
+        let key_a0 = write_placed(0, addr_a);
+        let key_a1 = write_placed(1, addr_a);
+        assert!(heap.mirror(0, slot_addr(0), true).is_some());
+        assert!(heap.mirror(1, slot_addr(1), true).is_some());
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), key_a0);
+        assert_eq!(heap.ready[1].load(Ordering::Acquire), key_a1);
+        let tex_a = crate::resource::texture_at(addr_a, &tex_words).expect("texture A");
+        let raw_a = windows::core::Interface::as_raw(
+            &crate::resource::made_copy(tex_a).expect("made A").texture,
+        ) as usize;
+        assert_eq!(heap.textures_at(&[0]), [raw_a]);
+        assert!(crate::resource::placed_made(addr_a, &tex_words));
+        assert!(!crate::resource::placed_made(addr_b, &tex_words));
+
+        // Batched sync path (`mirror_synced_batch`): rewrite slot 0 to unmade placed texture B,
+        // and write fresh empty slot 2 with unmade placed texture D.
+        let key_b = write_placed(0, addr_b);
+        let key_d = write_placed(2, addr_d);
+        heap.sync_slots_bytes_with(0..128, start, 32, start, &title_heap, true);
+        assert!(heap.made(0));
+        assert_eq!(heap.synced[0].load(Ordering::Acquire), key_b);
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), 0);
+        assert!(!heap.slot_ready(0, slot_addr(0)));
+        assert!(heap.kept(0), "slot 0 keeps prior host view instead of null");
+        assert_eq!(heap.textures_at(&[0]), [raw_a], "slot 0 still shows texture A");
+        assert!(heap.unmade_placed(0).is_some(), "make_read sees unmade kept slot");
+        assert_eq!(
+            heap.unmade_read_kind(0),
+            UnmadeRead::Background,
+            "heap_worker sees unmade kept slot"
+        );
+        assert!(!crate::resource::placed_made(addr_b, &tex_words), "B not allocated eagerly");
+        assert!(heap.made(2));
+        assert_eq!(heap.synced[2].load(Ordering::Acquire), key_d);
+        assert!(!heap.kept(2), "empty slot with no prior view stays null");
+
+        // Drawing / shader-read remakes slot 0 to texture B cleanly on demand.
+        assert!(heap.mirror(0, slot_addr(0), true).is_some());
+        let tex_b = crate::resource::texture_at(addr_b, &tex_words).expect("texture B");
+        let raw_b = windows::core::Interface::as_raw(
+            &crate::resource::made_copy(tex_b).expect("made B").texture,
+        ) as usize;
+        assert_ne!(raw_a, raw_b);
+        assert_eq!(heap.textures_at(&[0]), [raw_b], "slot 0 remade to texture B");
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), key_b);
+        assert!(heap.unmade_placed(0).is_none());
+        assert_eq!(heap.unmade_read_kind(0), UnmadeRead::None);
+
+        // Rewriting slot 0 back to already-made texture A updates immediately on sync (no null frame).
+        let key_a_again = write_placed(0, addr_a);
+        heap.sync_slots_bytes_with(0..128, start, 32, start, &title_heap, true);
+        assert_eq!(heap.textures_at(&[0]), [raw_a], "existing host texture made at once");
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), key_a_again);
+
+        // Direct `mirror(..., false)` path: rewrite slot 1 from A to unmade C -> keeps A until draw.
+        let key_c = write_placed(1, addr_c);
+        assert!(heap.mirror(1, slot_addr(1), false).is_some());
+        assert_eq!(heap.synced[1].load(Ordering::Acquire), key_c);
+        assert_eq!(heap.ready[1].load(Ordering::Acquire), 0);
+        assert_eq!(heap.textures_at(&[1]), [raw_a], "mirror(false) keeps prior view");
+        assert!(heap.mirror(1, slot_addr(1), true).is_some());
+        let tex_c = crate::resource::texture_at(addr_c, &tex_words).expect("texture C");
+        let raw_c = windows::core::Interface::as_raw(
+            &crate::resource::made_copy(tex_c).expect("made C").texture,
+        ) as usize;
+        assert_eq!(heap.textures_at(&[1]), [raw_c], "mirror(true) remakes to texture C");
+        assert_eq!(heap.ready[1].load(Ordering::Acquire), key_c);
+
+        // SAFETY: plain device health check.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
+        let _ = title_heap.as_mut_ptr();
+        let _ = mem.as_ptr();
     }
 
     #[test]
