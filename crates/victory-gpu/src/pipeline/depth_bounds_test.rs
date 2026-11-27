@@ -76,6 +76,8 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             half_views: Vec::new(),
         },
         used: Vec::new(),
+        used_written: Vec::new(),
+        write_unknown: true,
     }));
     shader
 }

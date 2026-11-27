@@ -2769,6 +2769,82 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
     });
 }
 
+/// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
+/// flushed subnormal sources and the legacy zero-factor rule.
+#[test]
+fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
+        // rounding, lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor triggers the legacy zero-factor rule with +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000];
+    run_cases(&mad, &cases, |backend, i, _, got| {
+        if backend == "warp" && i == 0 {
+            // WARP rounds the product before the add; hardware's single
+            // rounding is the reference for the fused form.
+            eprintln!("{backend}: fused rounding differs on WARP; skipped");
+            return;
+        }
+        assert_eq!(got, want[i], "{backend}: case {i}");
+    });
+}
+
+/// SDWA `dst_unused:UNUSED_SEXT` (1) with `dst_sel:WORD_0` (4) sign-extends bit 15
+/// into the upper 16 bits, and the reserved `dst_unused` encoding (3) is refused.
+#[test]
+fn sdwa_sext_sign_extends_low_16_bits_and_refuses_reserved_unused() {
+    // v_cvt_i16_f16 v0, v1 dst_sel:WORD_0 dst_unused:<unused> src0_sel:WORD_0
+    let cvt_sdwa = |dst_unused: u32| -> [u32; 2] {
+        let w0 = (0x3F << 25) | (0x053 << 9) | 0xF9;
+        let w1 = 1 | (4 << 8) | (dst_unused << 11) | (4 << 16);
+        [w0, w1]
+    };
+    // Seed v0 with non-zero upper bits to verify sext overwrites them rather
+    // than preserving or zero-padding.
+    let body = [
+        vop1(0x001, 0, vgpr(2)), // v_mov_b32 v0, v2
+        cvt_sdwa(1)[0],
+        cvt_sdwa(1)[1],
+    ];
+    let shader = build_valu_cs(&body);
+    let cases = [
+        // -1.0f16 (0xBC00) -> i16(-1) = 0xFFFF -> sext 0xFFFF_FFFF.
+        [0x0000_BC00, 0x1234_5678, 0, 0],
+        // -2048.0f16 (0xE800) -> i16(-2048) = 0xF800 -> sext 0xFFFF_F800.
+        [0x0000_E800, 0xDEAD_BEEF, 0, 0],
+        // +3.0f16 (0x4200) -> i16(3) = 0x0003 -> sext 0x0000_0003 (upper cleared).
+        [0x0000_4200, 0xFFFF_0000, 0, 0],
+        // 0.0f16 (0x0000) -> 0x0000_0000.
+        [0x0000_0000, 0xABCD_EF01, 0, 0],
+    ];
+    let want = [0xFFFF_FFFFu32, 0xFFFF_F800, 0x0000_0003, 0x0000_0000];
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        assert_eq!(got, want[i], "{backend}: case {i}");
+    });
+
+    // Reserved dst_unused = 3 must be refused.
+    let refused = try_build_valu_cs(&cvt_sdwa(3));
+    assert!(
+        matches!(
+            refused,
+            Err(crate::ShaderError::Unsupported {
+                what: "an SDWA destination of a 16-bit operation",
+                ..
+            })
+        ),
+        "{:?}",
+        refused.err()
+    );
+}
+
 /// A program that moves a typed buffer's 16-bit channels
 /// (`buffer_load_format_d16_xyzw` from the table's first view,
 /// `buffer_store_format_d16_xyzw` to its second) names both places for the

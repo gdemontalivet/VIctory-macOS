@@ -639,6 +639,16 @@ impl Tracked {
         merged
     }
 
+    /// Requeues the tracked pages returned by `take` when their copy could
+    /// not be staged. Writes since the take stay in the set too.
+    pub(crate) fn retry(&self, taken: &[(usize, usize)]) {
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &(from, to) in taken {
+            changed.extend(from / PAGE..to.div_ceil(PAGE));
+        }
+        set_dirty(self.changed.2, !changed.is_empty());
+    }
+
     /// Drains any retaken or remapped pages overlapping `[from, to)` so a host
     /// buffer copy discards cached baseline piece hashes before refreshing.
     pub(crate) fn take_retaken(&self, from: usize, to: usize) -> Runs {
