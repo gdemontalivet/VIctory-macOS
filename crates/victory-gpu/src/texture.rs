@@ -884,7 +884,6 @@ impl Staging {
                 for &(i, _) in &fresh {
                     last.states[i as usize] = TrackedSubresource::Unknown;
                 }
-                }
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
@@ -2205,18 +2204,18 @@ pub(crate) mod tests {
 
         // First refresh: slice 0 is mapped (0x42), slice 1 is unmapped (zeros).
         let fb0 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb0, "no copy_mapped fallback on unmapped slice");
         assert_eq!(bytes, page, "only mapped slice read via copy_mapped");
         let upload = upload.expect("first upload initializes both slices");
-        assert_eq!(upload.2, vec![0, 1]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x42);
         assert_eq!(staging_byte(&upload, &s, 1, 0), 0x00);
 
         // Redundant remap notification on still-unmapped slice 1: skipped completely.
         crate::watch::title_memory_remapped(mem.base + page, page);
         let fb1 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb1);
         assert_eq!(bytes, 0);
         assert!(upload.is_none(), "already-zero unmapped slice must not re-upload");
@@ -2224,27 +2223,27 @@ pub(crate) mod tests {
         // Unmap previously non-zero slice 0: must upload zeros once without fallback.
         mem.unmap(0);
         let fb2 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb2);
         assert_eq!(bytes, 0, "unmapped slice zeroed directly without copy_mapped");
         let upload = upload.expect("unmapping non-zero slice must clear host texture");
-        assert_eq!(upload.2, vec![0]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x00);
 
         // A second remap notification on now-zero slice 0 is skipped.
         crate::watch::title_memory_remapped(mem.base, page);
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(bytes, 0);
         assert!(upload.is_none());
 
         // Map slice 1 with non-zero bytes: reads and uploads slice 1 cleanly.
         mem.map(1, 0x99);
         let fb3 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb3);
         assert_eq!(bytes, page);
         let upload = upload.expect("newly mapped slice must upload");
-        assert_eq!(upload.2, vec![1]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1]);
         assert_eq!(staging_byte(&upload, &s, 1, 0), 0x99);
 
         release_staging(obj, s);
@@ -2267,11 +2266,11 @@ pub(crate) mod tests {
 
         // First refresh: page 0 mapped (0x33), page 1 unmapped (zeros).
         let fb0 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb0);
         assert_eq!(bytes, page);
         let upload = upload.expect("initial partial upload");
-        assert_eq!(upload.2, vec![0]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x33);
         assert_eq!(staging_byte(&upload, &s, 0, page), 0x00);
 
@@ -2280,23 +2279,23 @@ pub(crate) mod tests {
         // SAFETY: page 0 is mapped and writable (write fault opens guard).
         unsafe { (mem.base as *mut u8).write_bytes(0x55, page) };
         let fb1 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb1);
         assert_eq!(bytes, page);
         let upload = upload.expect("prefix write re-uploads subresource");
-        assert_eq!(upload.2, vec![0]);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, 0), 0x55);
-        assert_eq!(staging_byte(&upload, &s, 0, page), 0x00);
+        // (Page 1's rows are not detiled: the host texture keeps its zeros.)
 
-        // Map page 1 with 0x77: both pages are now read and uploaded.
+        // Map page 1 with 0x77: only the rows in page 1 are read and uploaded
+        // (page 0's rows keep what the host texture holds).
         mem.map(1, 0x77);
         let fb2 = crate::host::copy_mapped_fallbacks();
-        let (bytes, upload) = s.refresh_now();
+        let (bytes, upload) = s.refresh_now(Staging::detile);
         assert_eq!(crate::host::copy_mapped_fallbacks(), fb2);
-        assert_eq!(bytes, 2 * page);
+        assert_eq!(bytes, page);
         let upload = upload.expect("mapping tail re-uploads subresource");
-        assert_eq!(upload.2, vec![0]);
-        assert_eq!(staging_byte(&upload, &s, 0, 0), 0x55);
+        assert_eq!(upload.2.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0]);
         assert_eq!(staging_byte(&upload, &s, 0, page), 0x77);
 
         release_staging(obj, s);
