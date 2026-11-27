@@ -223,11 +223,17 @@ impl Shader {
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
-                    let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
-                        self.stage == "pixel"
-                            || (self.stage == "mesh"
-                                && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
-                    });
+                    let keep = (link_mesh_outputs()
+                        && done.0.as_ref().is_ok_and(|t| {
+                            self.stage == "pixel"
+                                || (self.stage == "mesh"
+                                    && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
+                        }))
+                        || (mesh_per_vertex_center()
+                            && self.stage == "pixel"
+                            && done.0.as_ref().is_ok_and(|t| {
+                                victory_shader::emit::needs_vertex_deltas(&t.host.dxil)
+                            }));
                     if !keep {
                         *container = Vec::new();
                     }
@@ -248,22 +254,24 @@ impl Shader {
                             kernel_ms,
                             "shader translated"
                         );
-                        // D3DMetal makes such a pipeline and marks it a no-op:
-                        // its draws are dropped without an error (#132).
+                        // D3DMetal makes such a pipeline and marks it a no-op
+                        // or hangs the queue (#132, #172).
                         use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
-                        if let Some(o) = mesh_outputs(&t.host.dxil)
-                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
-                            .filter(|_| crate::shader_cache::under_wine())
+                        if let (Some(o), Some(bytes)) =
+                            (mesh_outputs(&t.host.dxil), metal_mesh_output_bytes(&t.host.dxil))
+                            && bytes > METAL_MESH_OUTPUT_BYTES
+                            && crate::shader_cache::under_wine()
                         {
                             tracing::warn!(
                                 hash = %self.hash,
-                                bytes = o.bytes(),
+                                bytes,
+                                packed_bytes = o.bytes(),
                                 limit = METAL_MESH_OUTPUT_BYTES,
                                 vertices = o.vertices,
                                 primitives = o.primitives,
                                 vertex_components = o.vertex_components,
                                 primitive_components = o.primitive_components,
-                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                                "mesh shader outputs exceed Metal's limit; linking or refusing on host"
                             );
                         }
                     }
@@ -348,6 +356,23 @@ fn link_mesh_outputs() -> bool {
     })
 }
 
+/// Whether mesh+pixel pipelines whose pixel shader reads non-provoking vertex
+/// values (`VICTORY_P10`/`VICTORY_P20`) fall back to center interpolation
+/// (`per_vertex_center`) instead of being refused (`VICTORY_MESH_PER_VERTEX_CENTER=0`
+/// disables). Default on.
+#[cfg(windows)]
+pub(crate) fn mesh_per_vertex_center() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mesh_per_vertex_center_value(std::env::var_os("VICTORY_MESH_PER_VERTEX_CENTER").as_deref())
+    })
+}
+
+#[cfg(any(windows, test))]
+fn mesh_per_vertex_center_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
 /// Whether a mesh pipeline whose outputs are still over Metal's 32 KiB after
 /// linking is refused rather than made. On by default under Wine: on
 /// D3DMetal (3.0 and 4.0 beta 3) such a pipeline hangs the queue for good,
@@ -369,10 +394,22 @@ struct LinkedPair {
 }
 
 #[cfg(windows)]
-type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+type LinkedKey = ([u8; 32], Option<[u8; 32]>, bool);
 
 #[cfg(windows)]
 impl Shader {
+    fn container_bytes(&self) -> Vec<u8> {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        if !container.is_empty() {
+            return container.clone();
+        }
+        drop(container);
+        if let (Some(full), Some(dir)) = (self.spilled.get(), SPILL_DIR.get()) {
+            return crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+        }
+        Vec::new()
+    }
+
     fn with_translation(&self, translated: Translated) -> Arc<Shader> {
         let cell = OnceLock::new();
         let _ = cell.set(Some(translated));
@@ -391,13 +428,17 @@ impl Shader {
 /// Re-translates a mesh shader together with its paired pixel shader (if any)
 /// so arbitrary mesh outputs unread by the pixel shader are pruned under
 /// Metal's 32 KiB mesh output limit (`victory_shader::emit::METAL_MESH_OUTPUT_BYTES`).
+/// When `per_vertex_center` is set, non-provoking vertex reads in the pixel
+/// shader are lowered to center interpolation instead of requesting geometry-
+/// shader vertex deltas.
 #[cfg(windows)]
 pub(crate) fn translate_linked(
     ms: &Shader,
     ps: Option<&Shader>,
+    per_vertex_center: bool,
 ) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
     static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
-    let key = (ms.full_hash, ps.map(|p| p.full_hash));
+    let key = (ms.full_hash, ps.map(|p| p.full_hash), per_vertex_center);
     if let Some(hit) = LINKED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -408,18 +449,10 @@ pub(crate) fn translate_linked(
             .as_ref()
             .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
     }
-    let mesh_bytes = ms
-        .container
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let pixel_bytes = ps.map(|p| {
-        p.container
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
-    let options = crate::shader_cache::runtime_options();
+    let mesh_bytes = ms.container_bytes();
+    let pixel_bytes = ps.map(Shader::container_bytes);
+    let mut options = crate::shader_cache::runtime_options();
+    options.per_vertex_center = per_vertex_center;
     let result = match victory_shader::emit::translate_linked(
         &mesh_bytes,
         pixel_bytes.as_deref(),
@@ -443,6 +476,7 @@ pub(crate) fn translate_linked(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 bytes = ms_bytes,
+                per_vertex_center,
                 "mesh and pixel outputs linked"
             );
             Some(LinkedPair { mesh, pixel })
@@ -451,6 +485,7 @@ pub(crate) fn translate_linked(
             tracing::warn!(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
+                per_vertex_center,
                 error = %e,
                 "linked mesh/pixel translation failed; using standalone translation"
             );
@@ -466,6 +501,54 @@ pub(crate) fn translate_linked(
         .get_or_insert_with(HashMap::new)
         .insert(key, result);
     out
+}
+
+/// Re-translates a pixel shader with `per_vertex_center` so a mesh pipeline
+/// whose mesh stage already fits Metal's 32 KiB limit can run without
+/// geometry-shader vertex deltas.
+#[cfg(windows)]
+pub(crate) fn translate_pixel_center(ps: &Shader) -> Option<Arc<Shader>> {
+    type CenterCache = HashMap<[u8; 32], Option<Arc<Shader>>>;
+    static CENTER: Mutex<Option<CenterCache>> = Mutex::new(None);
+    if let Some(hit) = CENTER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&ps.full_hash))
+    {
+        return hit.clone();
+    }
+    let bytes = ps.container_bytes();
+    let result = if bytes.is_empty() {
+        None
+    } else {
+        let mut options = crate::shader_cache::runtime_options();
+        options.per_vertex_center = true;
+        match victory_shader::emit::translate_with(&bytes, options) {
+            Ok(host) => {
+                let used = ps.translated()?.used.clone();
+                tracing::info!(
+                    pixel = %ps.hash,
+                    "pixel shader re-translated with center-interpolated per-vertex fallback for mesh pipeline"
+                );
+                Some(ps.with_translation(Translated { host, used }))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pixel = %ps.hash,
+                    error = %e,
+                    "pixel shader center-interpolated per-vertex fallback failed"
+                );
+                None
+            }
+        }
+    };
+    CENTER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(ps.full_hash, result.clone());
+    result
 }
 
 #[repr(C)]
@@ -528,6 +611,23 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Whether a dispatch with the title pipeline is held back: it is the
@@ -1334,6 +1434,14 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn mesh_per_vertex_center_env_toggle_defaults_on() {
+        use std::ffi::OsStr;
+        assert!(mesh_per_vertex_center_value(None));
+        assert!(mesh_per_vertex_center_value(Some(OsStr::new("1"))));
+        assert!(!mesh_per_vertex_center_value(Some(OsStr::new("0"))));
     }
 }
 
