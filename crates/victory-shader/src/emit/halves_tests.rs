@@ -1653,6 +1653,7 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
                 bias_as_gradients: false,
                 host_wave32: true,
                 narrow_waves: false,
+                uav_size_level0: false,
             })
             .expect("lower")
         })
