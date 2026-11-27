@@ -61,20 +61,6 @@ pub(crate) fn pipeline(
     params: &[Param],
 ) -> Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let device = &crate::host::host().ok_or_else(Error::empty)?.device;
-    let root = root_signature(device, params)?;
-    let pso = pipeline_with_root(device, &root, source, name, flags)?;
-    Ok((root, pso))
-}
-
-/// Compiles `source`'s `main` for `cs_5_1` with `flags` against an existing
-/// `root` signature.
-pub(crate) fn pipeline_with_root(
-    device: &ID3D12Device,
-    root: &ID3D12RootSignature,
-    source: &str,
-    name: PCSTR,
-    flags: u32,
-) -> Result<ID3D12PipelineState> {
     let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
@@ -100,25 +86,25 @@ pub(crate) fn pipeline_with_root(
                     errors.GetBufferPointer().cast::<u8>(),
                     errors.GetBufferSize(),
                 );
-                let msg = String::from_utf8_lossy(text);
-                tracing::warn!("{}: {}", name.display(), msg);
-                return Err(Error::new(e.code(), msg.as_ref()));
+                tracing::warn!("{}: {}", name.display(), String::from_utf8_lossy(text));
             }
         }
         return Err(e);
     }
     let code = code.ok_or_else(Error::empty)?;
+    let root = root_signature(device, params)?;
     // SAFETY: the bytecode and the root signature live through the call.
-    unsafe {
+    let pso = unsafe {
         device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(root),
+            pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: code.GetBufferPointer(),
                 BytecodeLength: code.GetBufferSize(),
             },
             ..Default::default()
         })
-    }
+    }?;
+    Ok((root, pso))
 }
 
 pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<ID3D12RootSignature> {

@@ -22,6 +22,8 @@ use std::mem::offset_of;
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use victory_shader::emit::{metal_mesh_output_bytes, over_limit_mesh_output_bytes};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -74,12 +76,6 @@ pub(crate) struct Shader {
     /// (`VICTORY_SPILL_SHADERS`, [`spill`]).
     #[cfg(windows)]
     spilled: OnceLock<[u8; 32]>,
-    /// Its part in the stand-in for the indirect light (`crate::ambient`).
-    #[cfg(windows)]
-    pub(crate) ambient: Option<crate::ambient::Role>,
-    /// Ray-tracing pass skipped when the BVH builder does not run (`make`).
-    #[cfg(windows)]
-    pub(crate) without_bvh: Option<make::WithoutBvh>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -104,6 +100,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             .entry(*full.as_bytes())
             .or_insert_with(|| {
                 created = true;
+                // The programs the ambient stand-in follows are known by name
+                // (`crate::ambient`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ambient::note_program(&full.to_hex()[..16], bytes);
+                // So are the ray passes `VICTORY_RAY_SKIP` leaves out
+                // (`crate::ray_skip`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -182,14 +186,6 @@ impl Shader {
             #[cfg(windows)]
             spilled: OnceLock::new(),
             #[cfg(windows)]
-            ambient: (stage == "compute")
-                .then(|| crate::ambient::role(bytes))
-                .flatten(),
-            #[cfg(windows)]
-            without_bvh: (stage == "compute")
-                .then(|| make::without_bvh(bytes))
-                .flatten(),
-            #[cfg(windows)]
             translated: OnceLock::new(),
         }
     }
@@ -230,10 +226,7 @@ impl Shader {
                     let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
                         self.stage == "pixel"
                             || (self.stage == "mesh"
-                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
+                                && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
                     });
                     if !keep {
                         *container = Vec::new();
@@ -296,10 +289,7 @@ impl Shader {
 fn thread_cpu() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    }; 4];
+    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
     let [created, exited, kernel, user] = &mut t;
     // SAFETY: four times of our own thread into our own variables.
     unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
@@ -320,10 +310,7 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(container);
-    (
-        host.and_then(|host| with_resources(container, host)),
-        cached,
-    )
+    (host.and_then(|host| with_resources(container, host)), cached)
 }
 
 #[cfg(windows)]
@@ -396,8 +383,6 @@ impl Shader {
             size: self.size,
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
-            ambient: self.ambient,
-            without_bvh: self.without_bvh,
             translated: cell,
         })
     }
@@ -441,7 +426,7 @@ pub(crate) fn translate_linked(
         options,
     ) {
         Ok((ms_host, ps_host)) => {
-            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let ms_bytes = metal_mesh_output_bytes(&ms_host.dxil);
             let ms_used = ms.translated()?.used.clone();
             let mesh = ms.with_translation(Translated {
                 host: ms_host,
@@ -458,7 +443,7 @@ pub(crate) fn translate_linked(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 bytes = ms_bytes,
-                "mesh and pixel linked under 32 KiB output budget"
+                "mesh and pixel outputs linked"
             );
             Some(LinkedPair { mesh, pixel })
         }
@@ -499,6 +484,14 @@ struct Pipeline {
     /// ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// What its programs are to the ambient stand-in ([`crate::ambient`]):
+    /// bits, 0 for nothing (always while the stand-in is off).
+    #[cfg(windows)]
+    ambient: u8,
+    /// Which ray pass `VICTORY_RAY_SKIP` leaves out it is
+    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off).
+    #[cfg(windows)]
+    ray_pass: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -537,23 +530,6 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// As [`host_pipeline`], for a draw into render target and depth views of
-/// the formats `bound`.
-#[cfg(windows)]
-pub(crate) fn host_pipeline_for<'a>(
-    this: This,
-    bound: &host::TargetFormats,
-) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
-        return None;
-    }
-    let p = &pipeline(this).host;
-    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
-        return make::for_formats(p, bound);
-    }
-    make::ready(p)
-}
-
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).
@@ -562,10 +538,29 @@ pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
 }
 
-/// Whether the title's acceleration-structure builder runs this frame.
+/// Whether a dispatch with the title pipeline is left out: it is one of
+/// the ray passes `VICTORY_RAY_SKIP` names (`crate::ray_skip`), and the
+/// acceleration-structure builder does not run this frame
+/// ([`builder::runs`]), so there is nothing to trace against. Counted
+/// there when it is.
 #[cfg(windows)]
-pub(crate) fn builder_runs() -> bool {
-    builder::runs()
+pub(crate) fn ray_pass_left_out(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let kind = pipeline(this).ray_pass;
+    if kind == 0 || builder::runs() {
+        return false;
+    }
+    crate::ray_skip::left_out(kind);
+    true
+}
+
+/// What the title pipeline's programs are to the ambient stand-in
+/// ([`crate::ambient`]): bits, 0 for nothing.
+#[cfg(windows)]
+pub(crate) fn ambient_role(this: This) -> u8 {
+    if this.is_null() { 0 } else { pipeline(this).ambient }
 }
 
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
@@ -574,9 +569,6 @@ pub(crate) fn builder_runs() -> bool {
 pub fn note_title_dll(file: &str, base: usize, size: usize) {
     builder::note_title_dll(file, base, size);
 }
-
-#[cfg(not(windows))]
-pub fn note_title_dll(_file: &str, _base: usize, _size: usize) {}
 
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
@@ -723,6 +715,15 @@ fn hand_out(
     if builder {
         builder::note(&host);
     }
+    #[cfg(windows)]
+    let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
+    // Never a program the stand-in works after (it would not run).
+    #[cfg(windows)]
+    let ray_pass = if ambient == 0 {
+        crate::ray_skip::kind(shaders.iter().map(|s| s.hash.as_str()))
+    } else {
+        0
+    };
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -730,6 +731,10 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        ambient,
+        #[cfg(windows)]
+        ray_pass,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -892,13 +897,7 @@ fn read_stream(
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8, which the
             // slice does not promise to be aligned.
-            let code = unsafe {
-                stream
-                    .as_ptr()
-                    .add(at + 8)
-                    .cast::<Bytecode>()
-                    .read_unaligned()
-            };
+            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
             shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
@@ -936,6 +935,9 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+// Also built for tests, which run where `host` cannot.
+#[cfg(any(windows, test))]
+mod schedule;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 
@@ -1008,11 +1010,7 @@ impl Prebuild {
 
     /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self
-            .graphics
-            .as_ref()
-            .map(|g| g.describe())
-            .unwrap_or_default();
+        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -1025,7 +1023,7 @@ impl Prebuild {
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
         let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            host::HostPipeline::new(&self.shaders, self.graphics.as_deref(), |_, _| {})
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
@@ -1037,12 +1035,10 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(
-                match self.shaders.iter().find(|s| s.translated().is_none()) {
-                    Some(s) => format!("{} shader does not translate", s.stage),
-                    None => "the host refuses it".into(),
-                },
-            ),
+            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
+                Some(s) => format!("{} shader does not translate", s.stage),
+                None => "the host refuses it".into(),
+            }),
         }
     }
 }
@@ -1088,16 +1084,14 @@ mod tests {
     fn a_stream_of_any_alignment_is_read() {
         let mut backing = [0u64; 5];
         // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
-        let stream =
-            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
         stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
         stream[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
         stream[16..24].copy_from_slice(&7usize.to_le_bytes());
         assert_ne!(stream.as_ptr() as usize % 8, 0);
         let seen = std::cell::RefCell::new(Vec::new());
         read_stream(stream, |stage, code| {
-            seen.borrow_mut()
-                .push((stage, code.code as usize, code.size));
+            seen.borrow_mut().push((stage, code.code as usize, code.size));
             None
         });
         assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
@@ -1115,10 +1109,7 @@ mod tests {
         spill_to(dir.path(), &s, &full);
         assert!(s.container.lock().unwrap().is_empty(), "left memory");
         assert_eq!(s.spilled.get(), Some(&full));
-        assert_eq!(
-            crate::read_file(&spill_path(dir.path(), &full)).unwrap(),
-            bytes
-        );
+        assert_eq!(crate::read_file(&spill_path(dir.path(), &full)).unwrap(), bytes);
         let again = Shader::new("pixel", &bytes);
         spill_to(dir.path(), &again, &full);
         assert!(again.container.lock().unwrap().is_empty() && again.spilled.get() == Some(&full));
@@ -1130,6 +1121,58 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.lock().unwrap().clone()))
             .collect()
+    }
+
+    /// A compute pipeline the acceleration-structure builder creates (its
+    /// bytecode in the builder's image) is known as the builder's, and its
+    /// dispatches are held back while its host pipeline is not made: here
+    /// never, as its bytes are no shader container. Pipelines of other
+    /// code are never held back.
+    #[cfg(windows)]
+    #[test]
+    fn builder_dispatches_wait_for_every_builder_pipeline() {
+        let _one = builder::test_lock();
+        let code = [0xB0u8; 64];
+        let create = |code: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: code.as_ptr(),
+                    size: code.len(),
+                },
+            };
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
+        let p = create(&code);
+        let other_code = [0xC0u8; 64];
+        let other = create(&other_code);
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        assert!(
+            pipeline(p).builder,
+            "its bytecode is in the builder's image"
+        );
+        assert!(!pipeline(other).builder);
+        // Its host pipeline is started at once and refused.
+        let refused = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(refused, "the builder's pipeline was started");
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
+        assert!(
+            held_back(p),
+            "one builder pipeline missing: the builder waits"
+        );
+        assert!(!held_back(other));
+        for q in [p, other] {
+            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        }
     }
 
     #[test]
@@ -1252,16 +1295,10 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put =
-            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
-        let kinds = [
-            (0x10, 1),
-            (0x28, 2),
-            (0x40, 3),
-            (0x58, 4),
-            (0x70, 5),
-            (0x88, 8),
-        ];
+        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
+            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
+        };
+        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }
@@ -1285,10 +1322,7 @@ mod tests {
             stream: stream.as_ptr(),
         };
         let mut p = std::ptr::null();
-        assert_eq!(
-            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-            S_OK
-        );
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);

@@ -77,10 +77,7 @@ pub fn run(
     }
     // Rosetta cannot resume these when they fault partway (#14, #50).
     let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
-    println!(
-        "masked stores  {}",
-        victory_loader::masked::summary(&masked)
-    );
+    println!("masked stores  {}", victory_loader::masked::summary(&masked));
     // Under Rosetta, tracking is off unless asked for, and the stores it
     // cannot resume are patched when it is on (`victory_gpu::fault_tracking`).
     println!(
@@ -105,8 +102,7 @@ pub fn run(
         && requested.is_none()
         && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
     {
-        requested =
-            Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
+        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
     }
     let patching = victory_loader::masked::choice(requested, needs_patch);
     let original = patching.is_some().then_some(original);
@@ -161,8 +157,9 @@ pub fn run(
         }
     }
     // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
-    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
-    // off without it), ported from avatarmanz/VIctory-7900XTX.
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; the output size 1280x720
+    // on a Mac without the first, the other two off without theirs),
+    // ported from avatarmanz/VIctory-7900XTX.
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
