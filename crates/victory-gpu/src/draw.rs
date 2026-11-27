@@ -66,6 +66,10 @@ pub(crate) struct State {
     depth: usize,
     /// Last render target and depth keys set on the host list.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -261,6 +265,17 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -438,6 +453,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         let mut rtv_views = Vec::with_capacity(handles.len());
         let mut rtv_keys = Vec::with_capacity(handles.len());
         for &h in handles {
@@ -454,8 +471,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            let desc = record.desc();
+            if rtv_views.len() < 8 {
+                formats[rtv_views.len()] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
+            }
             rtv_keys.push((texture.as_raw() as usize, record.key()));
-            rtv_views.push((texture, record.desc()));
+            rtv_views.push((texture, desc));
         }
         if self
             .hdr_rtvs
@@ -471,11 +492,14 @@ impl State {
             && let Some(texture) = crate::resource::host_resource(record.resource)
         {
             self.depth = record.resource as usize;
+            let desc = record.depth_desc();
+            formats[8] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             dsv_key = Some((texture.as_raw() as usize, record.key()));
-            dsv_view = Some((texture, record.depth_desc()));
+            dsv_view = Some((texture, desc));
         }
+        self.target_formats = formats;
         if bind_cache_enabled()
             && self
                 .host_targets
@@ -585,7 +609,8 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1947,7 +1972,8 @@ impl State {
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -2332,10 +2358,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
-            if let Some(a) = crate::resource::alias_source(*resource as This) {
-                crate::texture::alias_copy(list, a.get(), *resource as This);
-            }
-            if let Some(t) = crate::resource::host_copy(*resource as This)
+            let copied = crate::resource::alias_source(*resource as This)
+                .is_some_and(|a| crate::texture::alias_copy(list, a.get(), *resource as This));
+            if !copied
+                && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.title_written()
             {
                 crate::texture::upload(list, *resource as This, &t.texture);
@@ -3952,6 +3978,123 @@ void main() { dst.Store4(0, asuint(src[0])); }
         );
         if let Some(memory) = memory {
             crate::watch::tests::free(memory);
+        }
+    }
+
+    /// A table slot the title wrote once (as it writes its materials' tables
+    /// at load) keeps its view, a constant buffer view or a placed view,
+    /// however many views without a resource object the title makes after it
+    /// (the world makes ~5,000 more a second). A view table that freed the
+    /// oldest of them past a cap left such a slot null: shaders read zeros
+    /// and the world drew black once the cap was reached (#414, ~284 s in).
+    /// #414's cap failed this with `VICTORY_OWNERLESS_VIEWS=64`.
+    #[test]
+    fn a_slot_written_once_keeps_its_view_past_newer_ownerless_views() {
+        slot_keeps_its_view_past(4096, 0x7ff0_0000_0000);
+    }
+
+    /// The same past #414's default cap (2^20), which it failed.
+    #[test]
+    #[ignore = "makes 2^20 views (~10 s under Wine, ~300 MB kept for the run): run by name"]
+    fn a_slot_written_once_keeps_its_view_past_two_to_the_twenty_ownerless_views() {
+        slot_keeps_its_view_past((1 << 20) + 64, 0x7e00_0000_0000);
+    }
+
+    /// Writes a constant buffer view and a placed buffer view of the same
+    /// title buffer once, each into a table of its own, reads both through
+    /// a dispatch, makes `newer` constant buffer views of other memory from
+    /// address `base` on, and reads both again.
+    fn slot_keeps_its_view_past(newer: u64, base: u64) {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let (a, out) = (buffer(256), buffer(256));
+        let (a_bytes, _) = crate::resource::buffer_bytes(a).unwrap();
+        let (out_bytes, _) = crate::resource::buffer_bytes(out).unwrap();
+        let (a_bytes, out_bytes) = (a_bytes as u64, out_bytes as u64);
+        let out_copy = crate::shadow::find(out_bytes, 256).expect("the output's host copy");
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        // A raw shader view of `a` placed by address: R32_TYPELESS, buffer,
+        // the default mapping, 64 elements, raw; then the address.
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&[39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]);
+        (placed[10], placed[11]) = (a_bytes as u32, (a_bytes >> 32) as u32);
+        let buffer_desc: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let (root, pso) = compile();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        // A shader-visible view heap of 4 slots (no memory of its own) for
+        // each view: the view in slot 0, the output in slot 1.
+        let heaps = [false, true].map(|placed_view| {
+            let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+                S_OK
+            );
+            let start = crate::descriptor::heap(heap).start;
+            if placed_view {
+                crate::descriptor::create_placed_srv(null, &buffer_desc, &placed, start);
+            } else {
+                let desc = [a_bytes as u32, (a_bytes >> 32) as u32, 256, 0];
+                crate::descriptor::create_cbv(null, &desc, start);
+            }
+            crate::descriptor::create_uav(null, out, null, &raw, start + 32);
+            heap
+        });
+        let read = |heap: This, value: u32| {
+            let title_heap = crate::descriptor::heap(heap);
+            let host_heap = title_heap.host().expect("a host view heap");
+            // SAFETY: inside the title buffer.
+            unsafe { (a_bytes as *mut u32).write(value) };
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 0, title_heap.start);
+            assert!(
+                state
+                    .tables(&list, &[used(ResourceType::Srv)], &[], true)
+                    .is_empty(),
+                "an in-place table"
+            );
+            // SAFETY: an open list and live objects of ours.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, host_heap.gpu(0));
+                list.list.SetComputeRootDescriptorTable(1, host_heap.gpu(1));
+                list.list
+                    .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            out_copy.read_host(out_bytes, 1)[0]
+        };
+        // The constant buffer view's table, then the placed view's.
+        let before = heaps.map(|heap| read(heap, 0x1111_1111));
+        assert_eq!(before, [0x1111_1111; 2], "before");
+        // Views of other memory, written elsewhere.
+        let mut record = [0u32; 8];
+        for k in 0..newer {
+            let address = base + 256 * k;
+            let desc = [address as u32, (address >> 32) as u32, 256, 0];
+            crate::descriptor::create_cbv(null, &desc, record.as_mut_ptr() as u64);
+        }
+        let after = heaps.map(|heap| read(heap, 0x2222_2222));
+        assert_eq!(after, [0x2222_2222; 2], "after {newer} newer views");
+        for heap in heaps {
+            assert_eq!(
+                crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap),
+                0
+            );
         }
     }
 
