@@ -3230,7 +3230,12 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        let texture_backs = {
+            let mut deferred = self.deferred();
+            let backs = std::mem::take(&mut deferred.texture_backs);
+            *deferred = Deferred::default();
+            backs
+        };
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3259,6 +3264,11 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+        // Recycle readback buffers only once the command allocator and list
+        // have reset cleanly so no live command list still references them.
+        for back in texture_backs {
+            back.recycle();
         }
         self.changed_deferred();
     }
@@ -3441,6 +3451,15 @@ impl HostList {
             .texture_backs
             .iter()
             .map(crate::texback::Back::range)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_back_raw_ptrs_for_test(&self) -> Vec<usize> {
+        self.deferred()
+            .texture_backs
+            .iter()
+            .map(crate::texback::Back::raw_resource_ptr)
             .collect()
     }
 
