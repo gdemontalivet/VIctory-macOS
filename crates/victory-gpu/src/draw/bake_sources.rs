@@ -823,7 +823,17 @@ mod tests {
         gfx.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         gfx.targets.NumRenderTargets = 1;
         gfx.targets.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        let pipeline = HostPipeline::new(&[vs, ps], Some(&gfx), |_, _| {}).expect("host bake pipeline");
+        let refusal = std::cell::Cell::new(None);
+        let Some(pipeline) = HostPipeline::new(&[vs, ps], Some(&gfx), |reason, code| {
+            refusal.set(Some((reason, code)));
+        }) else {
+            let (reason, code) = refusal.get().unwrap_or(("unknown", None));
+            eprintln!("host bake pipeline refused: {reason} ({code:?})");
+            // A refusal that carries a driver error code means this host GPU
+            // cannot build the pipeline (the CI runner's software adapter).
+            assert!(code.is_some(), "host bake pipeline: {reason}");
+            return;
+        };
 
         // 3. Create shader-visible title descriptor heap with 16 slots.
         let desc = [0u32, 16, 1, 0];
