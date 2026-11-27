@@ -179,6 +179,7 @@ fn shader(l: lower::Lowered) -> super::HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     }
 }
 
@@ -321,12 +322,23 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            in_a_loop(&[0xD760_000C, 0x0001_5100], 12),
+            in_a_loop(&[0xD760_000C, 0x0001_5100], 12, Count::Two),
             &[
                 "v_readlane_b32 s12, v0, 40",
                 "s_add_u32 s20, s20, 1",
+                "s_cmp_lt_u32 s20, 2",
                 "s_cbranch_scc1",
                 "v_mov_b32 v1, s12",
+            ],
+        ),
+        (
+            in_a_loop(&[0x7D88_00A8, 0xBE8C_106A], 12, Count::FirstLane),
+            &[
+                "v_readfirstlane_b32 s21, v0",
+                "v_cmp_gt_u32 vcc, 40, v0",
+                "s_bcnt1_i32_b64 s12, vcc",
+                "s_cmp_lt_u32 s20, s21",
+                "s_cbranch_scc1",
             ],
         ),
     ];
@@ -418,7 +430,7 @@ fn console_lanes_below(limit: u32, threads: u32, l: u32) -> [u32; 3] {
 
 /// The lanes below 40, as in [`lanes_below`], counted in a scalar loop
 /// that runs twice: the mask is written in a block each lane runs more than
-/// once.
+/// once, as often as every other lane of the group.
 fn lanes_below_in_a_loop() -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
@@ -457,9 +469,20 @@ fn lane_reads(k: u32, s: u32) -> Vec<u32> {
     w
 }
 
-/// `body`, run twice by a scalar loop (so each lane runs its block more
-/// than once), then the scalar `s<result>` stored by every lane.
-fn in_a_loop(body: &[u32], result: u32) -> Vec<u32> {
+/// How many passes [`in_a_loop`] makes.
+#[derive(Clone, Copy)]
+enum Count {
+    /// Two: a count every host wave computes alike.
+    Two,
+    /// Up to the thread id of the host wave's first lane
+    /// (`v_readfirstlane_b32`), at least one: a count the host waves need
+    /// not share.
+    FirstLane,
+}
+
+/// `body` in a scalar loop (so each lane runs its block more than once),
+/// then the scalar `s<result>` stored by every lane.
+fn in_a_loop(body: &[u32], result: u32, count: Count) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -467,11 +490,18 @@ fn in_a_loop(body: &[u32], result: u32) -> Vec<u32> {
         0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
         0xBE94_0380, // s_mov_b32 s20, 0
     ]);
+    let compare = match count {
+        Count::Two => 0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+        Count::FirstLane => {
+            w.push(0x7E2A_0500); // v_readfirstlane_b32 s21, v0
+            0xBF0A_1514 // s_cmp_lt_u32 s20, s21
+        }
+    };
     w.extend(body);
     let back = -(body.len() as i32 + 3);
     w.extend([
         0x8014_8114,                          // s_add_u32 s20, s20, 1
-        0xBF0A_8214,                          // s_cmp_lt_u32 s20, 2
+        compare,                              // s_cmp_lt_u32 s20, <count>
         0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1 (back to the body)
         0x7E02_0200 | result,                 // v_mov_b32 v1, s<result>
     ]);
@@ -520,6 +550,49 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
         0x0001_0101, // v_readlane_b32 s15, v1, 0
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
         0x7E02_020F, // v_mov_b32 v1, s15
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The console's low-half f16 whole-wave64 sum of `v0`: DPP within rows,
+/// `v_permlanex16` across rows, then lanes 31 and 63 (each 32-lane half's
+/// sum) read and added. Its high half is kept from lane 31, as the
+/// compiler's `v_add_f16` lowering does.
+fn half_reduction() -> Vec<u32> {
+    let vop2 = |src0: u16| (0x32u32 << 25) | (1 << 17) | (1 << 9) | u32::from(src0);
+    let dpp16 = |ctrl: u16| (0xFu32 << 28) | (0xFu32 << 24) | (u32::from(ctrl) << 8) | 1;
+    let vop3 = |dst: u8, op: u16, src0: u16, src1: u16, src2: u16| {
+        [
+            0xD400_0000 | u32::from(op) << 16 | u32::from(dst),
+            u32::from(src0) | u32::from(src1) << 9 | u32::from(src2) << 18,
+        ]
+    };
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_0680, // v_cndmask_b32 v1, 0, v3, s[12:13]
+        vop2(128),   // v_add_f16 v1, 0, v1
+    ]);
+    for ctrl in [0x00B1, 0x004E, 0x0164, 0x0168] {
+        w.push(vop2(0x00FA));
+        w.push(dpp16(ctrl));
+    }
+    w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+    w.push(vop2(258)); // v_add_f16 v1, v2, v1
+    // Lane 31 holds the sum of lanes 0-31, lane 63 that of lanes 32-63.
+    w.extend(vop3(1, 0x360, 257, 159, 0)); // v_readlane_b32 s1, v1, 31
+    w.extend(vop3(2, 0x360, 257, 191, 0)); // v_readlane_b32 s2, v1, 63
+    w.push(0x7E06_0202); // v_mov_b32 v3, s2
+    w.push((0x32 << 25) | (1 << 17) | (3 << 9) | 1); // v_add_f16 v1, s1, v3
+    w.extend(vop3(1, 0x360, 257, 159, 0)); // v_readlane_b32 s1, v1, 31
+    w.extend([
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E02_0201, // v_mov_b32 v1, s1
     ]);
     w.extend(store(1, 0));
     w.push(S_ENDPGM);
@@ -607,8 +680,9 @@ fn exclusive_prefix() -> Vec<u32> {
 
 /// A lane mask read as data in a group of 33 to 64 lanes or more holds
 /// lanes of both host waves: they pass their halves to each other where
-/// each lane of the group runs the block writing it once, and it is refused
-/// in a block that runs more than once. In a group of 32 or fewer, one host
+/// every lane of the group runs the block writing it together (once, or in
+/// a loop on a count every host wave computes alike), and it is refused in
+/// a loop counted to a lane's value. In a group of 32 or fewer, one host
 /// wave holds the whole mask.
 #[test]
 fn lane_masks_read_as_data_pass_between_halves() {
@@ -616,12 +690,15 @@ fn lane_masks_read_as_data_pass_between_halves() {
     assert_eq!(refusal(&first_active_lane(), 64, 0), "translated");
     for threads in [64, 96, 128] {
         assert_eq!(refusal(&lanes_below(40), threads, 0), "translated");
+        assert_eq!(refusal(&lanes_below_in_a_loop(), threads, 0), "translated");
     }
-    let why = refusal(&lanes_below_in_a_loop(), 64, 0);
+    // v_cmp_gt_u32 vcc, 40, v0; s_bcnt1_i32_b64 s12, vcc
+    let counted = in_a_loop(&[0x7D88_00A8, 0xBE8C_106A], 12, Count::FirstLane);
+    let why = refusal(&counted, 64, 0);
     assert!(why.contains("a lane mask read as data (wave64 on a 32-lane host)"), "{why}");
-    assert_eq!(refusal(&lanes_below_in_a_loop(), 32, 0), "translated");
+    assert_eq!(refusal(&counted, 32, 0), "translated");
     // For 64-lane hosts it is read in one wave, as before.
-    assert!(lowered(&native(&lanes_below_in_a_loop(), true, 64, 0), false).is_ok());
+    assert!(lowered(&native(&counted, true, 64, 0), false).is_ok());
 
     let halves = lowered(&native(&lanes_below(40), true, 64, 0), true).expect("halves");
     assert_eq!(halves.wave_size, Some(32));
@@ -644,11 +721,19 @@ fn lane_masks_passed_between_halves_match_the_console_on_every_gpu() {
             .collect();
         failed.extend(differences(&lanes_below(limit), threads, 3, &want));
     }
+    // Counted in a loop: the count of lanes below 40, each pass.
+    for threads in [64, 96, 128] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| console_lanes_below(40, threads, l)[0])
+            .collect();
+        failed.extend(differences(&lanes_below_in_a_loop(), threads, 1, &want));
+    }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// Whole-wave reductions and prefix sums pass between the halves where
-/// every lane of the group runs them once; in a group of 32 or fewer, one
+/// every lane of the group runs them together (once, or in a loop on a
+/// count every host wave computes alike); in a group of 32 or fewer, one
 /// host wave holds the whole console wave.
 #[test]
 fn reductions_and_prefixes_pass_between_halves() {
@@ -657,7 +742,11 @@ fn reductions_and_prefixes_pass_between_halves() {
         assert_eq!(refusal(&sum, threads, 0), "translated");
         assert_eq!(refusal(&exclusive_prefix(), threads, 0), "translated");
     }
-    let looped = in_a_loop(&sum[PROLOGUE.len() + 1..sum.len() - 3], 15);
+    let body = &sum[PROLOGUE.len() + 1..sum.len() - 3];
+    for threads in [64, 96, 128] {
+        assert_eq!(refusal(&in_a_loop(body, 15, Count::Two), threads, 0), "translated");
+    }
+    let looped = in_a_loop(body, 15, Count::FirstLane);
     let why = refusal(&looped, 64, 0);
     assert!(
         why.contains("a wave reduction over both 32-lane halves"),
@@ -675,6 +764,23 @@ fn reductions_and_prefixes_pass_between_halves() {
                 .expect("DXIL validation failed");
         }
     }
+
+    let half_sum = half_reduction();
+    let p = ir::build(&native(&half_sum, true, 96, 0).code, true, 32).expect("f16 IR");
+    assert!(
+        super::wave::sections(&p, 0).values().any(|section| {
+            section
+                .shapes
+                .values()
+                .any(|shape| matches!(shape, super::wave::Shape::Half(..)))
+        }),
+        "f16 reduction fixture was not recognized"
+    );
+    for threads in [32, 64, 96, 128] {
+        assert_eq!(refusal(&half_sum, threads, 0), "translated");
+    }
+    let halves = lowered(&native(&half_sum, true, 96, 0), true).expect("f16 halves");
+    assert_eq!(halves.wave_size, Some(32));
 }
 
 /// [`reduction`]s and [`exclusive_prefix`] on every hardware adapter give
@@ -724,13 +830,40 @@ fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
             .collect();
         failed.extend(differences(&exclusive_prefix(), threads, 1, &want));
     }
+    // The sum in a loop: the same each pass.
+    let sum = reduction(V_ADD_F32, 0x80, 0x7E06_0D00);
+    let looped = in_a_loop(&sum[PROLOGUE.len() + 1..sum.len() - 3], 15, Count::Two);
+    for threads in [64, 96, 128] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| (console_reduction(threads, l, |a, b| a + b, |t| t) as f32).to_bits())
+            .collect();
+        failed.extend(differences(&looped, threads, 1, &want));
+    }
+    // Each input lane is a positive f16 subnormal whose bit pattern is its
+    // lane number. These sums are exactly representable, so per-step f16
+    // arithmetic and the translator's f32 accumulation round to the same
+    // result. The 96-thread case also checks a missing upper half.
+    let half_sum = half_reduction();
+    for threads in [32, 64, 96, 128] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| match (threads, l & !63) {
+                (32, _) => 0x01F0,
+                (_, 0) => 0x07E0,
+                (96, 64) => 0x08F8,
+                (128, 64) => 0x0DF8,
+                _ => unreachable!(),
+            })
+            .collect();
+        failed.extend(differences(&half_sum, threads, 1, &want));
+    }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// Lane reads and first-lane reads that may be in the other half pass
-/// between the halves where every lane of the group runs them once, and are
-/// refused with a reason naming the host's waves in a block that runs more
-/// than once; the same programs translate for 64-lane hosts.
+/// between the halves where every lane of the group runs them together
+/// (once, or in a loop on a count every host wave computes alike), and are
+/// refused with a reason naming the host's waves in a loop counted to a
+/// lane's value; the same programs translate for 64-lane hosts.
 #[test]
 fn lane_reads_pass_between_halves() {
     for threads in [32, 64, 96, 128] {
@@ -745,7 +878,16 @@ fn lane_reads_pass_between_halves() {
         "translated"
     );
 
-    let readlane = in_a_loop(&[0xD760_000C, 0x0001_5100], 12); // v_readlane_b32 s12, v0, 40
+    let readlane = [0xD760_000C, 0x0001_5100]; // v_readlane_b32 s12, v0, 40
+    let first = [0x7E18_0500]; // v_readfirstlane_b32 s12, v0
+    for threads in [64, 96, 128] {
+        for body in [&readlane[..], &first] {
+            let words = in_a_loop(body, 12, Count::Two);
+            assert_eq!(refusal(&words, threads, 0), "translated");
+        }
+    }
+
+    let readlane = in_a_loop(&readlane, 12, Count::FirstLane);
     let why = refusal(&readlane, 64, 0);
     assert!(
         why.contains("a lane read that may cross 32-lane halves (wave64 on a 32-lane host)"),
@@ -754,7 +896,7 @@ fn lane_reads_pass_between_halves() {
     assert_eq!(refusal(&readlane, 32, 0), "translated");
     assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
 
-    let first = in_a_loop(&[0x7E18_0500], 12); // v_readfirstlane_b32 s12, v0
+    let first = in_a_loop(&first, 12, Count::FirstLane);
     let why = refusal(&first, 64, 0);
     assert!(
         why.contains("a first-lane read of a value that may differ between 32-lane halves"),
@@ -777,8 +919,11 @@ fn lane_reads_pass_between_halves() {
     ]
     .concat();
     assert_eq!(refusal(&first_alone, 64, 0), "translated");
-    // Nor does a value the same in every lane: a buffer dword loaded at an
-    // offset the same in every lane, through a scalar descriptor.
+    // A buffer dword loaded at an offset the same in every lane, through a
+    // scalar descriptor, with a store present (`store(5, 0)` below): not
+    // proven the same in every lane, so the first-lane read passes the
+    // value between the halves in the entry block, where every lane of the
+    // group runs it together.
     assert_eq!(
         refusal(&first_lane_of_a_buffer_load(3), 64, 0),
         "translated"
@@ -822,6 +967,15 @@ fn lane_reads_across_halves_match_the_console_on_every_gpu() {
             1,
             &want,
         ));
+        // In a loop, the same each pass.
+        let first = in_a_loop(&[0x7E18_0500], 12, Count::Two); // v_readfirstlane_b32 s12, v0
+        failed.extend(differences(&first, threads, 1, &want));
+    }
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads).map(|l| (l & !63) + 40).collect();
+        // v_readlane_b32 s12, v0, 40
+        let readlane = in_a_loop(&[0xD760_000C, 0x0001_5100], 12, Count::Two);
+        failed.extend(differences(&readlane, threads, 1, &want));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
@@ -1168,6 +1322,114 @@ fn lds_of_a_one_wave64_group_synced_by_barriers_runs_in_halves() {
 fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..64u32).map(|l| (l ^ 32).min(32)).collect();
     let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Per thread `l` of a one-wave group of 64: four passes of a loop on a
+/// scalar count, each writing the lane's sum to LDS and adding the sum of
+/// the lane 32 away, in the other half (`v_mbcnt` asks for the console's
+/// lanes). The console's lockstep orders the accesses; split, each pass
+/// needs a barrier before its read, and one before its write, which the
+/// other half's read of the last pass must not miss.
+fn lds_in_a_loop() -> Vec<u32> {
+    let body = [
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+        0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+    ];
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0005,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0xBE94_0380, // s_mov_b32 s20, 0
+    ]);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([
+        0x8014_8114,                          // s_add_u32 s20, s20, 1
+        0xBF0A_8414,                          // s_cmp_lt_u32 s20, 4
+        0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1 (back to the write)
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`lds_in_a_loop`]: each pass, a lane's sum and
+/// that of the lane 32 away both become their total.
+fn console_lds_in_a_loop() -> Vec<u32> {
+    let mut sum: Vec<u32> = (0..64).collect();
+    for _ in 0..4 {
+        sum = (0..64).map(|l| sum[l] + sum[l ^ 32]).collect();
+    }
+    sum
+}
+
+#[test]
+fn the_lds_loop_is_what_its_comments_say() {
+    let code: Vec<u8> = lds_in_a_loop()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_mbcnt_lo_u32_b32 v5, -1, 0",
+        "v_xor_b32 v4, 32, v0",
+        "v_mov_b32 v1, v0",
+        "s_mov_b32 s20, 0",
+        "ds_write_b32 v2, v1",
+        "ds_read_b32 v3, v4",
+        "v_add_nc_u32 v1, v1, v3",
+        "s_add_u32 s20, s20, 1",
+        "s_cmp_lt_u32 s20, 4",
+        "s_cbranch_scc1",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// With narrow host waves (D3DMetal), LDS a one-wave group shares in a loop
+/// on a scalar count gets its barriers inside the loop and runs in halves;
+/// without them it is refused, as before.
+#[test]
+fn lds_of_a_one_wave64_group_in_a_loop_runs_in_halves() {
+    let n = native(&lds_in_a_loop(), true, 64, 256);
+    let synced = lowered_with(&n, true, true).expect("synced, in halves");
+    assert_eq!(synced.wave_size, Some(32));
+    assert_eq!(synced.split_barriers, 2);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut synced.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let why = lowered_with(&n, true, false)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        why.contains("LDS one console wave64 shares without barriers"),
+        "{why}"
+    );
+}
+
+/// The loop on every hardware adapter, in halves: every pass gives the
+/// console's sums.
+#[test]
+fn lds_in_a_loop_in_halves_matches_the_console_on_every_gpu() {
+    let failed = differences_with(&lds_in_a_loop(), 64, 1, &console_lds_in_a_loop(), 256, true);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 

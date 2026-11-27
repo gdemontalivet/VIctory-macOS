@@ -611,10 +611,126 @@ impl Module {
         blocks
     }
 
+    /// [`Module::written_call_blocks`] of the calls whose first operand
+    /// after the `dx.op` opcode is `x`.
+    #[cfg(test)]
+    pub fn written_call_blocks_on(&self, name: &str, x: V) -> Vec<usize> {
+        let plan = self.plan();
+        let mut blocks = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && matches!(&self.insts[i as usize].op, Op::Call(f, args) if self.funcs[*f as usize].name == name && args.get(1) == Some(&x))
+                {
+                    blocks.push(b);
+                }
+            }
+        }
+        blocks
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
         self.written_call_blocks(name).len()
+    }
+
+    /// Per written `dx.op.unary.f32` call, its DXIL opcode and whether its
+    /// operand was flushed via `bitcast(select((x & 0x7F80_0000) == 0, x & 0x8000_0000, x))`.
+    #[cfg(test)]
+    pub fn written_unary_f32_flushes(&self) -> Vec<(u32, bool)> {
+        let plan = self.plan();
+        let mut out = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if !plan.live[i as usize] {
+                    continue;
+                }
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                if self.funcs[*f as usize].name != "dx.op.unary.f32" {
+                    continue;
+                }
+                let opcode = args.first().and_then(|&v| self.int_value(v));
+                let flushed = args.get(1).is_some_and(|&v| self.is_ftz_f32(v));
+                out.push((opcode.unwrap_or(0) as u32, flushed));
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn is_ftz_f32(&self, v: V) -> bool {
+        let V::Inst(w) = v else { return false };
+        let Op::Cast(Cast::Bitcast, V::Inst(sel)) = self.insts[w as usize].op else {
+            return false;
+        };
+        let Op::Select(V::Inst(den), V::Inst(sign), x) = self.insts[sel as usize].op else {
+            return false;
+        };
+        let Op::Cmp(pred::EQ, V::Inst(exp), zero) = self.insts[den as usize].op else {
+            return false;
+        };
+        if self.int_value(zero) != Some(0) {
+            return false;
+        }
+        let Op::Bin(Bin::And, x_exp, exp_mask) = self.insts[exp as usize].op else {
+            return false;
+        };
+        let Op::Bin(Bin::And, x_sign, sign_mask) = self.insts[sign as usize].op else {
+            return false;
+        };
+        x_exp == x
+            && x_sign == x
+            && self.int_value(exp_mask) == Some(0x7F80_0000)
+            && self.int_value(sign_mask).map(|v| v as u32) == Some(0x8000_0000)
+    }
+
+    /// The blocks, instructions (phis included) and conditional branches
+    /// [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_shape(&self) -> (usize, usize, usize) {
+        let plan = self.plan();
+        let mut shape = (plan.layout.len(), 0, 0);
+        for &b in &plan.layout {
+            let blk = &self.blocks[b];
+            let live = |&&i: &&u32| plan.live[i as usize];
+            shape.1 += blk.phis.iter().chain(&blk.body).filter(live).count();
+            shape.2 += usize::from(matches!(self.term(b), Some(Term::CondBr(..))));
+        }
+        shape
+    }
+
+    /// The arguments of each call of a function named `name` that
+    /// [`Module::write`] writes, as integers where they are constants or
+    /// sums of constants (lowering adds offsets up unfolded), else `None`.
+    #[cfg(test)]
+    pub fn written_call_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
+        fn sum(m: &Module, v: V) -> Option<i64> {
+            match v {
+                V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Bin(Bin::Add, a, b) => Some(i64::from(
+                        (sum(m, a)? as i32).wrapping_add(sum(m, b)? as i32),
+                    )),
+                    _ => None,
+                },
+                v => m.int_value(v),
+            }
+        }
+        let plan = self.plan();
+        let mut calls = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if let Op::Call(f, args) = &self.insts[i as usize].op
+                    && plan.live[i as usize]
+                    && self.funcs[*f as usize].name == name
+                {
+                    calls.push(args.iter().map(|&a| sum(self, a)).collect());
+                }
+            }
+        }
+        calls
     }
 
     /// The globals and functions [`Module::write`] declares, each kept
