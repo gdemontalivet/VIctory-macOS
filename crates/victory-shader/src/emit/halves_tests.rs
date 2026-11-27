@@ -3330,3 +3330,228 @@ fn lane_masks_in_divergent_code_match_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// `v_readfirstlane_b32 s12, v0` inside an `s_and_saveexec_b64` region.
+///
+/// * `mask_words`: computes `vcc` selecting the active lanes (e.g. lanes 8..=9,
+///   40..=41, 12 & 44, or empty).
+/// * `with_mbcnt`: include `v_mbcnt_lo_u32_b32` so the program requires
+///   console lanes (`halves` mode on 32-lane hosts).
+/// * `with_branch`: wrap the `v_readfirstlane_b32` in `s_cbranch_execz` so
+///   the read sits in a divergent basic block rather than a predicated line.
+fn readfirstlane_in_branch(mask_words: &[u32], with_mbcnt: bool, with_branch: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    w.extend(mask_words);
+    w.push(0xBE80_246A); // s_and_saveexec_b64 s[0:1], vcc
+    if with_branch {
+        w.push(0xBE8C_0380); // s_mov_b32 s12, 0
+        w.push(0xBF88_0001); // s_cbranch_execz +1 (skip v_readfirstlane_b32)
+    }
+    w.push(0x7E18_0500); // v_readfirstlane_b32 s12, v0
+    w.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    w.push(0x7E04_020C); // v_mov_b32 v2, s12
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Active-lane predicates for [`readfirstlane_in_branch`]:
+/// - lower half only: `(v0 >> 1) == 4` -> lanes 8, 9 (first = 8)
+/// - upper half only: `(v0 >> 1) == 20` -> lanes 40, 41 (first = 40)
+/// - both halves: `(v0 & 31) == 12` -> lanes 12, 44 (first = 12)
+/// - empty EXEC: `(v0 >> 1) == 64` -> no lanes active (first = lane 0 = 0, or
+///   with `v0 + 7` -> 7, distinguishing lane 0 from 0 and from lane 63)
+const MASK_LANES_8_9: [u32; 2] = [
+    0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
+    0x7D84_0684, // v_cmp_eq_u32 vcc, 4, v3
+];
+const MASK_LANES_40_41: [u32; 2] = [
+    0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
+    0x7D84_0694, // v_cmp_eq_u32 vcc, 20, v3
+];
+const MASK_LANES_12_44: [u32; 2] = [
+    0x3606_009F, // v_and_b32 v3, 31, v0
+    0x7D84_068C, // v_cmp_eq_u32 vcc, 12, v3
+];
+const MASK_EMPTY: [u32; 2] = [
+    0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
+    0x7D84_06C0, // v_cmp_eq_u32 vcc, 64, v3
+];
+
+/// Same as [`readfirstlane_in_branch`] but reads `v4 = v0 + 7` so lane 0 has
+/// value `7` (distinguishable from zero and from lane 31/63).
+fn readfirstlane_offset_in_branch(
+    mask_words: &[u32],
+    with_mbcnt: bool,
+    with_branch: bool,
+) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+    w.push(0x4A08_0087); // v_add_nc_u32 v4, 7, v0
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    w.extend(mask_words);
+    w.push(0xBE80_246A); // s_and_saveexec_b64 s[0:1], vcc
+    if with_branch {
+        w.push(0xBE8C_0387); // s_mov_b32 s12, 7
+        w.push(0xBF88_0001); // s_cbranch_execz +1 (skip v_readfirstlane_b32)
+    }
+    w.push(0x7E18_0504); // v_readfirstlane_b32 s12, v4
+    w.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    w.push(0x7E04_020C); // v_mov_b32 v2, s12
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_readfirstlane_branch_programs_are_what_their_comments_say() {
+    let programs: Vec<(Vec<u32>, &[&str])> = vec![
+        (
+            readfirstlane_in_branch(&MASK_LANES_8_9, false, false),
+            &[
+                "v_lshlrev_b32 v16, 5, v0",
+                "v_lshrrev_b32 v3, 1, v0",
+                "v_cmp_eq_u32 vcc, 4, v3",
+                "s_and_saveexec_b64 s[0:1], vcc",
+                "v_readfirstlane_b32 s12, v0",
+                "s_mov_b64 exec, s[0:1]",
+                "v_mov_b32 v2, s12",
+            ],
+        ),
+        (
+            readfirstlane_in_branch(&MASK_LANES_40_41, true, true),
+            &[
+                "v_mbcnt_lo_u32_b32 v1, -1, 0",
+                "v_cmp_eq_u32 vcc, 20, v3",
+                "s_cbranch_execz",
+                "v_readfirstlane_b32 s12, v0",
+            ],
+        ),
+        (
+            readfirstlane_offset_in_branch(&MASK_LANES_12_44, true, false),
+            &[
+                "v_add_nc_u32 v4, 7, v0",
+                "v_and_b32 v3, 31, v0",
+                "v_cmp_eq_u32 vcc, 12, v3",
+                "v_readfirstlane_b32 s12, v4",
+            ],
+        ),
+        (
+            readfirstlane_offset_in_branch(&MASK_EMPTY, true, false),
+            &[
+                "v_cmp_eq_u32 vcc, 64, v3",
+                "v_readfirstlane_b32 s12, v4",
+            ],
+        ),
+    ];
+    for (words, wants) in programs {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in wants {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn readfirstlane_in_branch_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for (label, mask, want_val) in [
+        ("lower_8_9", &MASK_LANES_8_9, 8u32),
+        ("upper_40_41", &MASK_LANES_40_41, 40u32),
+        ("both_12_44", &MASK_LANES_12_44, 12u32),
+        ("empty_exec", &MASK_EMPTY, 0u32),
+    ] {
+        for with_mbcnt in [false, true] {
+            for with_branch in [false, true] {
+                let words = readfirstlane_offset_in_branch(mask, with_mbcnt, with_branch);
+                let n = native(&words, true, 64, 0);
+                let l = lowered(&n, true).expect("readfirstlane branch lowers in halves");
+                assert_eq!(l.wave_size, Some(32));
+                if let Ok(mut v) =
+                    validator::Validator::load(validator::Validator::default_path().as_deref())
+                {
+                    v.validate(&mut l.dxil.clone())
+                        .expect("DXIL validation failed");
+                }
+                let want = vec![want_val + 7; 64];
+                for msg in differences(&words, 64, 1, &want) {
+                    failed.push(format!(
+                        "{label}(mbcnt={with_mbcnt},branch={with_branch}): {msg}"
+                    ));
+                }
+            }
+        }
+    }
+    // Direct `v_readfirstlane_b32 s12, v0` without `v_mbcnt` or `s_cbranch_execz`:
+    for (label, mask, want_val) in [
+        ("direct_v0_8_9", &MASK_LANES_8_9, 8u32),
+        ("direct_v0_40_41", &MASK_LANES_40_41, 40u32),
+        ("direct_v0_12_44", &MASK_LANES_12_44, 12u32),
+        ("direct_v0_empty", &MASK_EMPTY, 0u32),
+    ] {
+        let words = readfirstlane_in_branch(mask, false, false);
+        let want = vec![want_val; 64];
+        for msg in differences(&words, 64, 1, &want) {
+            failed.push(format!("{label}: {msg}"));
+        }
+    }
+    // Single-host-wave (32), partial-tail (96), and multi-wave (128) groups:
+    for (label, mask, threads, expected) in [
+        ("wave32_8_9", &MASK_LANES_8_9, 32u32, (0..32).map(|_| 8 + 7).collect::<Vec<_>>()),
+        ("wave32_empty", &MASK_EMPTY, 32u32, (0..32).map(|_| 7).collect::<Vec<_>>()),
+        (
+            "wave96_both_12_44",
+            &MASK_LANES_12_44,
+            96u32,
+            (0..96).map(|l| (l & !63) + 12 + 7).collect::<Vec<_>>(),
+        ),
+        (
+            "wave96_empty",
+            &MASK_EMPTY,
+            96u32,
+            (0..96).map(|l| (l & !63) + 7).collect::<Vec<_>>(),
+        ),
+        (
+            "wave128_both_12_44",
+            &MASK_LANES_12_44,
+            128u32,
+            (0..128).map(|l| (l & !63) + 12 + 7).collect::<Vec<_>>(),
+        ),
+        (
+            "wave128_empty",
+            &MASK_EMPTY,
+            128u32,
+            (0..128).map(|l| (l & !63) + 7).collect::<Vec<_>>(),
+        ),
+    ] {
+        let words = readfirstlane_offset_in_branch(mask, false, false);
+        for msg in differences(&words, threads, 1, &expected) {
+            failed.push(format!("{label}: {msg}"));
+        }
+    }
+    // Literal whole-wave halves with empty EXEC must also return lane 0's value.
+    let empty_lit = readfirstlane_offset_in_branch(&MASK_EMPTY, true, false);
+    for msg in differences_in(true, &empty_lit, 64, 1, &[7; 64], 0, true, true) {
+        failed.push(format!("literal_empty: {msg}"));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

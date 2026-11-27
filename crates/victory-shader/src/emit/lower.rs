@@ -33,6 +33,7 @@ mod packed;
 mod round_mode;
 mod mesh;
 mod predicate;
+mod retry;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
@@ -42,6 +43,11 @@ pub(crate) use meet::MeetSite;
 use super::bitcode::Rmw;
 use packed::packed_half;
 use round_mode::{round16, round16_after};
+#[cfg(any(test, all(windows, feature = "host")))]
+pub(crate) use retry::lower;
+#[cfg(all(test, windows))]
+pub(crate) use retry::lower_literal;
+pub(crate) use retry::lower_pruned;
 
 type Why = &'static str;
 
@@ -213,109 +219,6 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
-}
-
-#[cfg(any(test, all(windows, feature = "host")))]
-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_pruned(parts, None, false, false)
-}
-
-pub(crate) fn lower_pruned(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-    literal_halves: bool,
-) -> Result<Lowered, ShaderError> {
-    // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center);
-    if !literal_halves
-        || !parts.host_wave32
-        || !parts.native.wave64
-        || !matches!(&parts.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-        || !matches!(
-            &original,
-            Err(ShaderError::Unsupported {
-                what: halves::MASK_ACROSS
-                    | LANE_MASK
-                    | MASK_CYCLE
-                    | MASK_ELSEWHERE
-                    | halves::LDS_ACROSS
-                    | halves::REDUCTION_ACROSS
-                    | halves::FIRST_ACROSS
-                    | halves::READ_ACROSS
-                    | halves::WRITE_ACROSS,
-                ..
-            })
-        )
-    {
-        return original;
-    }
-    lower_literal(parts, keep, per_vertex_center)
-}
-
-/// The whole-wave translation of a 64-thread wave64 compute program on a
-/// 32-lane host, tried when the per-lane halves translation refuses it.
-pub(crate) fn lower_literal(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-) -> Result<Lowered, ShaderError> {
-    let native = parts.native;
-    // Register-relative move bounds and resource paths must use the same
-    // control flow as lowering. The per-lane move bounds do not apply here.
-    let p = crate::ir::build(&native.patched_code(), true, native.vgprs)?;
-    let st = crate::structure::split_literal(&p)?;
-    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    if !res.waterfall.reads.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a resource waterfall in literal wave64 halves",
-        });
-    }
-    let io = crate::io::raise(&p, native)?;
-    lower_with_structure(
-        &Parts {
-            p: &p,
-            st: &st,
-            res: &res,
-            io: &io,
-            ..parts.clone()
-        },
-        keep,
-        per_vertex_center,
-    )
-}
-
-fn lower_with_structure(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
-    // Divergent sites where the halves meet (`lower::meet`): a pass that
-    // finds new ones goes again with them laid out.
-    let mut plan: Set<MeetSite> = Set::default();
-    loop {
-        let found = std::cell::RefCell::new(Set::default());
-        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run();
-        let found = found.into_inner();
-        if !found.is_empty() {
-            plan.extend(found);
-            continue;
-        }
-        match r {
-            Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
-                }
-            }
-            Err(Stop::Fail(e)) => return Err(e),
-        }
-    }
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -793,6 +696,7 @@ impl<'a> Lower<'a> {
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
+        let mut alike_cache: Option<HashSet<Value>> = None;
         let mut split_barriers = Set::default();
         let mut pred = predicate::PredicatePlan::empty(Vec::new());
         if let StageIo::Cs(cs) = x.native.io {
@@ -835,7 +739,7 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            };
+            } || halves::needs_first_lane(x, &mut alike_cache);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -1026,7 +930,7 @@ impl<'a> Lower<'a> {
             meet_epoch: Map::default(),
             level: 0,
             alike: if halves {
-                halves::lane_uniform(x)
+                alike_cache.unwrap_or_else(|| halves::lane_uniform(x))
             } else {
                 HashSet::new()
             },
@@ -7665,11 +7569,10 @@ impl<'a> Lower<'a> {
                 // In halves the host wave's first lane is the console's only
                 // for a value the same in both halves, or where the group is
                 // one host wave.
-                if self.halves
-                    && !self.one_host_wave()
-                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
-                {
+                let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
+                let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                if self.halves && !self.one_host_wave() && is_vec && !is_alike {
                     if !self.across_here() {
                         return Err(halves::FIRST_ACROSS);
                     }
@@ -7678,19 +7581,7 @@ impl<'a> Lower<'a> {
                     return self.write_i(inst, r, None);
                 }
                 let a = s(self, 0)?;
-                // shortcut: without console lanes, the first lane of the host
-                // wave (whose waves are the driver's choice): the console's
-                // where the value is the same in every lane, what the compiler
-                // reads first lanes for.
-                self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = self.first_lane_in_wave(a, (!is_alike).then_some(guard).flatten());
                 let r = self.helper_reads_own(a, r);
                 self.write_i(inst, r, None)
             }

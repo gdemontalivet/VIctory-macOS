@@ -394,9 +394,11 @@ impl Lower<'_> {
     /// `v_readfirstlane_b32` of `x`, in halves ([`Lower::across_here`]): the
     /// first active lane across both 32-lane halves. When `active` is `None`,
     /// every lane is active and the lower half's lane 0 wins; when `active` is
-    /// `Some(act)`, each half finds its own first active lane and exchanges
-    /// `(value, ballot != 0)` so the upper half's first active lane is chosen
-    /// whenever all 32 lanes of the lower half are inactive.
+    /// `Some(act)`, each half finds its own first active lane (defaulting to
+    /// its lane 0 when inactive) and exchanges `(value, ballot)` so the lower
+    /// half wins if any lower lane is active, the upper half wins if only upper
+    /// lanes are active, and empty EXEC (neither half active) returns lane 0's
+    /// value, matching RDNA2 hardware.
     pub(super) fn first_lane_across(&mut self, x: V, active: Option<V>) -> Result<V, Why> {
         let c = self.cur;
         let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
@@ -412,15 +414,54 @@ impl Lower<'_> {
             .s
             .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
         let ballot = self.s.m.extract(c, b, 0);
-        // DXIL opcode 32: FirstbitLo (returns 0..31 for non-zero ballot).
+        // DXIL opcode 32: FirstbitLo (returns 0..31 for non-zero ballot,
+        // 0xffffffff for 0). Default to lane 0 when this half has no active
+        // lanes so empty EXEC across both halves returns console lane 0.
+        let own_any = self.s.m.cmp(c, pred::NE, ballot, zero);
         let bit = self.unary_bits(c, 32, ballot);
-        let mask31 = self.s.m.i32(31);
-        let lane = self.s.m.bin(c, Bin::And, bit, mask31);
+        let lane = self.s.m.select(c, own_any, bit, zero);
         let own = self.read_lane(x, lane);
         let (lo_val, hi_val) = self.exchange_halves(own, zero, c)?;
-        let (lo_ballot, _) = self.exchange_halves(ballot, zero, c)?;
-        let lo_any = self.s.m.cmp(c, pred::NE, lo_ballot, zero);
-        Ok(self.s.m.select(c, lo_any, lo_val, hi_val))
+        let (lo_ballot, hi_ballot) = self.exchange_halves(ballot, zero, c)?;
+        let lo_empty = self.s.m.cmp(c, pred::EQ, lo_ballot, zero);
+        let hi_any = self.s.m.cmp(c, pred::NE, hi_ballot, zero);
+        let pick_hi = self.s.m.bin(c, Bin::And, lo_empty, hi_any);
+        Ok(self.s.m.select(c, pick_hi, hi_val, lo_val))
+    }
+
+    /// `v_readfirstlane_b32` of `x` within a single host wave: when `active` is
+    /// `Some(act)`, finds the first lane where `act` holds (falling back to
+    /// lane 0 on empty EXEC, matching RDNA2 hardware); otherwise reads the host
+    /// wave's first active lane.
+    pub(super) fn first_lane_in_wave(&mut self, x: V, active: Option<V>) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let Some(act) = active else {
+            return self
+                .s
+                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        };
+        let zero = self.s.m.i32(0);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let b = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+        let lo = self.s.m.extract(c, b, 0);
+        let lo_any = self.s.m.cmp(c, pred::NE, lo, zero);
+        let lo_bit = self.unary_bits(c, 32, lo);
+        let lane = if !self.halves {
+            let hi = self.s.m.extract(c, b, 1);
+            let hi_any = self.s.m.cmp(c, pred::NE, hi, zero);
+            let hi_bit = self.unary_bits(c, 32, hi);
+            let k32 = self.s.m.i32(32);
+            let hi_lane = self.s.m.bin(c, Bin::Add, hi_bit, k32);
+            let fallback = self.s.m.select(c, hi_any, hi_lane, zero);
+            self.s.m.select(c, lo_any, lo_bit, fallback)
+        } else {
+            self.s.m.select(c, lo_any, lo_bit, zero)
+        };
+        self.read_lane(x, lane)
     }
 
     /// `Shape::Half(Op::AddH)` 16-bit float wave reduction (low 16 bits = sum
@@ -602,6 +643,43 @@ const GROUP_SHARED_DWORDS: u32 = 8192;
 /// Why a first-lane read stops in halves: the console's first lane may be
 /// in the other half, and the value is not known to be the same there.
 pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
+
+/// Whether `x` (a wave64 compute program) has a non-waterfall
+/// `v_readfirstlane_b32` whose vector source may differ between lanes of the
+/// console wave: such a read needs console-wave lane order (and halves on a
+/// 32-lane host) so both halves see the same first active lane.
+pub(super) fn needs_first_lane(x: &Parts, alike: &mut Option<HashSet<Value>>) -> bool {
+    if !x.native.wave64 {
+        return false;
+    }
+    let wf = &x.res.waterfall.reads;
+    let is_vec_first = |i: &Inst| -> Option<Value> {
+        if i.name() != "v_readfirstlane_b32"
+            || i.writes.first().is_some_and(|w| wf.contains(&w.1))
+        {
+            return None;
+        }
+        let Fields::Valu(v) = &i.fields else {
+            return None;
+        };
+        match v.src.first() {
+            Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+            _ => None,
+        }
+    };
+    let mut srcs = x
+        .p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(is_vec_first)
+        .peekable();
+    if srcs.peek().is_none() {
+        return false;
+    }
+    let uniform = alike.get_or_insert_with(|| lane_uniform(x));
+    srcs.any(|val| !uniform.contains(&val))
+}
 
 /// Every branch (by its block) with its region: the blocks reachable from
 /// it that do not post-dominate it, which only the lanes taking one side may
