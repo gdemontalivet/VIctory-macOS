@@ -73,7 +73,7 @@ fn build() -> &'static [u8; 32] {
 /// (made here if it is not yet: the cache belongs to the GPU it was filled
 /// on, as the pipeline library does); none without one.
 fn host_wave32() -> bool {
-    crate::host::host().is_some_and(crate::host::Host::wave32)
+    crate::host::host().is_some_and(crate::backend::HostGpu::wave32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -102,13 +102,33 @@ fn atomic_locks() -> bool {
 
 /// Whether the lanes of a wave first try their 64-bit atomics' locks in
 /// rounds before the lanes still not done take turns (`emit`, "Atomic
-/// locks"; #240): opt-in while it is measured, `VICTORY_ATOMIC_LOCK_ROUNDS=1`.
-/// Only with [`atomic_locks`].
+/// locks"; #240): wherever [`atomic_locks`] are on. In the game the rounds
+/// took a world frame from 7.9 to 2.5 s on an M2 Max, from 5.29 to 0.71 s
+/// on an M4 Pro and from 2.9 to 0.88 s on an M4, and left no GPU resets.
+/// `VICTORY_ATOMIC_LOCK_ROUNDS=0` goes back to the turns alone.
 fn atomic_lock_rounds() -> bool {
     static ROUNDS: OnceLock<bool> = OnceLock::new();
     *ROUNDS.get_or_init(|| {
-        atomic_locks() && std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").as_deref() == Ok("1")
+        let var = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
+        rounds_on(atomic_locks(), var.as_deref())
     })
+}
+
+/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
+/// a wave to their maximum key, one representative locking (`emit`,
+/// "Atomic locks"; #240): opt-in while it is measured,
+/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
+fn atomic_umax() -> bool {
+    static UMAX: OnceLock<bool> = OnceLock::new();
+    *UMAX.get_or_init(|| {
+        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
+    })
+}
+
+/// The rounds, given whether the locks are on and
+/// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
+fn rounds_on(locks: bool, var: Option<&str>) -> bool {
+    locks && var != Some("0")
 }
 
 /// Whether compute shaders' biased samples run as scaled gradient samples:
@@ -154,22 +174,24 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with host workarounds (atomic locks and
-/// their rounds, bias as gradients, narrow waves): their own cache entries,
-/// one per combination.
+/// [`build`] for translations with host workarounds (atomic locks, their
+/// rounds and umax reduction, bias as gradients, narrow waves): their own
+/// cache entries, one per combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
+    let umax = rounds && options.atomic_umax;
     if !locks && !bias && !narrow {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
-        | usize::from(rounds) << 3;
+        | usize::from(rounds) << 3
+        | usize::from(umax) << 4;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -178,6 +200,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if rounds {
             h.update(b"atomic lock rounds");
+        }
+        if umax {
+            h.update(b"atomic umax");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -199,6 +224,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
         atomic_lock_rounds: atomic_lock_rounds(),
+        atomic_umax: atomic_umax(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
@@ -300,7 +326,7 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -363,6 +389,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        half_views,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -419,6 +446,11 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, half_views.len() as u32);
+    for &(slot, dword) in half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -485,6 +517,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -501,12 +538,24 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        half_views,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rounds are on wherever the locks are, `VICTORY_ATOMIC_LOCK_ROUNDS=0`
+    /// turns them off, and without the locks there are none (#240).
+    #[test]
+    fn lock_rounds_are_on_with_the_locks_unless_turned_off() {
+        assert!(rounds_on(true, None), "on by default with the locks");
+        assert!(rounds_on(true, Some("1")), "the old opt-in still works");
+        assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
+        assert!(!rounds_on(false, None), "no rounds without the locks");
+        assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
 
     fn shader() -> HostShader {
         HostShader {
@@ -535,6 +584,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
