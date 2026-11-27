@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::backend::HostMemory;
 use crate::descriptor::{Heap, View};
 use crate::object::This;
 use crate::resource::HostTexture;
@@ -700,6 +701,15 @@ fn now_millis() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Held by a test that enables the worker, and by GPU tests that must not run
+/// beside one: `kick_worker_heaps` wakes the worker for every shader-visible
+/// heap, so a test's heap swept by it loses its tracked page changes.
+#[cfg(test)]
+pub(crate) fn serial() -> MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    lock(&TEST_LOCK)
+}
+
 /// Test helper: temporarily enables `heap_worker` on the calling thread and
 /// resets its queues cleanly on drop.
 #[cfg(test)]
@@ -711,8 +721,7 @@ pub(crate) struct EnableForTest {
 #[cfg(test)]
 impl EnableForTest {
     pub(crate) fn new() -> Self {
-        static TEST_LOCK: Mutex<()> = Mutex::new(());
-        let guard = lock(&TEST_LOCK);
+        let guard = serial();
         let prev = TEST_ON.replace(Some(true));
         // Drain any stale entries left by an earlier test.
         drop(take_ready());
