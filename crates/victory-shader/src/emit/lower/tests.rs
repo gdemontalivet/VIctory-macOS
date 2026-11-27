@@ -2958,24 +2958,28 @@ fn lower_halves_io(
     // These tests probe the value analysis behind each refusal, which
     // selective predication of a divergent branch would route around.
     super::NO_PREDICATION.with(|c| c.set(true));
-    let lowered = lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        atomic_lock_rounds: false,
-        atomic_umax: false,
-        bias_as_gradients: false,
-        host_wave32: true,
-        narrow_waves: false,
-        uav_size_level0: false,
-        view_marks: false,
+    // The wave ticket's own barrier would count among the exchanges these
+    // tests look for, so they lower without it.
+    let lowered = crate::emit::with_thread_ticket(false, || {
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            host_wave32: true,
+            narrow_waves: false,
+            uav_size_level0: false,
+            view_marks: false,
+        })
     });
     super::NO_PREDICATION.with(|c| c.set(false));
     lowered
