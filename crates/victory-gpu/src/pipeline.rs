@@ -254,22 +254,24 @@ impl Shader {
                             kernel_ms,
                             "shader translated"
                         );
-                        // D3DMetal makes such a pipeline and marks it a no-op:
-                        // its draws are dropped without an error (#132).
+                        // D3DMetal makes such a pipeline and marks it a no-op
+                        // or hangs the queue (#132, #172).
                         use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
-                        if let Some(o) = mesh_outputs(&t.host.dxil)
-                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
-                            .filter(|_| crate::shader_cache::under_wine())
+                        if let (Some(o), Some(bytes)) =
+                            (mesh_outputs(&t.host.dxil), metal_mesh_output_bytes(&t.host.dxil))
+                            && bytes > METAL_MESH_OUTPUT_BYTES
+                            && crate::shader_cache::under_wine()
                         {
                             tracing::warn!(
                                 hash = %self.hash,
-                                bytes = o.bytes(),
+                                bytes,
+                                packed_bytes = o.bytes(),
                                 limit = METAL_MESH_OUTPUT_BYTES,
                                 vertices = o.vertices,
                                 primitives = o.primitives,
                                 vertex_components = o.vertex_components,
                                 primitive_components = o.primitive_components,
-                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                                "mesh shader outputs exceed Metal's limit; linking or refusing on host"
                             );
                         }
                     }
@@ -609,6 +611,23 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Whether a dispatch with the title pipeline is held back: it is the
