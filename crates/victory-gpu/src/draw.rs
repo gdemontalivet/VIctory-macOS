@@ -97,10 +97,10 @@ pub(crate) struct State {
     /// the list ([`State::cut`]).
     fixed: Fixed,
     /// Per-list descriptor preparation memo (`VICTORY_TABLE_MEMO`): maps a
-    /// table entry key to `(list_epoch, read_tested_depth, seen)`.
+    /// table entry key to `(descriptor_bytes, required_epoch, read_tested_depth, seen)`.
     entry_memo: std::collections::HashMap<
         EntryKey,
-        (u64, bool, Seen),
+        EntryValue,
         std::hash::BuildHasherDefault<MemoHasher>,
     >,
 }
@@ -143,9 +143,12 @@ impl std::hash::Hasher for MemoHasher {
     }
 }
 
-/// Key for per-list table-entry memoization: `(handle, descriptor_bytes, kind,
-/// stores_generation, tested_depth_resource)`.
-type EntryKey = (u64, [u64; 4], ResourceType, u64, usize);
+/// Key for per-list table-entry memoization: `(handle, kind, tested_depth_resource)`.
+type EntryKey = (u64, ResourceType, usize);
+
+/// Value stored in [`State::entry_memo`]: `(descriptor_bytes, required_epoch,
+/// read_tested_depth, seen)`.
+type EntryValue = ([u64; 4], u64, bool, Seen);
 
 /// Decision from [`State::entry_begin`] before preparing a table entry.
 enum EntryMemo {
@@ -153,8 +156,10 @@ enum EntryMemo {
     Skip,
     Do {
         key: EntryKey,
+        bytes: [u64; 4],
         hit: bool,
         epoch: u64,
+        deferred_epoch: u64,
         steps: usize,
         depth_before: (usize, bool),
         depth_hit: bool,
@@ -215,21 +220,9 @@ fn table_memo() -> u8 {
 }
 
 thread_local! {
-    /// Per-thread monotonic store generation: bumped whenever shader UAV/heap
-    /// writes are recorded so subsequent table entries cannot hit stale memo
-    /// entries recorded before the store.
-    static STORES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Currently bound graphics depth target `(resource, read_by_table)` while
     /// preparing descriptor tables.
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
-}
-
-fn stores_gen() -> u64 {
-    STORES.with(std::cell::Cell::get)
-}
-
-fn note_store() {
-    STORES.with(|s| s.set(s.get().wrapping_add(1)));
 }
 
 fn copy_of(r: usize) -> usize {
@@ -238,10 +231,13 @@ fn copy_of(r: usize) -> usize {
 
 /// Returns what a memoized table entry for `(view, kind)` depends on, or `None`
 /// if the entry must not be memoized (e.g., buffer UAVs whose write step is
-/// recorded every time, or aliased textures whose source may be written
-/// outside this list).
+/// recorded every time, 3-channel widened SRVs that check `widened_ready`, or
+/// aliased textures whose source may be written outside this list).
 fn memo_copy(view: &View, kind: ResourceType) -> Option<Seen> {
     let is_uav = kind == ResourceType::Uav;
+    if kind == ResourceType::Srv && crate::descriptor::host::three_channel_srv(view) {
+        return None;
+    }
     let texture = |r: usize| -> Option<(usize, usize)> {
         if crate::resource::buffer_bytes(r as This).is_some() {
             None
@@ -1018,7 +1014,6 @@ impl State {
                     list.mark_widened_read(&buffer);
                 }
                 if writes {
-                    note_store();
                     list.mark_widened_heap(&host.viewed);
                 }
             }
@@ -1577,7 +1572,13 @@ impl State {
         }
     }
 
-    fn entry_begin(&mut self, list: &HostList, handle: u64, kind: ResourceType) -> EntryMemo {
+    fn entry_begin(
+        &mut self,
+        list: &HostList,
+        ready_slot: Option<(&crate::descriptor::host::HostHeap, u32)>,
+        handle: u64,
+        kind: ResourceType,
+    ) -> EntryMemo {
         let mode = table_memo();
         if mode == 0 {
             return EntryMemo::Off;
@@ -1586,22 +1587,38 @@ impl State {
         // descriptor heap by the caller.
         let bytes = unsafe { (handle as *const [u64; 4]).read_unaligned() };
         let tested = TESTED_DEPTH.with(std::cell::Cell::get);
-        let key = (handle, bytes, kind, stores_gen(), tested.0);
+        let key = (handle, kind, tested.0);
         let epoch = list.epoch();
+        let deferred_epoch = list.deferred_epoch();
         memo_count(0);
         let (hit, depth_hit) = match self.entry_memo.get(&key) {
             None => {
                 memo_count(5);
                 (false, false)
             }
-            Some(&(e, _, _)) if e != epoch => {
+            Some(&(saved_bytes, _, _, _)) if saved_bytes != bytes => {
+                memo_count(5);
+                (false, false)
+            }
+            Some(&(_, saved_epoch, _, seen))
+                if saved_epoch
+                    != if matches!(seen, Seen::Nothing) {
+                        deferred_epoch
+                    } else {
+                        epoch
+                    } =>
+            {
                 memo_count(6);
                 (false, false)
             }
-            Some(&(_, depth, seen)) if copy_stands(seen, handle) => (true, depth),
-            Some(_) => {
-                memo_count(7);
-                (false, false)
+            Some(&(_, _, depth_hit, seen)) => {
+                let slot_ok = ready_slot.is_none_or(|(host, index)| host.slot_ready(index, handle));
+                if slot_ok && copy_stands(seen, handle) {
+                    (true, depth_hit)
+                } else {
+                    memo_count(7);
+                    (false, false)
+                }
             }
         };
         if hit {
@@ -1616,8 +1633,10 @@ impl State {
         TESTED_DEPTH.with(|d| d.set((tested.0, false)));
         EntryMemo::Do {
             key,
+            bytes,
             hit,
             epoch,
+            deferred_epoch,
             steps: list.deferred_steps(),
             depth_before: tested,
             depth_hit,
@@ -1627,8 +1646,10 @@ impl State {
     fn entry_end(&mut self, list: &HostList, memo: EntryMemo, view: Option<&View>) {
         let EntryMemo::Do {
             key,
+            bytes,
             hit,
             epoch,
+            deferred_epoch,
             steps,
             depth_before,
             depth_hit,
@@ -1639,15 +1660,14 @@ impl State {
         let depth = TESTED_DEPTH.with(std::cell::Cell::get).1;
         TESTED_DEPTH.with(|d| d.set((depth_before.0, depth_before.1 || depth)));
         if hit {
-            if list.epoch() != epoch {
+            if list.epoch() != epoch || list.deferred_epoch() != deferred_epoch {
                 memo_count(2);
                 static SAID: AtomicU64 = AtomicU64::new(0);
                 if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
                     tracing::warn!(
                         handle = format_args!("{:#x}", key.0),
-                        kind = ?key.2,
-                        stores = key.3,
-                        tested = format_args!("{:#x}", key.4),
+                        kind = ?key.1,
+                        tested = format_args!("{:#x}", key.2),
                         ?view,
                         "table memo (verify): remembered entry changed list epoch"
                     );
@@ -1659,7 +1679,7 @@ impl State {
                 if SAID_STEPS.fetch_add(1, Ordering::Relaxed) < 20 {
                     tracing::warn!(
                         handle = format_args!("{:#x}", key.0),
-                        kind = ?key.2,
+                        kind = ?key.1,
                         steps_before = steps,
                         steps_after = list.deferred_steps(),
                         "table memo (verify): remembered entry changed deferred steps"
@@ -1672,7 +1692,7 @@ impl State {
                 if SAID_DEPTH.fetch_add(1, Ordering::Relaxed) < 20 {
                     tracing::warn!(
                         handle = format_args!("{:#x}", key.0),
-                        kind = ?key.2,
+                        kind = ?key.1,
                         depth_before = depth_hit,
                         depth_after = depth,
                         "table memo (verify): remembered entry changed depth test"
@@ -1683,9 +1703,15 @@ impl State {
         if self.entry_memo.len() >= 1 << 16 {
             self.entry_memo.clear();
         }
-        match view.and_then(|v| memo_copy(v, key.2)) {
+        match view.and_then(|v| memo_copy(v, key.1)) {
             Some(seen) => {
-                self.entry_memo.insert(key, (list.epoch(), depth, seen));
+                let required_epoch = if matches!(seen, Seen::Nothing) {
+                    list.deferred_epoch()
+                } else {
+                    list.epoch()
+                };
+                self.entry_memo
+                    .insert(key, (bytes, required_epoch, depth, seen));
             }
             None => {
                 memo_count(8);
@@ -1699,35 +1725,25 @@ impl State {
             return;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
-        if self.heap_of(handle).is_none() {
+        let Some(heap) = self.heap_of(handle) else {
             return;
-        }
-        let memo = self.entry_begin(list, handle, u.kind);
+        };
+        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+            return;
+        };
+        let samplers = heap.samplers();
+        let memo = self.entry_begin(list, Some((host, index)), handle, u.kind);
         if matches!(memo, EntryMemo::Skip) {
             return;
         }
-        let view = self.table_entry_whole(list, u, handle);
-        self.entry_end(list, memo, view.as_deref());
-    }
-
-    fn table_entry_whole(
-        &self,
-        list: &HostList,
-        u: &UsedResource,
-        handle: u64,
-    ) -> Option<crate::descriptor::ViewPin> {
-        let heap = self.heap_of(handle)?;
-        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return None;
-        };
         let view = host.mirror(index, handle, true);
         if let Some(view) = &view {
             readable(list, u, view, true);
         }
-        if !heap.samplers() {
+        if !samplers {
             list.defer_slot(&host.viewed, index);
         }
-        view
+        self.entry_end(list, memo, view.as_deref());
     }
 
     /// The descriptors a shader reads through tables, made from the
@@ -1806,7 +1822,7 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    let memo = self.entry_begin(list, handle, u.kind);
+                    let memo = self.entry_begin(list, None, handle, u.kind);
                     if matches!(memo, EntryMemo::Skip) {
                         continue;
                     }
@@ -2405,7 +2421,6 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         };
         shadow.refresh(list, refresh_at, refresh_len);
         if uav {
-            note_store();
             shadow.gpu_writes(list, address, len, marked);
         } else if u.kind == ResourceType::Srv && crate::descriptor::host::three_channel_srv(view) {
             for widened in
@@ -5295,44 +5310,52 @@ void main(uint3 id : SV_DispatchThreadID) {
         let c = local_memo_counts();
         assert_eq!((c[0], c[1], c[5]), (2, 1, 1), "first miss then hit");
 
-        // (a) Descriptor bytes change at the same handle -> miss.
+        // (a) Descriptor bytes change at the same handle -> miss, including ABA
+        // restoration back to `cbv_a`.
         crate::descriptor::create_cbv(std::ptr::null(), &cbv_b, slot0);
         state.table_entry(&list, &u_cbv, false);
         let c = local_memo_counts();
         assert_eq!((c[0], c[1], c[5]), (3, 1, 2), "changed descriptor bytes miss");
         state.table_entry(&list, &u_cbv, false);
         assert_eq!(local_memo_counts()[1], 2, "updated descriptor hits on repeat");
+        crate::descriptor::create_cbv(std::ptr::null(), &cbv_a, slot0);
+        state.table_entry(&list, &u_cbv, false);
+        let c = local_memo_counts();
+        assert_eq!((c[0], c[1], c[5]), (5, 2, 3), "ABA descriptor restoration misses");
 
-        // (b) `list.epoch()` bump (e.g., deferred copy) -> epoch miss.
+        // (b) `list.deferred_epoch()` bump (e.g., deferred copy) -> epoch miss.
         let src = [0x5Au8; 16];
         list.defer_copy(p as *mut u8, src.as_ptr(), src.len());
         state.table_entry(&list, &u_cbv, false);
         let c = local_memo_counts();
-        assert_eq!(c[6], 1, "list.epoch() bump causes epoch miss");
-        assert_eq!(c[1], 2, "no hit after epoch bump");
+        assert_eq!(c[6], 1, "deferred_epoch bump causes epoch miss");
+        assert_eq!(c[1], 2, "no hit after deferred copy");
 
-        // (c) `STORES` generation bump -> miss even with unchanged list epoch.
-        let epoch_steady = list.epoch();
-        note_store();
-        assert_eq!(list.epoch(), epoch_steady);
+        // (c) Texture-only `list.epoch()` bump does NOT invalidate buffer CBVs.
+        list.changed_something();
         state.table_entry(&list, &u_cbv, false);
         let c = local_memo_counts();
-        assert_eq!(c[1], 2, "STORES bump invalidates entry_memo");
-        assert_eq!(c[5], 3, "new STORES key is a first-in-list miss");
+        assert_eq!(c[1], 3, "texture-only epoch bump preserves CBV memo hit");
 
-        // (d) `State::reset` & `HostList::reset` clear `entry_memo` and bump epoch.
+        // (d) `State::reset` & `HostList::reset` clear `entry_memo` and bump epochs.
         assert!(!state.entry_memo.is_empty());
         let epoch_before_reset = list.epoch();
+        let def_epoch_before_reset = list.deferred_epoch();
         state.reset(std::ptr::null());
         list.close();
         list.reset();
         assert!(state.entry_memo.is_empty(), "State::reset clears entry_memo");
         assert_ne!(list.epoch(), epoch_before_reset, "HostList::reset advances epoch");
+        assert_ne!(
+            list.deferred_epoch(),
+            def_epoch_before_reset,
+            "HostList::reset advances deferred_epoch"
+        );
 
         state.set_heaps(&[heap_raw]);
         state.set_table(false, 0, title_heap.start);
         state.table_entry(&list, &u_cbv, false);
-        assert_eq!(local_memo_counts()[1], 2, "post-reset call misses cleanly");
+        assert_eq!(local_memo_counts()[1], 3, "post-reset call misses cleanly");
 
         list.close();
         crate::shadow::unregister(buf as usize, p as u64);

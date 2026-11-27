@@ -1147,7 +1147,9 @@ pub(crate) mod tests {
         let Some(host) = host() else { return };
         let Ok(list) = host.new_list() else { return };
         let start_epoch = list.epoch();
+        let start_def_epoch = list.deferred_epoch();
         assert_ne!(start_epoch, 0);
+        assert_ne!(start_def_epoch, 0);
         assert_eq!(list.deferred_steps(), 0);
 
         let p = crate::watch::tests::pool(1);
@@ -1164,28 +1166,32 @@ pub(crate) mod tests {
         assert_eq!(list.epoch(), start_epoch, "deduplicated refresh keeps epoch");
         assert_eq!(list.deferred_steps(), 1, "deduplicated refresh adds no step");
 
-        // Deferred copy bumps epoch, adds a step, and clears refresh dedup.
+        // Deferred copy bumps both epochs, adds a step, and clears refresh dedup.
         let src = [0x22u8; 16];
         list.defer_copy(p as *mut u8, src.as_ptr(), src.len());
         let after_copy = list.epoch();
+        let after_copy_def = list.deferred_epoch();
         assert_ne!(after_copy, start_epoch);
+        assert_ne!(after_copy_def, start_def_epoch);
         assert_eq!(list.deferred_steps(), 2);
 
-        // need_rebind and defer_gpu_write each bump epoch.
+        // need_rebind and defer_gpu_write do not invalidate already-recorded
+        // read-only descriptor preparation.
         list.need_rebind();
-        let after_rebind = list.epoch();
-        assert_ne!(after_rebind, after_copy);
+        assert_eq!(list.epoch(), after_copy);
+        assert_eq!(list.deferred_epoch(), after_copy_def);
         assert!(list.take_rebind());
 
         list.defer_gpu_write(&shadow, p, 256, false);
-        let after_uav = list.epoch();
-        assert_ne!(after_uav, after_rebind);
+        assert_eq!(list.epoch(), after_copy);
+        assert_eq!(list.deferred_epoch(), after_copy_def);
         assert_eq!(list.deferred_steps(), 3);
 
-        // Reset advances epoch and clears queued deferred steps.
+        // Reset advances both epochs and clears queued deferred steps.
         list.close();
         list.reset();
-        assert_ne!(list.epoch(), after_uav);
+        assert_ne!(list.epoch(), after_copy);
+        assert_ne!(list.deferred_epoch(), after_copy_def);
         assert_eq!(list.deferred_steps(), 0);
         list.close();
 
@@ -1214,9 +1220,12 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
-    /// Monotonic epoch bumped on every mutation that changes what subsequent
-    /// descriptor preparation must record ([`HostList::changed_something`]).
+    /// Monotonic epoch bumped whenever texture state, twin state, deferred
+    /// dedup sets, or the list itself resets ([`HostList::changed_something`]).
     epoch: std::sync::atomic::AtomicU64,
+    /// Monotonic epoch bumped only when deferred refresh/slot deduplication
+    /// sets are cleared (`reset` or `defer_title_copy`).
+    deferred_epoch: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1628,6 +1637,7 @@ impl Host {
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                deferred_epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -2682,19 +2692,32 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        self.changed_something();
+        self.changed_deferred();
     }
 
-    /// Bumps the list's mutation epoch whenever a recorded transition, twin
-    /// copy, deferred step, widened-buffer event, rebind, or reset changes
-    /// what subsequent descriptor preparation would need to do.
+    /// Bumps the list's texture/state mutation epoch whenever a recorded
+    /// transition or twin copy/write changes what subsequent texture
+    /// descriptor preparation would need to do.
     pub(crate) fn changed_something(&self) {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
     }
 
-    /// Monotonic epoch of the last mutation recorded on this list.
+    /// Bumps both the deferred-dedup epoch and texture/state epoch when
+    /// deferred refresh/slot sets are cleared (`reset` or title copy).
+    fn changed_deferred(&self) {
+        let next = next_epoch();
+        self.deferred_epoch.store(next, Ordering::Relaxed);
+        self.epoch.store(next, Ordering::Relaxed);
+    }
+
+    /// Monotonic epoch of the last texture/state or reset mutation on this list.
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic epoch of the last deferred refresh/slot invalidation on this list.
+    pub(crate) fn deferred_epoch(&self) -> u64 {
+        self.deferred_epoch.load(Ordering::Relaxed)
     }
 
     /// Number of deferred submission-time steps currently queued on this list.
@@ -2787,7 +2810,6 @@ impl HostList {
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(crate::twin::Use::new(depth, side, writes));
-                self.changed_something();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -2822,7 +2844,6 @@ impl HostList {
     /// A copy of ours replaced the compute root signature and pipeline.
     pub(crate) fn need_rebind(&self) {
         self.rebind.store(true, Ordering::Relaxed);
-        self.changed_something();
     }
 
     /// Whether the list's compute root signature and pipeline must be set
@@ -2862,7 +2883,6 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(WidenedEvent::Write((shadow.clone(), address, len)));
-        self.changed_something();
     }
 
     /// A heap-indexing shader may write through any of this heap's current
@@ -2875,7 +2895,6 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(WidenedEvent::Heap(heap.clone()));
-        self.changed_something();
     }
 
     /// Keeps an exact source shadow's arena slice alive until the list resets.
@@ -2939,7 +2958,6 @@ impl HostList {
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
         pending.clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).extend(views);
-        self.changed_something();
     }
 
     /// Moves widened buffers into the unordered state for widening copies.
@@ -3159,7 +3177,7 @@ impl HostList {
         deferred.refreshed.clear();
         deferred.slots.clear();
         deferred.filled_scratch.clear();
-        self.changed_something();
+        self.changed_deferred();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3232,7 +3250,6 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
-        self.changed_something();
     }
 
     /// Shaders of the list take views from the heap itself
@@ -3446,7 +3463,6 @@ impl HostList {
     /// Runs `work` on host memory at submission, in order with the copies.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
-        self.changed_something();
     }
 
     /// Brings a texture's staging buffer and host texture `copy` up to date
