@@ -247,7 +247,7 @@ mod crosslane_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod halves_tests;
 pub mod heap_sources;
 pub use heap_sources::{BufferBinding, HeapIndexSource, ScalarSource};
@@ -521,6 +521,8 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// Keep the per-lane translation for wave64 programs on 32-lane hosts.
+    pub disable_literal_halves: bool,
     /// A size query on a writable image (`getDimensions`) asks for level 0,
     /// where DXC (and the default here) leaves the level undefined. A
     /// writable view has one level, so it is the same query, but D3DMetal
@@ -1057,14 +1059,17 @@ fn emit_pruned(
         narrow_waves: options.narrow_waves,
         uav_size_level0: options.uav_size_level0,
     };
-    let (l, heap_index_sources) = match lower::lower_pruned(&parts(st, res), keep, options.per_vertex_center) {
+    let (l, heap_index_sources) = match lower::lower_pruned(&parts(st, res), keep,
+        options.per_vertex_center,
+        !options.disable_literal_halves,
+    ) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            let l = lower::lower_pruned(&parts(&st, &res), keep, options.per_vertex_center)?;
+            let l = lower::lower_pruned(&parts(&st, &res), keep, options.per_vertex_center, false)?;
             let sources = if pixel && l.heap {
                 heap_sources::extract(native, p, &res)
             } else {

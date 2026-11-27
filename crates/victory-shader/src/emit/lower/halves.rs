@@ -76,8 +76,7 @@ impl Lower<'_> {
     /// Why a program in halves cannot run: LDS a group of one console wave
     /// shares without barriers, split across two host waves.
     pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
+        (lds_dwords > 0 && group > HALF && group <= 64).then_some(LDS_ACROSS)
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
@@ -561,6 +560,28 @@ impl Lower<'_> {
             Op::MinF => self.binary(36, lo, hi),
             Op::MaxF => self.binary(35, lo, hi),
         })
+    }
+}
+
+pub(super) const LDS_ACROSS: Why =
+    "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
+pub(super) const REDUCTION_ACROSS: Why =
+    "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+pub(super) const READ_ACROSS: Why =
+    "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)";
+
+/// Whether both halves calculate the same selector for a lane read or write.
+pub(super) fn uniform_selector(inst: &Inst, alike: &Set<Value>) -> bool {
+    let Fields::Valu(v) = &inst.fields else {
+        return false;
+    };
+    match v.src.get(1) {
+        Some(Operand::Const(k)) => crate::resource::inline(*k).is_some(),
+        Some(Operand::Literal(_) | Operand::Scalar { code: NULL, .. }) => true,
+        Some(Operand::Scalar { code, .. }) => {
+            inst.read(Reg::S(*code)).is_some_and(|v| alike.contains(&v))
+        }
+        _ => false,
     }
 }
 

@@ -168,7 +168,7 @@ pub(crate) fn step_and_cap(
     p: &Program,
     st: &Structured,
     need_step: bool,
-) -> (Vec<bool>, Vec<bool>) {
+) -> (Vec<bool>, Vec<bool>, Set<Value>) {
     step_and_cap_with(p, st, &st.exits, &Set::default(), need_step)
 }
 
@@ -184,7 +184,7 @@ pub(crate) fn step_and_cap_with(
     exits: &[LaneExit],
     uniform_branches: &Set<usize>,
     need_step: bool,
-) -> (Vec<bool>, Vec<bool>) {
+) -> (Vec<bool>, Vec<bool>, Set<Value>) {
     let n = p.blocks.len();
     // Reverse postorder ranks, as lowering numbers them: a Jump to a block at
     // or before the jump is a back edge.
@@ -210,7 +210,7 @@ pub(crate) fn step_and_cap_with(
                 .iter()
                 .any(|b| b.insts.iter().any(|i| i.name() == "s_barrier")))
     {
-        return (Vec::new(), vec![false; n]);
+        return (Vec::new(), vec![false; n], Set::default());
     }
     let Some(regions) = halves::branch_regions_with(p, exits) else {
         return (
@@ -220,6 +220,7 @@ pub(crate) fn step_and_cap_with(
                 Vec::new()
             },
             vec![false; n],
+            Set::default(),
         );
     };
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -280,7 +281,11 @@ pub(crate) fn step_and_cap_with(
                 .bools
                 .support(when)
                 .iter()
-                .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)))
+                .all(|a| match *a {
+                    Atom::Uniform(v) => alike.contains(&v),
+                    Atom::Any(_) => st.literal,
+                    _ => false,
+                })
     };
     let mut alike: Set<Value> = p
         .inputs
@@ -299,6 +304,12 @@ pub(crate) fn step_and_cap_with(
                 )
         }))
         .collect();
+    let tracked = |v| {
+        st.literal
+            && (st.masks.contains_key(&v)
+                || st.highs.contains_key(&v)
+                || st.scc_votes.contains_key(&v))
+    };
     // Group-uniform VGPRs: optimistically all non-entry VGPRs, narrowed with
     // `alike` in lockstep. Entry VGPRs (`v0`/`v1`/`v2` thread ids) are never
     // group-uniform.
@@ -462,7 +473,9 @@ pub(crate) fn step_and_cap_with(
             // Every host wave enters by the same edge.
             let entered = step[b] && block.preds.iter().all(|&q| step[q]);
             for phi in &block.phis {
-                if scalar(phi.reg) && entered && phi.args.iter().all(|a| alike.contains(a)) {
+                if scalar(phi.reg)
+                    && (tracked(phi.value) || entered && phi.args.iter().all(|a| alike.contains(a)))
+                {
                     next.insert(phi.value);
                 } else if vector(phi.reg) && entered && phi.args.iter().all(|a| alike_v.contains(a))
                 {
@@ -475,10 +488,29 @@ pub(crate) fn step_and_cap_with(
                 let from_scalar = inst
                     .reads
                     .iter()
-                    .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
-                if from_scalar && !own(inst) {
-                    next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
-                    continue;
+                    .all(|&(r, v)| scalar(r) && (!mask(r) || tracked(v)) && alike.contains(&v));
+                let lane_read = st.literal
+                    && step[b]
+                    && match name {
+                        "v_readfirstlane_b32" => true,
+                        "v_readlane_b32" => {
+                            halves::uniform_selector(inst, &alike)
+                                && inst
+                                    .writes
+                                    .first()
+                                    .and_then(|w| st.restored.get(&w.1))
+                                    .is_none_or(|source| alike.contains(source))
+                        }
+                        _ => false,
+                    };
+                if from_scalar && !own(inst) || lane_read || st.literal {
+                    next.extend(inst.writes.iter().filter_map(|&(r, v)| {
+                        (scalar(r) && (tracked(v) || from_scalar && !own(inst) || lane_read))
+                            .then_some(v)
+                    }));
+                    if from_scalar && !own(inst) || lane_read {
+                        continue;
+                    }
                 }
                 // `v_readfirstlane_b32` of a group-uniform VGPR yields a
                 // group-uniform SGPR.
@@ -626,7 +658,7 @@ pub(crate) fn step_and_cap_with(
             }
         }
         if next.len() == alike.len() && next_v.len() == alike_v.len() {
-            return (step, escaped);
+            return (step, escaped, next);
         }
         alike = next;
         alike_v = next_v;
