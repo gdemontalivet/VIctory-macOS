@@ -69,6 +69,8 @@ pub mod list;
 #[cfg(all(windows, test))]
 mod list_bench;
 #[cfg(windows)]
+mod mac_pressure;
+#[cfg(windows)]
 mod memory;
 pub mod object;
 pub mod pipeline;

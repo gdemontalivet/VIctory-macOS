@@ -3755,12 +3755,29 @@ mod tests {
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
     }
 
-    /// Work to run while a view's texture is prepared, once (tests).
-    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+    std::thread_local! {
+        /// Work to run while a view's texture is prepared on this thread,
+        /// once (tests). Each test thread has its own: tests run at once,
+        /// and every test's heap syncs and mirrors pass through `prepare`.
+        /// One hook for the process ran a test's work on whichever thread
+        /// prepared a view first (the bench's syncs, thousands a second),
+        /// so the test went on without waiting for it.
+        static WHILE_PREPARING: std::cell::RefCell<Option<crate::descriptor::tests::Work>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Sets the work the next `prepare` on this thread runs.
+    fn when_preparing(work: impl FnOnce() + Send + 'static) {
+        WHILE_PREPARING.set(Some(Box::new(work)));
+    }
+
+    /// Whether this thread's `prepare` ran the work set (or none was set).
+    fn prepared() -> bool {
+        WHILE_PREPARING.with_borrow(Option::is_none)
+    }
 
     pub(crate) fn while_preparing() {
-        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(work) = work {
+        if let Some(work) = WHILE_PREPARING.take() {
             work();
         }
     }
@@ -3791,7 +3808,7 @@ mod tests {
             resource,
             0x10,
         );
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        when_preparing(move || {
             // The title's last reference goes while the view is being made.
             // The call must not wait for the make: this very thread is the
             // one making the view, so a wait would never end.
@@ -3805,10 +3822,10 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(released.join().unwrap(), 1, "the pin still holds it");
-        }));
+        });
 
         let view = heap.mirror(0, at, false).expect("the current view");
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(prepared(), "the prepare ran");
         assert!(heap.made(0), "the view was made from the live resource");
         assert!(
             crate::descriptor::view(at).is_some(),
@@ -3847,14 +3864,14 @@ mod tests {
         let host = title_heap.host().expect("a host view heap");
         let (done, waited) = std::sync::mpsc::channel();
         let second_view = view_of(second);
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        when_preparing(move || {
             // The title writes the other record into the slot meanwhile.
             std::thread::spawn(move || {
                 crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
                 done.send(()).unwrap();
             });
             assert!(waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the write waits");
-        }));
+        });
         // A draw reads the slot: its first record is prepared.
         assert!(host.mirror(s, at, true).is_some());
         let second_texture = crate::resource::texture_at(second, &words).expect("its resource");
@@ -3890,7 +3907,7 @@ mod tests {
         let heap_at = title_heap.start;
         let heap = heap as usize;
         let (done, waited) = std::sync::mpsc::channel();
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        when_preparing(move || {
             std::thread::spawn(move || {
                 let h = crate::descriptor::heap(heap as crate::object::This);
                 h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
@@ -3900,9 +3917,9 @@ mod tests {
                 waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
                 "a view bound while another slot's texture is made waits"
             );
-        }));
+        });
         assert!(host.mirror(first, slot(first), true).is_some());
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(prepared(), "the prepare ran");
         assert!(host.kept(first) && host.kept(second), "both made");
     }
 
@@ -4307,6 +4324,35 @@ mod tests {
         let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
         // SAFETY: non-zero size and power-of-two alignment; leaked for the test.
         unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+    }
+
+    /// `len` zeroed bytes that no other test's memory comes near for the
+    /// rest of the run: committed at the start of a reservation of 4 MiB
+    /// windows of its own (the windows `crate::shadow` copies loose memory
+    /// in), never freed. Memory from the process heap is handed to the next
+    /// test at the same address, which finds what the tables keyed by address
+    /// keep of the last one's (its placed textures, its views, the window
+    /// copies of its memory and their guards), and its memory shares those
+    /// windows with the tests running beside it.
+    fn private_memory(len: usize) -> &'static mut [u8] {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const WINDOW: usize = 4 << 20;
+        let span = len.next_multiple_of(WINDOW);
+        // SAFETY: a fresh reservation, never freed: one window more than
+        // `span`, so a whole aligned `span` lies inside it.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), span + WINDOW, MEM_RESERVE, PAGE_READWRITE) }
+                as usize;
+        assert_ne!(base, 0, "address space for the test's memory");
+        let start = base.next_multiple_of(WINDOW);
+        // SAFETY: inside the reservation above.
+        let at =
+            unsafe { VirtualAlloc(start as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(at, start, "the test's memory committed");
+        // SAFETY: `len` committed bytes (zeroed), used by the caller alone.
+        unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
     }
 
     fn placed_tex_desc(width: u64, height: u32, format: u32, flags: u32) -> [u32; 14] {
@@ -4894,16 +4940,16 @@ mod tests {
             expected_c.as_mut_ptr() as u64,
         );
         let expected_c_key = u64::from(expected_c[2]) << 32 | u64::from(expected_c[1]);
-        *WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+        when_preparing(move || {
             crate::descriptor::create_srv(
                 std::ptr::null(),
                 buf_c_addr as crate::object::This,
                 &srv_desc,
                 race_addr,
             );
-        }));
+        });
         host.sync_slots_bytes_with(0..128, start, 32, start, &title_heap[..128 * 32], true);
-        assert!(WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(prepared());
         assert_eq!(
             host.synced[race_slot as usize].load(Ordering::Acquire),
             expected_c_key,
@@ -4948,8 +4994,7 @@ mod tests {
         // Extra resource forgotten after benchmark to verify Views/HostHeap invalidation.
         let ephemeral = make_shadowed_buffer();
 
-        let tex_mem = vec![0u8; 1 << 16];
-        let tex_addr = tex_mem.as_ptr() as u64;
+        let tex_addr = private_memory(1 << 16).as_ptr() as u64;
         let tex_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
         let mut placed_records: Vec<[u32; 3]> = Vec::with_capacity(40);
         for k in 0..40u64 {
@@ -4994,24 +5039,24 @@ mod tests {
         };
 
         let build_heap = || {
-            let mut mem = vec![0u8; SLOTS as usize * 32];
+            let mem = private_memory(SLOTS as usize * 32);
             // 10,000 steady-state buffer views (real host SRVs), 20,000 steady-state
             // placed-texture-left-null slots (ready == 0, synced == key), 16 ephemeral
             // slots, remainder empty.
             for i in 0..10_000usize {
-                write_rec(&mut mem, i, buf_records[i % 75]);
+                write_rec(mem, i, buf_records[i % 75]);
             }
             for i in 0..20_000usize {
-                write_rec(&mut mem, 12_288 + i, placed_records[i % 20]);
+                write_rec(mem, 12_288 + i, placed_records[i % 20]);
             }
             for i in 0..16usize {
-                write_rec(&mut mem, 34_816 + i, eph_record);
+                write_rec(mem, 34_816 + i, eph_record);
             }
             mem
         };
 
-        let mut mem_legacy = build_heap();
-        let mut mem_fast = build_heap();
+        let mem_legacy = build_heap();
+        let mem_fast = build_heap();
 
         let sync_all_pages = |host: &HostHeap, mem: &[u8], fast: bool| {
             let start = mem.as_ptr() as u64;
@@ -5032,8 +5077,8 @@ mod tests {
         };
 
         // Initial warm sync so steady-state slots (including 20,000 placed-left-null) are populated.
-        sync_all_pages(&host_legacy, &mem_legacy, false);
-        sync_all_pages(&host_fast, &mem_fast, true);
+        sync_all_pages(&host_legacy, mem_legacy, false);
+        sync_all_pages(&host_fast, mem_fast, true);
         assert!(host_fast.kept(0), "benchmark buffer SRVs are real host views");
         assert!(!host_fast.kept(12_288), "placed textures remain null on sync");
 
@@ -5071,24 +5116,38 @@ mod tests {
         // Run legacy across 23 passes (1.5M scanned + ~39k stale) with a mid-run forget() epoch bump.
         let t_legacy = std::time::Instant::now();
         for pass in 0..PASSES {
-            mutate_pass(&mut mem_legacy, pass);
+            mutate_pass(mem_legacy, pass);
             if pass == PASSES / 2 {
                 crate::descriptor::forget(bump_legacy as usize);
             }
-            sync_all_pages(&host_legacy, &mem_legacy, false);
+            sync_all_pages(&host_legacy, mem_legacy, false);
         }
         let legacy_ms = t_legacy.elapsed().as_secs_f64() * 1000.0;
 
         // Run fast across identical 23 passes (1.5M scanned + ~39k stale) with identical forget() epoch bump.
         let t_fast = std::time::Instant::now();
         for pass in 0..PASSES {
-            mutate_pass(&mut mem_fast, pass);
+            mutate_pass(mem_fast, pass);
             if pass == PASSES / 2 {
                 crate::descriptor::forget(bump_fast as usize);
             }
-            sync_all_pages(&host_fast, &mem_fast, true);
+            sync_all_pages(&host_fast, mem_fast, true);
         }
         let fast_ms = t_fast.elapsed().as_secs_f64() * 1000.0;
+
+        // Both heaps' memory took the same writes: records that differ were
+        // written by something else, and the heaps' states differ with them.
+        if let Some(i) = mem_fast
+            .chunks(32)
+            .zip(mem_legacy.chunks(32))
+            .position(|(f, l)| f != l)
+        {
+            panic!(
+                "slot {i}'s record changed behind the bench: {:?} (fast) vs {:?} (legacy)",
+                &mem_fast[i * 32..i * 32 + 12],
+                &mem_legacy[i * 32..i * 32 + 12]
+            );
+        }
 
         // Verify identical final made/kept state across all 65,536 slots.
         for i in 0..SLOTS {
@@ -5098,8 +5157,8 @@ mod tests {
 
         // Now actually forget ephemeral and verify both clear slots 34,816..34,832.
         crate::descriptor::forget(ephemeral as usize);
-        sync_all_pages(&host_legacy, &mem_legacy, false);
-        sync_all_pages(&host_fast, &mem_fast, true);
+        sync_all_pages(&host_legacy, mem_legacy, false);
+        sync_all_pages(&host_fast, mem_fast, true);
         for i in 34_816..34_832u32 {
             assert!(!host_legacy.made(i));
             assert!(!host_fast.made(i));
@@ -5121,7 +5180,6 @@ mod tests {
         for b in buffers {
             crate::object::release(b);
         }
-        let _ = tex_mem.as_ptr();
     }
 
     /// Mismatched descriptor kinds (a sampler record in a CBV/SRV/UAV heap or
