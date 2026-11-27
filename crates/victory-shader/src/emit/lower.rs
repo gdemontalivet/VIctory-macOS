@@ -825,13 +825,7 @@ impl<'a> Lower<'a> {
             let mut max_primitives = ms.max_primitives;
             let declared =
                 super::MeshOutputs::of(&s.outputs, &s.prims, max_vertices, max_primitives);
-            let aligned = super::mesh_elements_aligned_bytes(
-                &s.outputs,
-                &s.prims,
-                max_vertices,
-                max_primitives,
-            );
-            if declared.bytes().max(aligned) > super::METAL_MESH_OUTPUT_BYTES {
+            if declared.bytes() > super::METAL_MESH_OUTPUT_BYTES {
                 max_vertices = max_vertices.min(ms.threads);
                 max_primitives = max_primitives.min(ms.threads);
             }

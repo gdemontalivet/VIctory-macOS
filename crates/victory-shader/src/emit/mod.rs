@@ -530,46 +530,6 @@ impl MeshOutputs {
     }
 }
 
-/// Aligned mesh output bytes for lowered signature slices, matching Apple
-/// Metal's layout: clip/cull distances (`4` B each), `SV_Position` (`16` B),
-/// then remaining allocated vertex outputs aligned to their own byte size
-/// (`4 * cols`), and allocated primitive outputs aligned likewise, multiplied
-/// by the declared maxima.
-pub(crate) fn mesh_elements_aligned_bytes(
-    outputs: &[container::SigElement],
-    prims: &[container::SigElement],
-    vertices: u32,
-    primitives: u32,
-) -> u32 {
-    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
-        sizes
-            .filter(|&size| size > 0)
-            .fold(0u32, |end, size| end.next_multiple_of(size) + size)
-    };
-    let distances: u32 = outputs
-        .iter()
-        .filter(|e| e.row.is_some() && matches!(e.kind, 6 | 7))
-        .map(|e| u32::from(e.cols))
-        .sum();
-    let vertex_bytes = layout(
-        &mut std::iter::repeat_n(4, distances as usize)
-            .chain([16])
-            .chain(
-                outputs
-                    .iter()
-                    .filter(|e| e.row.is_some() && !matches!(e.kind, 3 | 6 | 7))
-                    .map(|e| 4 * u32::from(e.cols)),
-            ),
-    );
-    let primitive_bytes = layout(
-        &mut prims
-            .iter()
-            .filter(|e| e.row.is_some())
-            .map(|e| 4 * u32::from(e.cols)),
-    );
-    vertices * vertex_bytes + primitives * primitive_bytes
-}
-
 /// Output bytes as Apple's Metal counts them for a translated mesh shader
 /// container (`OSG1`, `PSG1`, `PSV0`): per vertex, clip/cull distances,
 /// `SV_Position`, then remaining allocated outputs in signature order aligned
@@ -3095,16 +3055,20 @@ mod tests {
         assert_eq!(metal_mesh_output_bytes(&standalone.dxil), Some(aligned));
         assert!(aligned > METAL_MESH_OUTPUT_BYTES);
 
-        // If the next stage needs every component, pruning cannot make it safe.
+        // If the next stage needs every component nothing is pruned, but the
+        // repacking still orders the outputs by size, which removes the
+        // alignment holes: the layout then takes its packed size, over the
+        // limit only when the packed size is.
         let all_reads = widths
             .into_iter()
             .enumerate()
             .map(|(row, width)| (("TEXCOORD".into(), row as u32), (1 << width) - 1))
             .collect();
         let still_over = emit_pruned(&ms_in, Options::default(), Some(&all_reads)).unwrap();
+        assert_eq!(metal_mesh_output_bytes(&still_over.dxil), Some(packed));
         assert_eq!(
             over_limit_mesh_output_bytes(&still_over.dxil),
-            Some(aligned)
+            (packed > METAL_MESH_OUTPUT_BYTES).then_some(packed)
         );
 
         // Depth-only linking (no pixel shader) drops all arbitrary outputs.
