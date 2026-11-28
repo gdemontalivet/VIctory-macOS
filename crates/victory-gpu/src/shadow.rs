@@ -2027,9 +2027,13 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let mut map = buffers();
-    if let Some(entry) = map.remove(&(start, resource)) {
-        if entry.shadow.is_some() {
+    let removed = {
+        let mut map = buffers();
+        map.remove(&(start, resource))
+    };
+    if let Some(entry) = removed {
+        if let Some(shadow) = entry.shadow {
+            crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
             changed();
         } else {
             lookup_changed();
@@ -2090,13 +2094,21 @@ pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
 }
 
 pub(crate) fn unregister_aliased(start: u64) -> bool {
-    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
-    let removed = map.remove(&start).is_some();
-    if removed {
-        ALIASED_COUNT.fetch_sub(1, Ordering::Release);
+    let removed = {
+        let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+        let removed = map.remove(&start);
+        if removed.is_some() {
+            ALIASED_COUNT.fetch_sub(1, Ordering::Release);
+        }
+        removed
+    };
+    if let Some(shadow) = removed {
+        crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
         changed();
+        true
+    } else {
+        false
     }
-    removed
 }
 
 fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {

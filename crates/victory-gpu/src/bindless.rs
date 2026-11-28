@@ -9,7 +9,7 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, Mutex};
 
@@ -58,8 +58,14 @@ impl Viewed {
     /// Creates a bindless registry, optionally enabling the fast UAV range
     /// index and snapshot cache (`VICTORY_CENSUS_FAST=1`).
     pub(crate) fn new(fast: bool) -> Self {
+        Self::with_disjoint_spans(fast, crate::ranges::disjoint_spans_enabled())
+    }
+
+    /// Creates a bindless registry with explicit `VICTORY_CENSUS_FAST` (`fast`)
+    /// and `VICTORY_DISJOINT_SPANS` (`disjoint_spans`) settings.
+    pub(crate) fn with_disjoint_spans(fast: bool, disjoint_spans: bool) -> Self {
         Viewed {
-            inner: Mutex::new(Inner::new(fast)),
+            inner: Mutex::new(Inner::new(fast, disjoint_spans)),
             fast: fast.then(SnapshotCache::default),
             hull_generation: AtomicU64::new(0),
         }
@@ -69,13 +75,316 @@ impl Viewed {
     pub(crate) fn hull_generation(&self) -> u64 {
         self.hull_generation.load(Acquire)
     }
+
+    /// Sets or clears a buffer slot directly for unit tests without needing a
+    /// live title descriptor record.
+    #[cfg(test)]
+    pub(crate) fn set_buffer_slot(
+        &self,
+        index: u32,
+        entry: Option<(&Arc<Shadow>, u64, u64, bool)>,
+    ) {
+        let seen = entry.map(|(shadow, address, len, uav)| {
+            let len = len.min(shadow.left(address));
+            Seen::Buffer(shadow.clone(), address, len, uav)
+        });
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(next) = &seen
+            && inner
+                .slots
+                .get(&index)
+                .is_some_and(|old| same_buffer(old, next))
+        {
+            return;
+        }
+        let (mut unordered_changed, mut hulls_changed) = (false, false);
+        if let Some(old) = inner.slots.remove(&index) {
+            let (u, h) = inner.count(Some(index), &old, false);
+            unordered_changed |= u;
+            hulls_changed |= h;
+        }
+        if let Some(seen) = seen {
+            let (u, h) = inner.count(Some(index), &seen, true);
+            unordered_changed |= u;
+            hulls_changed |= h;
+            inner.slots.insert(index, seen);
+        }
+        if hulls_changed {
+            self.hull_generation.fetch_add(1, Release);
+        }
+        if unordered_changed
+            && let Some(fast) = &self.fast
+        {
+            fast.invalidate();
+        }
+    }
 }
 
 type Range = (usize, u64, u64, bool);
 
-/// A merged range: copy, start, bytes, unordered access, the copy's bit in
-/// the change tracker (`crate::watch::clean_bit`).
+/// A coalesced refresh span: copy, start, bytes, unordered access, the copy's
+/// bit in the change tracker (`crate::watch::clean_bit`).
+#[cfg(test)]
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
+
+/// Bucket granularity for [`CopySpans`] (`64 KiB`, matching `watch`'s guard
+/// page size). Tracking occupancy per 64 KiB page rather than per distinct
+/// buffer-view range keeps intra-page slot churn O(1) without setting `dirty`,
+/// and caps `recompute` work to O(occupied 64 KiB pages) instead of O(views).
+const CHUNK_SHIFT: u32 = 16;
+/// Maximum number of 64 KiB pages a range covers before it is stored directly
+/// in `CopySpans::large` instead of per-page buckets (`<= 512 KiB` stays
+/// bucketed, which covers >99.9% of heap buffer views).
+const MAX_SMALL_CHUNKS: u64 = 8;
+
+/// Ref-counted active range bounds within one 64 KiB page of a host copy.
+#[derive(Clone, Copy)]
+struct PageBucket {
+    count: u32,
+    min_lo: u64,
+    max_hi: u64,
+}
+
+/// Zero-allocation merge of two ascending `(from, to)` interval iterators.
+struct MergeIntervals<A: Iterator<Item = (u64, u64)>, B: Iterator<Item = (u64, u64)>> {
+    a: std::iter::Peekable<A>,
+    b: std::iter::Peekable<B>,
+}
+
+impl<A: Iterator<Item = (u64, u64)>, B: Iterator<Item = (u64, u64)>> Iterator
+    for MergeIntervals<A, B>
+{
+    type Item = (u64, u64);
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.a.peek(), self.b.peek()) {
+            (Some(&x), Some(&y)) => {
+                if x <= y {
+                    self.a.next()
+                } else {
+                    self.b.next()
+                }
+            }
+            (Some(_), None) => self.a.next(),
+            (None, Some(_)) => self.b.next(),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Active range contributions and lazily coalesced disjoint sub-intervals for
+/// one `(Shadow, uav)` pair.
+struct CopySpans {
+    shadow: Arc<Shadow>,
+    uav: bool,
+    bit: Option<u32>,
+    /// Exact ref-counted range starts/ends so global `(min, max)` stays
+    /// byte-exact in O(log R) without iterating all ranges, and removing a
+    /// boundary range tightens the outer span even within a single 64 KiB page.
+    starts: BTreeMap<u64, u32>,
+    ends: BTreeMap<u64, u32>,
+    /// Per-64 KiB page refcounts and tightest observed sub-page bounds for
+    /// ranges spanning `<= MAX_SMALL_CHUNKS` pages. Keys are `addr >> 16`, so
+    /// iterating `values()` yields intervals strictly ascending by `min_lo`.
+    chunks: BTreeMap<u64, PageBucket>,
+    /// Exact ref-counted ranges spanning `> MAX_SMALL_CHUNKS` pages (>512 KiB).
+    large: BTreeMap<(u64, u64), u32>,
+    /// Total distinct active ranges (from `Inner::ranges` `was == 0 <-> now == 0`),
+    /// including any zero-length ranges, so emptiness is O(1).
+    active_ranges: u32,
+    /// Heap slot indices currently referencing this `(shadow, uav)` in
+    /// `Inner::slots`, so evicting a dead copy touches only its `k` slots in
+    /// O(k) instead of scanning the entire heap.
+    slots: HashSet<u32>,
+    /// Coalesced disjoint `[from, to)` sub-intervals (recomputed lazily when `dirty`).
+    spans: Vec<(u64, u64)>,
+    /// Bytes excluded as holes relative to this copy's single `(min, max)` envelope.
+    #[cfg_attr(not(any(feature = "diagnostics", test)), allow(dead_code))]
+    hole_bytes: u64,
+    dirty: bool,
+}
+
+impl CopySpans {
+    fn new(shadow: Arc<Shadow>, uav: bool) -> Self {
+        let bit = shadow.dirty_bit();
+        Self {
+            shadow,
+            uav,
+            bit,
+            starts: BTreeMap::new(),
+            ends: BTreeMap::new(),
+            chunks: BTreeMap::new(),
+            large: BTreeMap::new(),
+            active_ranges: 0,
+            slots: HashSet::new(),
+            spans: Vec::new(),
+            hole_bytes: 0,
+            dirty: true,
+        }
+    }
+
+    fn covers(&self, from: u64, to: u64) -> bool {
+        self.spans.iter().any(|&(a, b)| a <= from && to <= b)
+    }
+
+    /// Records a newly active distinct range `[from, to)`. Returns `true` only
+    /// if the coalesced refresh spans can change (keeping interior edits within
+    /// existing spans/buckets generation-neutral per #613).
+    fn add_range(&mut self, from: u64, to: u64, disjoint_spans: bool) -> bool {
+        let was_empty = self.active_ranges == 0;
+        let prev_lo = self.starts.first_key_value().map(|(&k, _)| k);
+        let prev_hi = self.ends.last_key_value().map(|(&k, _)| k);
+        self.active_ranges += 1;
+        tally(&mut self.starts, from, true);
+        tally(&mut self.ends, to, true);
+        let outer_changed = self.starts.first_key_value().map(|(&k, _)| k) != prev_lo
+            || self.ends.last_key_value().map(|(&k, _)| k) != prev_hi;
+        if from >= to {
+            if was_empty {
+                self.dirty = true;
+            }
+            return was_empty;
+        }
+        let p0 = from >> CHUNK_SHIFT;
+        let p1 = (to - 1) >> CHUNK_SHIFT;
+        let span_grew = if p1 - p0 < MAX_SMALL_CHUNKS {
+            let mut grew = false;
+            for p in p0..=p1 {
+                let page_lo = p << CHUNK_SHIFT;
+                let page_hi = (p + 1) << CHUNK_SHIFT;
+                let lo = from.max(page_lo);
+                let hi = to.min(page_hi);
+                match self.chunks.get_mut(&p) {
+                    Some(b) => {
+                        b.count += 1;
+                        if lo < b.min_lo {
+                            b.min_lo = lo;
+                            grew = true;
+                        }
+                        if hi > b.max_hi {
+                            b.max_hi = hi;
+                            grew = true;
+                        }
+                    }
+                    None => {
+                        self.chunks.insert(
+                            p,
+                            PageBucket {
+                                count: 1,
+                                min_lo: lo,
+                                max_hi: hi,
+                            },
+                        );
+                        grew = true;
+                    }
+                }
+            }
+            grew
+        } else {
+            let cnt = self.large.entry((from, to)).or_insert(0);
+            let inserted = *cnt == 0;
+            *cnt += 1;
+            inserted
+        };
+        let changed = if !disjoint_spans {
+            was_empty || outer_changed
+        } else {
+            was_empty || (span_grew && (self.dirty || !self.covers(from, to)))
+        };
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Removes a distinct range `[from, to)` whose refcount hit zero. Returns
+    /// `(remove_copy, spans_changed)` so interior edits within occupied page
+    /// buckets keep `hull_generation` steady (#613).
+    fn remove_range(&mut self, from: u64, to: u64, disjoint_spans: bool) -> (bool, bool) {
+        self.active_ranges = self.active_ranges.saturating_sub(1);
+        let prev_lo = self.starts.first_key_value().map(|(&k, _)| k);
+        let prev_hi = self.ends.last_key_value().map(|(&k, _)| k);
+        tally(&mut self.starts, from, false);
+        tally(&mut self.ends, to, false);
+        let outer_changed = self.starts.first_key_value().map(|(&k, _)| k) != prev_lo
+            || self.ends.last_key_value().map(|(&k, _)| k) != prev_hi;
+        let mut bucket_changed = false;
+        if from < to {
+            let p0 = from >> CHUNK_SHIFT;
+            let p1 = (to - 1) >> CHUNK_SHIFT;
+            if p1 - p0 < MAX_SMALL_CHUNKS {
+                for p in p0..=p1 {
+                    let remove_page = if let Some(b) = self.chunks.get_mut(&p) {
+                        b.count = b.count.saturating_sub(1);
+                        b.count == 0
+                    } else {
+                        false
+                    };
+                    if remove_page {
+                        self.chunks.remove(&p);
+                        bucket_changed = true;
+                    }
+                }
+            } else if let Some(cnt) = self.large.get_mut(&(from, to)) {
+                *cnt = cnt.saturating_sub(1);
+                if *cnt == 0 {
+                    self.large.remove(&(from, to));
+                    bucket_changed = true;
+                }
+            }
+        }
+        let empty = self.active_ranges == 0;
+        let changed = if !disjoint_spans {
+            empty || outer_changed
+        } else {
+            empty || outer_changed || bucket_changed
+        };
+        if changed {
+            self.dirty = true;
+        }
+        (empty, changed)
+    }
+
+    fn recompute(&mut self, disjoint_spans: bool) {
+        let Some(((&min_lo, _), (&max_hi, _))) =
+            self.starts.first_key_value().zip(self.ends.last_key_value())
+        else {
+            self.spans.clear();
+            self.hole_bytes = 0;
+            self.dirty = false;
+            return;
+        };
+        if !disjoint_spans {
+            self.spans.clear();
+            if min_lo < max_hi {
+                self.spans.push((min_lo, max_hi));
+            }
+            self.hole_bytes = 0;
+            self.dirty = false;
+            return;
+        }
+        let merged = MergeIntervals {
+            a: self
+                .chunks
+                .values()
+                .map(|b| (b.min_lo.max(min_lo), b.max_hi.min(max_hi)))
+                .filter(|&(a, b)| a < b)
+                .peekable(),
+            b: self.large.keys().copied().peekable(),
+        };
+        self.spans = crate::ranges::coalesce_intervals(
+            merged,
+            crate::ranges::MERGE_GAP_BYTES,
+            crate::ranges::MAX_INTERVALS_PER_COPY,
+        );
+        let covered: u64 = self.spans.iter().map(|&(a, b)| b - a).sum();
+        let envelope = match (self.spans.first(), self.spans.last()) {
+            (Some(&(lo, _)), Some(&(_, hi))) => hi.saturating_sub(lo),
+            _ => 0,
+        };
+        self.hole_bytes = envelope.saturating_sub(covered);
+        self.dirty = false;
+    }
+}
 
 /// One non-empty 64-tracker word of `watch::DIRTY` referenced by `Inner::hulls`,
 /// holding the bitmask of active tracker bits and the sorted `(bit_offset, hull_idx)`
@@ -92,37 +401,32 @@ struct Inner {
     /// Per title texture, the slots viewing it: an entry names its slots, so
     /// releasing the texture ([`Inner::forget`]) does not search the heap.
     textures: BTreeMap<usize, BTreeSet<u32>>,
-    /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
-    /// as ranges come and go (each list running heap shaders asks for all
-    /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
-    /// run perf4). Stored densely so `refresh` indexes directly without hashing.
-    hulls: Vec<Hull>,
+    /// Per `(copy, uav)` disjoint refresh sub-intervals (`CopySpans`), kept
+    /// incrementally and coalesced lazily only when read. Stored densely so
+    /// `refresh` indexes directly without hashing.
+    hulls: Vec<CopySpans>,
     /// Maps `(copy_ptr, uav)` to its dense index in `hulls`.
     hull_pos: HashMap<(usize, bool), u32>,
     /// Sorted by `word`; lets `refresh` test 64 copies per atomic word load
     /// and index `hulls` directly with zero hash lookups.
     active_words: Vec<ActiveWord>,
     /// Indices into `hulls` whose `Shadow` has no `watch::DIRTY` bit
-    /// (`bit == None`: untracked buffers and zero-copy aliased shadows).
+    /// (`bit == None`: untracked buffers and zero-copy aliased/tiled shadows).
     untracked_hulls: Vec<u32>,
-    /// Per copy and kind (unordered access): the copy, and how many ranges
-    /// start and end at each offset, so that the hulls are made from the
-    /// copies, not from every range (the title rewrites slots between most
-    /// lists, and remerging the world's 130,000 ranges each time cost 0.15
-    /// s per frame).
-    ends: HashMap<(usize, bool), Ends>,
     /// Secondary index of active UAV ranges only (`VICTORY_CENSUS_FAST=1`).
     unordered: Option<UnorderedIndex<Shadow>>,
+    /// Whether >256 KiB gaps stay split (`VICTORY_DISJOINT_SPANS`).
+    disjoint_spans: bool,
 }
 
 impl Default for Inner {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, crate::ranges::disjoint_spans_enabled())
     }
 }
 
 impl Inner {
-    fn new(fast: bool) -> Self {
+    fn new(fast: bool, disjoint_spans: bool) -> Self {
         Inner {
             slots: HashMap::new(),
             ranges: BTreeMap::new(),
@@ -131,14 +435,22 @@ impl Inner {
             hull_pos: HashMap::new(),
             active_words: Vec::new(),
             untracked_hulls: Vec::new(),
-            ends: HashMap::new(),
             unordered: fast.then(UnorderedIndex::new),
+            disjoint_spans,
         }
     }
 }
 
-/// A copy, and the counts of its ranges' starts and ends.
-type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
+/// Whether two `Seen` entries name the exact same buffer shadow, byte range,
+/// and access kind (so overwriting a slot with an identical buffer view is a
+/// no-op).
+fn same_buffer(a: &Seen, b: &Seen) -> bool {
+    matches!(
+        (a, b),
+        (Seen::Buffer(sa, aa, la, ua), Seen::Buffer(sb, ab, lb, ub))
+            if Arc::ptr_eq(sa, sb) && aa == ab && la == lb && ua == ub
+    )
+}
 
 /// One more (`add`) or one fewer of `at` in `counts`.
 fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
@@ -239,7 +551,7 @@ impl Inner {
 
     /// Updates range, hull, texture, and (when enabled) UAV-index counts for
     /// one slot transition. Returns `(unordered_changed, hulls_changed)`.
-    fn count(&mut self, index: u32, seen: &Seen, add: bool) -> (bool, bool) {
+    fn count(&mut self, slot: Option<u32>, seen: &Seen, add: bool) -> (bool, bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         let mut unordered_changed = false;
         let mut hulls_changed = false;
@@ -264,70 +576,93 @@ impl Inner {
                     }
                     unordered_changed = true;
                 }
-                // A range came or went: its copy's hull may change.
-                if (was == 0) != (now == 0) {
-                    let hull_key = (key.0, key.3);
-                    let ends = self
-                        .ends
-                        .entry(hull_key)
-                        .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
-                    tally(&mut ends.1, key.1, now > 0);
-                    tally(&mut ends.2, key.2, now > 0);
-                    let hull = match (ends.1.first_key_value(), ends.2.last_key_value()) {
-                        (Some((&from, _)), Some((&to, _))) => Some((from, to - from)),
-                        _ => None,
-                    };
-                    match hull {
-                        Some((from, len)) => {
-                            if let Some(&idx) = self.hull_pos.get(&hull_key) {
-                                let hull = &mut self.hulls[idx as usize];
-                                // The refresh pass uses the hull, not its
-                                // individual ranges. Interior changes still
-                                // update the UAV index above.
-                                if (hull.1, hull.2) != (from, len) {
-                                    (hull.1, hull.2) = (from, len);
-                                    hulls_changed = true;
-                                }
-                            } else {
-                                let bit = shadow.dirty_bit();
-                                let idx = self.hulls.len() as u32;
-                                self.hulls.push((shadow.clone(), from, len, key.3, bit));
-                                self.hull_pos.insert(hull_key, idx);
-                                self.insert_hull_index(idx, bit);
-                                hulls_changed = true;
-                            }
-                        }
+                let hull_key = (key.0, key.3);
+                let disjoint = self.disjoint_spans;
+                if add {
+                    let idx = match self.hull_pos.get(&hull_key) {
+                        Some(&idx) => idx,
                         None => {
-                            self.ends.remove(&hull_key);
-                            if let Some(idx) = self.hull_pos.remove(&hull_key) {
-                                let last_idx = (self.hulls.len() - 1) as u32;
-                                let removed = self.hulls.swap_remove(idx as usize);
-                                self.remove_hull_index(idx, removed.4);
-                                if idx != last_idx {
-                                    let moved = &self.hulls[idx as usize];
-                                    let moved_key = (Arc::as_ptr(&moved.0) as usize, moved.3);
-                                    let moved_bit = moved.4;
-                                    self.hull_pos.insert(moved_key, idx);
-                                    self.move_hull_index(moved_bit, last_idx, idx);
-                                }
-                                hulls_changed = true;
-                            }
+                            let entry = CopySpans::new(shadow.clone(), key.3);
+                            let bit = entry.bit;
+                            let idx = self.hulls.len() as u32;
+                            self.hulls.push(entry);
+                            self.hull_pos.insert(hull_key, idx);
+                            self.insert_hull_index(idx, bit);
+                            idx
+                        }
+                    };
+                    let entry = &mut self.hulls[idx as usize];
+                    if let Some(index) = slot {
+                        entry.slots.insert(index);
+                    }
+                    if was == 0 && now > 0 {
+                        hulls_changed |= entry.add_range(key.1, key.2, disjoint);
+                    }
+                } else if let Some(&idx) = self.hull_pos.get(&hull_key) {
+                    let mut remove_copy = false;
+                    {
+                        let entry = &mut self.hulls[idx as usize];
+                        if let Some(index) = slot {
+                            entry.slots.remove(&index);
+                        }
+                        if was > 0 && now == 0 {
+                            let (empty, changed) = entry.remove_range(key.1, key.2, disjoint);
+                            remove_copy = empty;
+                            hulls_changed |= changed;
+                        }
+                    }
+                    if remove_copy {
+                        self.hull_pos.remove(&hull_key);
+                        let last_idx = (self.hulls.len() - 1) as u32;
+                        let removed = self.hulls.swap_remove(idx as usize);
+                        self.remove_hull_index(idx, removed.bit);
+                        if idx != last_idx {
+                            let moved = &self.hulls[idx as usize];
+                            let moved_key = (Arc::as_ptr(&moved.shadow) as usize, moved.uav);
+                            let moved_bit = moved.bit;
+                            self.hull_pos.insert(moved_key, idx);
+                            self.move_hull_index(moved_bit, last_idx, idx);
                         }
                     }
                 }
             }
             Seen::Texture(r) => {
-                let slots = self.textures.entry(*r).or_default();
-                if add {
-                    slots.insert(index);
-                } else {
-                    slots.remove(&index);
-                }
-                if slots.is_empty() {
-                    self.textures.remove(r);
+                if let Some(index) = slot {
+                    let slots = self.textures.entry(*r).or_default();
+                    if add {
+                        slots.insert(index);
+                    } else {
+                        slots.remove(&index);
+                    }
+                    if slots.is_empty() {
+                        self.textures.remove(r);
+                    }
                 }
             }
             Seen::Left(_) => {}
+        }
+        (unordered_changed, hulls_changed)
+    }
+
+    /// Evicts all heap slots referencing `copy_ptr` in O(k) using
+    /// `CopySpans::slots` without scanning `self.slots`.
+    fn forget_copy(&mut self, copy_ptr: usize) -> (bool, bool) {
+        let mut stale = Vec::new();
+        for uav in [false, true] {
+            if let Some(&idx) = self.hull_pos.get(&(copy_ptr, uav)) {
+                stale.extend(self.hulls[idx as usize].slots.iter().copied());
+            }
+        }
+        if stale.is_empty() {
+            return (false, false);
+        }
+        let (mut unordered_changed, mut hulls_changed) = (false, false);
+        for slot in stale {
+            if let Some(old) = self.slots.remove(&slot) {
+                let (u, h) = self.count(Some(slot), &old, false);
+                unordered_changed |= u;
+                hulls_changed |= h;
+            }
         }
         (unordered_changed, hulls_changed)
     }
@@ -353,14 +688,22 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(next) = &seen
+            && inner
+                .slots
+                .get(&index)
+                .is_some_and(|old| same_buffer(old, next))
+        {
+            return;
+        }
         let (mut unordered_changed, mut hulls_changed) = (false, false);
         if let Some(old) = inner.slots.remove(&index) {
-            let (u, h) = inner.count(index, &old, false);
+            let (u, h) = inner.count(Some(index), &old, false);
             unordered_changed |= u;
             hulls_changed |= h;
         }
         if let Some(seen) = seen {
-            let (u, h) = inner.count(index, &seen, true);
+            let (u, h) = inner.count(Some(index), &seen, true);
             unordered_changed |= u;
             hulls_changed |= h;
             inner.slots.insert(index, seen);
@@ -407,13 +750,21 @@ impl Viewed {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let (mut unordered_changed, mut hulls_changed) = (false, false);
         for (index, entry) in entries {
+            if let Some(next) = &entry
+                && inner
+                    .slots
+                    .get(&index)
+                    .is_some_and(|old| same_buffer(old, next))
+            {
+                continue;
+            }
             if let Some(old) = inner.slots.remove(&index) {
-                let (u, h) = inner.count(index, &old, false);
+                let (u, h) = inner.count(Some(index), &old, false);
                 unordered_changed |= u;
                 hulls_changed |= h;
             }
             if let Some(entry) = entry {
-                let (u, h) = inner.count(index, &entry, true);
+                let (u, h) = inner.count(Some(index), &entry, true);
                 unordered_changed |= u;
                 hulls_changed |= h;
                 inner.slots.insert(index, entry);
@@ -438,7 +789,7 @@ impl Viewed {
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .count(u32::MAX, &seen, true); // no slot: only textures name theirs
+            .count(None, &seen, true);
         if hulls_changed {
             self.hull_generation.fetch_add(1, Release);
         }
@@ -449,11 +800,29 @@ impl Viewed {
         }
     }
 
-    /// The buffer ranges views reach, merged per host copy and kind
-    /// (shader resource, unordered access): copy, start, bytes.
-    #[cfg(any(test, feature = "diagnostics"))]
+    /// The buffer ranges views reach, coalesced per host copy and kind
+    /// (shader resource, unordered access) with >256 KiB holes kept disjoint:
+    /// copy, start, bytes, uav, dirty bit.
+    #[cfg(test)]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.clone()
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let disjoint = inner.disjoint_spans;
+        let mut out = Vec::with_capacity(inner.hulls.len());
+        for entry in &mut inner.hulls {
+            if entry.dirty {
+                entry.recompute(disjoint);
+            }
+            for &(from, to) in &entry.spans {
+                out.push((
+                    entry.shadow.clone(),
+                    from,
+                    to - from,
+                    entry.uav,
+                    entry.bit,
+                ));
+            }
+        }
+        out
     }
 
     /// Snapshot of distinct title texture resources currently viewed by this
@@ -749,30 +1118,45 @@ impl Drop for Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let emit = |(shadow, address, len, uav, _): &Hull,
+    let emit = |entry: &mut CopySpans,
+                disjoint: bool,
                 add: &mut dyn FnMut(&Arc<Shadow>, usize, usize)| {
-        // Aliased zero-copy shadows have `dirty_bit() == None` and live in
+        // Aliased/tiled zero-copy shadows have `dirty_bit() == None` and live in
         // `untracked_hulls`, yet report `clean() == true` unless widened:
-        // skip `page_range` and `Batch::add` for clean shadows.
-        if shadow.clean() {
+        // skip coalescing, `page_range`, and `Batch::add` for clean shadows.
+        if entry.shadow.clean() {
             return;
         }
-        let (address, len) = if *uav && shadow.marked() {
-            shadow.page_range(*address, *len)
-        } else {
-            (*address, *len)
-        };
-        add(shadow, address as usize, len as usize);
+        if entry.dirty {
+            entry.recompute(disjoint);
+        }
+        for &(from, to) in &entry.spans {
+            let len = to - from;
+            let (address, len) = if entry.uav && entry.shadow.marked() {
+                entry.shadow.page_range(from, len)
+            } else {
+                (from, len)
+            };
+            add(&entry.shadow, address as usize, len as usize);
+        }
     };
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for aw in &inner.active_words {
+    let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Inner {
+        active_words,
+        untracked_hulls,
+        hulls,
+        disjoint_spans,
+        ..
+    } = &mut *inner;
+    let disjoint = *disjoint_spans;
+    for aw in active_words.iter() {
         let mut dirty = crate::watch::dirty_word(aw.word as usize) & aw.mask;
         if dirty == 0 {
             continue;
         }
         if dirty == aw.mask {
             for &(_, idx) in &aw.entries {
-                emit(&inner.hulls[idx as usize], &mut add);
+                emit(&mut hulls[idx as usize], disjoint, &mut add);
             }
             continue;
         }
@@ -785,19 +1169,19 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
                     if o != off {
                         break;
                     }
-                    emit(&inner.hulls[idx as usize], &mut add);
+                    emit(&mut hulls[idx as usize], disjoint, &mut add);
                 }
             }
         } else {
             for &(off, idx) in &aw.entries {
                 if dirty & (1u64 << off) != 0 {
-                    emit(&inner.hulls[idx as usize], &mut add);
+                    emit(&mut hulls[idx as usize], disjoint, &mut add);
                 }
             }
         }
     }
-    for &idx in &inner.untracked_hulls {
-        emit(&inner.hulls[idx as usize], &mut add);
+    for &idx in untracked_hulls.iter() {
+        emit(&mut hulls[idx as usize], disjoint, &mut add);
     }
 }
 
@@ -817,14 +1201,20 @@ pub(crate) fn refresh_slot(
     }
 }
 
-/// Each copy the heap views for unordered access, with the range of it
+/// Each copy the heap views for unordered access, with the ranges of it
 /// its views reach (address, bytes): what the heap's shaders may write with
 /// no list declaring it.
 pub(crate) fn written_ranges(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, uav, _) in &inner.hulls {
-        if *uav {
-            each(shadow, *address as usize, *len as usize);
+    let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let disjoint = inner.disjoint_spans;
+    for entry in &mut inner.hulls {
+        if entry.uav {
+            if entry.dirty {
+                entry.recompute(disjoint);
+            }
+            for &(from, to) in &entry.spans {
+                each(&entry.shadow, from as usize, (to - from) as usize);
+            }
         }
     }
 }
@@ -927,6 +1317,27 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// A buffer's host copy (`copy_ptr = Arc::as_ptr(&shadow) as usize`) was
+/// unregistered: evict only its `k` referencing slots in O(k) from every live
+/// view heap so dead shadows are never retained or refreshed.
+pub(crate) fn forget_shadow(copy_ptr: usize) {
+    let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
+        let (unordered_changed, hulls_changed) = {
+            let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.forget_copy(copy_ptr)
+        };
+        if hulls_changed {
+            viewed.hull_generation.fetch_add(1, Release);
+        }
+        if unordered_changed
+            && let Some(fast) = &viewed.fast
+        {
+            fast.invalidate();
+        }
+    }
+}
+
 /// Logs, per frame over `frames`, the heap-indexed draws, and what the
 /// view heaps' slots view (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -936,7 +1347,7 @@ pub(crate) fn log(frames: f64) {
     let [forgotten, taken] = [0, 1].map(|i| FORGOTTEN[i].swap(0, Relaxed) as f64 / frames);
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut left = [0u32; KINDS.len()];
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
@@ -956,11 +1367,21 @@ pub(crate) fn log(frames: f64) {
         }
         let placed_mb = placed.values().sum::<u64>() as f64 / 1e6;
         let bytes: u64 = inner.ranges.keys().map(|&(_, a, b, _)| b - a).sum();
-        drop(inner);
-        let hulls = viewed.ranges();
-        let uav_hulls: u64 = hulls.iter().filter(|r| r.3).map(|r| r.2).sum();
-        let all_hulls: u64 = hulls.iter().map(|r| r.2).sum();
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let disjoint = inner.disjoint_spans;
+        let (mut all_hulls, mut uav_hulls, mut hole_bytes, mut span_count) =
+            (0u64, 0u64, 0u64, 0usize);
+        for entry in &mut inner.hulls {
+            if entry.dirty {
+                entry.recompute(disjoint);
+            }
+            hole_bytes = hole_bytes.saturating_add(entry.hole_bytes);
+            span_count += entry.spans.len();
+            let entry_bytes: u64 = entry.spans.iter().map(|&(a, b)| b - a).sum();
+            all_hulls = all_hulls.saturating_add(entry_bytes);
+            if entry.uav {
+                uav_hulls = uav_hulls.saturating_add(entry_bytes);
+            }
+        }
         let copies = {
             let mut c: Vec<usize> = inner.ranges.keys().map(|k| k.0).collect();
             c.dedup();
@@ -975,7 +1396,7 @@ pub(crate) fn log(frames: f64) {
              ({taken:.1} slots); slots: {buffers} buffer views ({} ranges, \
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
              left null: {} (placed textures at {} addresses, {placed_mb:.0} MB); \
-             host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
+             host copies of title memory: {} ({:.1} MB); hulls {:.1} MB ({span_count} spans, holes {:.1} MB), unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,
             inner.textures.len(),
@@ -984,6 +1405,7 @@ pub(crate) fn log(frames: f64) {
             all.len(),
             all_bytes as f64 / 1e6,
             all_hulls as f64 / 1e6,
+            hole_bytes as f64 / 1e6,
             uav_hulls as f64 / 1e6
         );
     }
@@ -1090,11 +1512,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let set = |slot: u32, range: Option<(u64, u64)>| {
             let mut inner = viewed.inner.lock().unwrap();
             if let Some(old) = inner.slots.remove(&slot) {
-                inner.count(slot, &old, false);
+                inner.count(Some(slot), &old, false);
             }
             if let Some((from, len)) = range {
                 let seen = Seen::Buffer(copy.clone(), at + from, len, false);
-                inner.count(slot, &seen, true);
+                inner.count(Some(slot), &seen, true);
                 inner.slots.insert(slot, seen);
             }
         };
@@ -1165,11 +1587,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             let mut inner = viewed.inner.lock().unwrap();
             let mut hulls_changed = false;
             if let Some(old) = inner.slots.remove(&slot) {
-                hulls_changed |= inner.count(slot, &old, false).1;
+                hulls_changed |= inner.count(Some(slot), &old, false).1;
             }
             if let Some((copy, addr, len, uav)) = entry {
                 let seen = Seen::Buffer(copy.clone(), addr, len, uav);
-                hulls_changed |= inner.count(slot, &seen, true).1;
+                hulls_changed |= inner.count(Some(slot), &seen, true).1;
                 inner.slots.insert(slot, seen);
             }
             if hulls_changed {
@@ -1298,7 +1720,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             (2, Seen::Texture(0x10)),
             (3, Seen::Left((0, 0, 0))),
         ] {
-            inner.count(slot, &seen, true);
+            inner.count(Some(slot), &seen, true);
             inner.slots.insert(slot, seen);
         }
         inner.forget(0x10);
@@ -1748,5 +2170,162 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::object::release_ref(dst);
         crate::object::release_ref(tex_c);
         crate::watch::tests::free(pool);
+    }
+
+    /// Endpoint views separated by >256 KiB on a large buffer stay disjoint,
+    /// preserve `hull_generation` across interior view edits (#613) while
+    /// bumping it on hole fills or tail removals, shrink cleanly when the tail
+    /// slot is cleared, and collapse to a single `(min, max)` envelope when
+    /// `VICTORY_DISJOINT_SPANS=0`.
+    #[test]
+    fn disjoint_intervals_skip_large_hole_preserve_interior_generation_and_gate() {
+        const SIZE: usize = 2 << 20; // 2 MiB (> 256 KiB merge gap)
+        let memory = vec![0u8; SIZE];
+        let at = memory.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, SIZE as u64);
+        let Some(copy) = crate::shadow::find(at, SIZE as u64) else {
+            crate::shadow::unregister(at as usize, at);
+            return; // no host GPU here
+        };
+
+        for (label, viewed) in [
+            ("standard+disjoint", Viewed::with_disjoint_spans(false, true)),
+            ("census_fast+disjoint", Viewed::with_disjoint_spans(true, true)),
+        ] {
+            viewed.set_buffer_slot(1, Some((&copy, at, 4096, false)));
+            viewed.set_buffer_slot(2, Some((&copy, at + 32 * 1024, 4096, false)));
+            viewed.set_buffer_slot(3, Some((&copy, at + SIZE as u64 - 4096, 4096, false)));
+
+            let mut emitted = Vec::new();
+            refresh(&viewed, |_, a, l| emitted.push((a as u64 - at, l as u64)));
+            emitted.sort_unstable();
+            assert_eq!(
+                emitted,
+                vec![(0, 36 * 1024), (SIZE as u64 - 4096, 4096)],
+                "{label}: middle hole must stay excluded"
+            );
+            {
+                let inner = viewed.inner.lock().unwrap();
+                assert_eq!(inner.hulls.len(), 1);
+                assert_eq!(inner.hulls[0].hole_bytes, SIZE as u64 - 40 * 1024);
+            }
+
+            // Interior edit inside an existing span keeps hull_generation steady (#613).
+            let gen_before_interior = viewed.hull_generation();
+            viewed.set_buffer_slot(4, Some((&copy, at + 512, 1024, false)));
+            assert_eq!(
+                viewed.hull_generation(),
+                gen_before_interior,
+                "{label}: interior add must not bump hull_generation"
+            );
+            viewed.set_buffer_slot(4, None);
+            assert_eq!(
+                viewed.hull_generation(),
+                gen_before_interior,
+                "{label}: interior remove must not bump hull_generation"
+            );
+
+            // Adding a range inside the >256 KiB middle hole must bump hull_generation.
+            viewed.set_buffer_slot(5, Some((&copy, at + (1 << 20), 4096, false)));
+            assert!(
+                viewed.hull_generation() > gen_before_interior,
+                "{label}: range inside hole must bump hull_generation"
+            );
+            viewed.set_buffer_slot(5, None);
+
+            // Clearing the tail slot shrinks back to just the head sub-interval.
+            viewed.set_buffer_slot(3, None);
+            let mut after = Vec::new();
+            refresh(&viewed, |_, a, l| after.push((a as u64 - at, l as u64)));
+            assert_eq!(after, vec![(0, 36 * 1024)], "{label}: shrinks on tail clear");
+            assert_eq!(viewed.inner.lock().unwrap().hulls[0].hole_bytes, 0);
+        }
+
+        // `VICTORY_DISJOINT_SPANS=0` falls back to a single `(min, max)` envelope
+        // and keeps interior edits generation-neutral.
+        let flat = Viewed::with_disjoint_spans(true, false);
+        flat.set_buffer_slot(1, Some((&copy, at, 4096, false)));
+        flat.set_buffer_slot(2, Some((&copy, at + 32 * 1024, 4096, false)));
+        flat.set_buffer_slot(3, Some((&copy, at + SIZE as u64 - 4096, 4096, false)));
+        let flat_gen = flat.hull_generation();
+        flat.set_buffer_slot(4, Some((&copy, at + (1 << 20), 4096, false)));
+        assert_eq!(
+            flat.hull_generation(),
+            flat_gen,
+            "single-envelope interior edit must keep hull_generation steady"
+        );
+        flat.set_buffer_slot(4, None);
+        assert_eq!(flat.hull_generation(), flat_gen);
+        let mut flat_emitted = Vec::new();
+        refresh(&flat, |_, a, l| flat_emitted.push((a as u64 - at, l as u64)));
+        assert_eq!(
+            flat_emitted,
+            vec![(0, SIZE as u64)],
+            "VICTORY_DISJOINT_SPANS=0 must preserve single (min, max) envelope"
+        );
+
+        drop(flat);
+        drop(copy);
+        crate::shadow::unregister(at as usize, at);
+    }
+
+    /// Evicting an unregistered shadow removes only its `k` associated slots in
+    /// O(k) via `CopySpans::slots`, tracks slot reassignments without stale
+    /// entries, and keeps live copies' slots and spans intact.
+    #[test]
+    fn dead_copy_eviction_targets_only_associated_slots() {
+        let mem_live = vec![0u8; 0x10_000];
+        let mem_dead = vec![0u8; 0x10_000];
+        let at_live = mem_live.as_ptr() as u64;
+        let at_dead = mem_dead.as_ptr() as u64;
+        crate::shadow::register(at_live as usize, at_live, 0x10_000);
+        crate::shadow::register(at_dead as usize, at_dead, 0x10_000);
+        let (Some(live), Some(dead)) = (
+            crate::shadow::find(at_live, 0x10_000),
+            crate::shadow::find(at_dead, 0x10_000),
+        ) else {
+            crate::shadow::unregister(at_live as usize, at_live);
+            crate::shadow::unregister(at_dead as usize, at_dead);
+            return;
+        };
+
+        let viewed = Arc::new(Viewed::with_disjoint_spans(true, true));
+        register(&viewed);
+
+        // Place slots across a wide sparse index space.
+        viewed.set_buffer_slot(10, Some((&live, at_live + 0x1000, 0x1000, false)));
+        viewed.set_buffer_slot(500_000, Some((&dead, at_dead + 0x3000, 0x1000, false)));
+        viewed.set_buffer_slot(900_000, Some((&dead, at_dead + 0x5000, 0x1000, false)));
+        // Reassign slot 900_000 from `dead` to `live`: `dead` must keep only slot 500_000.
+        viewed.set_buffer_slot(900_000, Some((&live, at_live + 0x7000, 0x1000, false)));
+
+        let gen_before = viewed.hull_generation();
+        let dead_ptr = Arc::as_ptr(&dead) as usize;
+        drop(dead);
+        // Unregistering `dead` invokes `bindless::forget_shadow(dead_ptr)` in O(k).
+        crate::shadow::unregister(at_dead as usize, at_dead);
+
+        assert!(
+            viewed.hull_generation() > gen_before,
+            "evicting a dead copy must bump hull_generation"
+        );
+        {
+            let inner = viewed.inner.lock().unwrap();
+            assert!(!inner.slots.contains_key(&500_000), "dead slot evicted");
+            assert!(inner.slots.contains_key(&10), "live slot 10 preserved");
+            assert!(
+                inner.slots.contains_key(&900_000),
+                "reassigned slot 900_000 preserved"
+            );
+            assert_eq!(inner.hulls.len(), 1);
+            assert!(!inner.hull_pos.contains_key(&(dead_ptr, false)));
+            let mut live_slots: Vec<u32> = inner.hulls[0].slots.iter().copied().collect();
+            live_slots.sort_unstable();
+            assert_eq!(live_slots, vec![10, 900_000]);
+        }
+
+        drop(viewed);
+        drop(live);
+        crate::shadow::unregister(at_live as usize, at_live);
     }
 }

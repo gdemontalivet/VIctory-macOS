@@ -7726,6 +7726,78 @@ mod batch {
         crate::watch::tests::free(p);
     }
 
+    /// End-to-end: `bindless::refresh` keeps >256 KiB holes disjoint through
+    /// `Batch::add` -> `Batch::flush`, refreshing only the viewed endpoint
+    /// pages and leaving the unrefreshed middle hole absent from
+    /// `Batch::current` so a later draw reading the middle still refreshes it.
+    #[test]
+    fn disjoint_bindless_spans_skip_middle_hole_in_batch_and_preserve_exact_current() {
+        const PAGES: usize = 16; // 1 MiB (> 256 KiB merge gap)
+        let p = crate::watch::tests::pool(PAGES);
+        let len = PAGES * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        // Initial flush brings the copy clean and arms write-watch guards.
+        let mut init = Batch::default();
+        init.add(&copy, p, len);
+        assert_eq!(init.flush(), len);
+
+        // Dirty every page (head, middle hole, and tail).
+        for page in 0..PAGES {
+            // SAFETY: our committed pool of `PAGES` pages.
+            unsafe { ((p + page * PAGE) as *mut u8).write_volatile(0x40 + page as u8) };
+        }
+
+        let viewed = crate::bindless::Viewed::with_disjoint_spans(true, true);
+        viewed.set_buffer_slot(1, Some((&copy, p as u64, 4096, false)));
+        viewed.set_buffer_slot(2, Some((&copy, p as u64 + 32 * 1024, 4096, false)));
+        viewed.set_buffer_slot(3, Some((&copy, (p + (PAGES - 1) * PAGE) as u64, 4096, false)));
+
+        let mut batch = Batch::default();
+        crate::bindless::refresh(&viewed, |s, a, l| batch.add(s, a, l));
+        assert_eq!(
+            batch.refreshes.len(),
+            1,
+            "all disjoint spans of one Shadow stay grouped into one worker entry"
+        );
+        assert_eq!(
+            batch.refreshes[0].1.as_slice(),
+            &[
+                (p, p + 36 * 1024),
+                (p + (PAGES - 1) * PAGE, p + (PAGES - 1) * PAGE + 4096),
+            ]
+        );
+        // Only the viewed head (36 KiB) and tail (4 KiB) sub-intervals are
+        // copied; the 14 middle pages are completely skipped.
+        assert_eq!(batch.flush(), 36 * 1024 + 4096);
+        assert_eq!(copy.read_host(p as u64, 1)[0] as u8, 0x40);
+        assert_eq!(
+            copy.read_host((p + (PAGES - 1) * PAGE) as u64, 1)[0] as u8,
+            0x40 + (PAGES - 1) as u8
+        );
+
+        // A subsequent request inside the unrefreshed middle hole must NOT be
+        // skipped by `Batch::current` (exact span tracking).
+        let mid = p + 8 * PAGE;
+        assert_ne!(
+            copy.read_host(mid as u64, 1)[0] as u8,
+            0x48,
+            "middle hole was not copied yet"
+        );
+        batch.add(&copy, mid, PAGE);
+        assert_eq!(batch.flush(), PAGE, "middle hole was not marked current");
+        assert_eq!(copy.read_host(mid as u64, 1)[0] as u8, 0x48);
+
+        drop(viewed);
+        drop(copy);
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
     /// A list asking again for what the submission already brought up to
     /// date copies nothing, and the copystat line says so: the skipped
     /// bytes are what staying current saved the later lists.

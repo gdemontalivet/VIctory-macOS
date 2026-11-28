@@ -642,15 +642,60 @@ fn workers() -> Option<&'static rayon::ThreadPool> {
         .as_ref()
 }
 
+thread_local! {
+    /// Whether this thread is already executing inside [`in_parallel`]. Nested
+    /// `in_parallel` calls run inline instead of re-entering Rayon's
+    /// work-stealing scheduler (`pool.install`), preventing single-thread
+    /// re-entrant self-deadlock when a worker holds a non-recursive `Mutex`.
+    static IN_PARALLEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct ParallelDepthGuard(bool);
+
+impl ParallelDepthGuard {
+    #[inline]
+    fn enter() -> Self {
+        Self(IN_PARALLEL.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for ParallelDepthGuard {
+    #[inline]
+    fn drop(&mut self) {
+        IN_PARALLEL.with(|flag| flag.set(self.0));
+    }
+}
+
+#[inline]
+fn in_parallel_active() -> bool {
+    IN_PARALLEL.with(std::cell::Cell::get)
+}
+
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest). Reuse the workers and
 /// their thread-local scratch across submissions.
+///
+/// Nested calls while already inside `in_parallel` execute inline on the
+/// current thread so Rayon cannot steal an unrelated outer job onto a thread
+/// holding a non-recursive `Mutex`.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
-    if n > 1
-        && let Some(pool) = workers()
-    {
-        pool.install(|| (0..n).into_par_iter().for_each(&f));
+    if n == 0 {
+        return;
+    }
+    if n == 1 || in_parallel_active() {
+        let _depth = ParallelDepthGuard::enter();
+        (0..n).for_each(f);
+        return;
+    }
+    if let Some(pool) = workers() {
+        pool.install(|| {
+            (0..n).into_par_iter().for_each(|i| {
+                let _depth = ParallelDepthGuard::enter();
+                f(i);
+            });
+        });
     } else {
+        let _depth = ParallelDepthGuard::enter();
         (0..n).for_each(f);
     }
 }
@@ -1843,6 +1888,33 @@ pub(crate) mod tests {
             assert!(visits.iter().all(|count| count.load(Relaxed) == pass));
         }
         assert!(workers.into_inner().unwrap().len() <= 4);
+    }
+
+    /// Nested `in_parallel` called while holding a non-recursive `Mutex` must
+    /// execute inline via `IN_PARALLEL` instead of re-entering Rayon
+    /// work-stealing and self-deadlocking on an unrelated outer job.
+    #[test]
+    fn nested_in_parallel_under_non_recursive_mutex_never_self_deadlocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let shared_lock = Mutex::new(0usize);
+        let completed = AtomicUsize::new(0);
+
+        for _round in 0..64 {
+            in_parallel(8, |_outer| {
+                let mut guard = shared_lock.lock().expect("outer non-recursive lock");
+                *guard += 1;
+                let inner_sum = AtomicUsize::new(0);
+                in_parallel(16, |inner| {
+                    inner_sum.fetch_add(inner + 1, Ordering::Relaxed);
+                });
+                assert_eq!(inner_sum.load(Ordering::Relaxed), (1..=16).sum::<usize>());
+                completed.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        assert_eq!(completed.load(Ordering::Relaxed), 64 * 8);
+        assert_eq!(*shared_lock.lock().unwrap(), 64 * 8);
     }
 
     #[test]
