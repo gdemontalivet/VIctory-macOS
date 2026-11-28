@@ -4014,6 +4014,7 @@ impl HostList {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 if before != wanted {
+                    copy.bump_transition_gen();
                     self.changed_something();
                     Some(before)
                 } else {
@@ -4061,11 +4062,13 @@ impl HostList {
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = o.get().last();
                 let copy = o.get_mut().again(side, writes, whole);
                 if stores {
                     o.get_mut().store();
                 }
-                if copy.is_some() || writes {
+                if copy.is_some() || o.get().last() != before {
+                    depth.bump_transition_gen();
                     self.changed_something();
                 }
                 copy

@@ -959,6 +959,10 @@ pub(crate) struct HostTexture {
     /// Host submissions handed to the queue when it was made
     /// (`crate::host::submissions_begun`): see [`HostTexture::fresh`].
     made_in: u64,
+    /// Monotonic counter bumped whenever any list transitions this host
+    /// texture, changes its twin routing, attaches a twin, or adds a writable
+    /// alias at its address (per-texture invalidation for `VICTORY_TABLE_MEMO`).
+    transition_gen: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(windows)]
@@ -995,7 +999,20 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
             made_in: crate::host::submissions_begun(),
+            transition_gen: 0.into(),
         }
+    }
+
+    /// Current per-texture transition generation.
+    pub(crate) fn transition_gen(&self) -> u64 {
+        self.transition_gen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bumps the per-texture transition generation.
+    pub(crate) fn bump_transition_gen(&self) {
+        self.transition_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a submission handed to the queue before it was made may
@@ -1515,6 +1532,13 @@ fn shared_texture(
                 && (!PACKED_16.contains(&title_format) || pc_format(r.desc.format) == title_format)
             {
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
+            }
+        }
+        if d.flags & USES != 0 {
+            for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
+                if let Some(copy) = made(r) {
+                    copy.bump_transition_gen();
+                }
             }
         }
     }
@@ -2380,7 +2404,15 @@ fn hand_out_resource(
         let size = texture_layout(&desc).map_or(0, |t| t.size as usize);
         crate::texback::replaced(data_at, size);
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(data_at as u64).or_default().push(at);
+        let siblings = map.entry(data_at as u64).or_default();
+        if desc.flags & 0x7 != 0 {
+            for &other in siblings.iter() {
+                if let Some(copy) = made(self::resource(other as This)) {
+                    copy.bump_transition_gen();
+                }
+            }
+        }
+        siblings.push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
